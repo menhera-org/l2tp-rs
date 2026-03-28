@@ -23,6 +23,7 @@ struct SockaddrL2tpIp {
     l2tp_unused: u16,
     l2tp_addr: libc::in_addr,
     l2tp_conn_id: u32,
+    _pad: [u8; 4],
 }
 
 #[repr(C)]
@@ -311,6 +312,7 @@ fn l2tp_sockaddr(endpoint: &IpEndpoint, conn_id: u32) -> SockAddr {
                 s_addr: u32::from_ne_bytes(addr.octets()),
             },
             l2tp_conn_id: conn_id,
+            _pad: [0; 4],
         }),
         IpEndpoint::V6(addr) => SockAddr::L2tpV6(SockaddrL2tpIp6 {
             l2tp_family: libc::AF_INET6 as libc::sa_family_t,
@@ -329,6 +331,7 @@ fn l2tp_sockaddr(endpoint: &IpEndpoint, conn_id: u32) -> SockAddr {
 mod tests {
     use super::*;
     use std::io;
+    use std::mem::size_of;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket};
     use std::time::Duration;
 
@@ -482,5 +485,10 @@ mod tests {
 
         let err = sock.set_ipv6_dontfrag(true).unwrap_err();
         assert!(matches!(err, crate::Error::KernelError { .. }));
+    }
+
+    #[test]
+    fn sockaddr_l2tpip_matches_sockaddr_size() {
+        assert_eq!(size_of::<SockaddrL2tpIp>(), size_of::<libc::sockaddr>());
     }
 }
