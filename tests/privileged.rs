@@ -52,7 +52,9 @@ fn privileged_bind_to_device_on_loopback() {
 #[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp generic-netlink support"]
 fn privileged_unmanaged_tunnel_lifecycle_over_genl() {
     runtime().block_on(async {
-        let handle = L2tpHandle::new().unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
+        let handle = L2tpHandle::new()
+            .await
+            .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
         let mut selected_ids = None;
         let mut tunnel_opt = None;
         for _ in 0..16 {
@@ -117,7 +119,9 @@ fn privileged_unmanaged_tunnel_lifecycle_over_genl() {
 #[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp_eth support"]
 fn privileged_session_lifecycle_over_genl() {
     runtime().block_on(async {
-        let handle = L2tpHandle::new().unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
+        let handle = L2tpHandle::new()
+            .await
+            .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
         let mut selected_ids = None;
         let mut tunnel_opt = None;
         for _ in 0..16 {

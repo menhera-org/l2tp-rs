@@ -24,17 +24,20 @@ struct L2tpInner {
 }
 
 impl L2tpHandle {
-    pub fn new() -> crate::Result<Self> {
-        let (connection, genl, _unsolicited) = genetlink::new_connection()?;
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(connection);
-        } else {
-            return Err(io::Error::new(
+    /// Create a new L2TP Generic Netlink handle.
+    ///
+    /// This must be awaited while running inside a Tokio runtime because the
+    /// internal Generic Netlink connection task is spawned onto the current
+    /// Tokio executor.
+    pub async fn new() -> crate::Result<Self> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            io::Error::new(
                 io::ErrorKind::Other,
                 "tokio runtime is required for L2tpHandle::new()",
             )
-            .into());
-        }
+        })?;
+        let (connection, genl, _unsolicited) = genetlink::new_connection()?;
+        runtime.spawn(connection);
 
         Ok(Self {
             inner: Arc::new(L2tpInner {
@@ -303,7 +306,7 @@ fn normalize_errno(code: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_errno;
+    use super::{normalize_errno, L2tpHandle};
 
     #[test]
     fn normalize_errno_converts_negative_to_positive() {
@@ -315,5 +318,20 @@ mod tests {
     fn normalize_errno_keeps_non_negative_unchanged() {
         assert_eq!(normalize_errno(0), 0);
         assert_eq!(normalize_errno(libc::ENOENT), libc::ENOENT);
+    }
+
+    #[test]
+    fn new_fails_without_tokio_runtime() {
+        let result = futures::executor::block_on(L2tpHandle::new());
+        match result {
+            Ok(_) => panic!("expected failure without tokio runtime"),
+            Err(crate::Error::Io(e)) => {
+                assert!(
+                    e.to_string().contains("tokio runtime is required"),
+                    "unexpected error message: {e}"
+                );
+            }
+            Err(e) => panic!("unexpected error type: {e:?}"),
+        }
     }
 }
