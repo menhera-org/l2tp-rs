@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use l2tp::{
     Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, L2tpHandle, PseudowireType,
-    SessionConfig, SessionId, SessionInfo, SessionModify, TunnelConfig, TunnelId,
-    TunnelModify, TunnelSocket, UdpEndpoint,
+    SessionConfig, SessionId, SessionInfo, SessionModify, TunnelConfig, TunnelId, TunnelModify,
+    TunnelSocket, UdpEndpoint,
 };
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_REQUEST};
 use netlink_packet_generic::GenlMessage;
@@ -287,10 +287,8 @@ fn resolve_udp_endpoints(
     local_str: Option<&str>,
     remote_str: &str,
 ) -> l2tp::Result<(UdpEndpoint, UdpEndpoint)> {
-    let local = parse_udp_addr(local_str.unwrap_or("::"))
-        .map_err(l2tp::Error::InvalidIfName)?;
-    let remote =
-        parse_udp_addr(remote_str).map_err(l2tp::Error::InvalidIfName)?;
+    let local = parse_udp_addr(local_str.unwrap_or("::")).map_err(l2tp::Error::InvalidIfName)?;
+    let remote = parse_udp_addr(remote_str).map_err(l2tp::Error::InvalidIfName)?;
 
     if remote_str.parse::<SocketAddr>().is_err() {
         return Err(l2tp::Error::InvalidIfName(format!(
@@ -315,7 +313,10 @@ fn resolve_udp_endpoints(
     }
 }
 
-fn resolve_udp_remote_for_local(local: &UdpEndpoint, remote_str: &str) -> l2tp::Result<UdpEndpoint> {
+fn resolve_udp_remote_for_local(
+    local: &UdpEndpoint,
+    remote_str: &str,
+) -> l2tp::Result<UdpEndpoint> {
     let remote = parse_udp_addr(remote_str).map_err(l2tp::Error::InvalidIfName)?;
     if remote_str.parse::<SocketAddr>().is_err() {
         return Err(l2tp::Error::InvalidIfName(format!(
@@ -345,7 +346,7 @@ fn parse_hex_cookie(s: &str, field: &str) -> l2tp::Result<Cookie> {
     if s.is_empty() {
         return Ok(Cookie::none());
     }
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(l2tp::Error::InvalidIfName(format!(
             "invalid {field}: odd-length hex string"
         )));
@@ -356,9 +357,8 @@ fn parse_hex_cookie(s: &str, field: &str) -> l2tp::Result<Cookie> {
     let mut i = 0usize;
     while i < bytes.len() {
         let pair = &s[i..i + 2];
-        let v = u8::from_str_radix(pair, 16).map_err(|_| {
-            l2tp::Error::InvalidIfName(format!("invalid {field}: non-hex value"))
-        })?;
+        let v = u8::from_str_radix(pair, 16)
+            .map_err(|_| l2tp::Error::InvalidIfName(format!("invalid {field}: non-hex value")))?;
         out.push(v);
         i += 2;
     }
@@ -449,11 +449,7 @@ async fn tunnel_create(
     handle: &L2tpHandle,
     out: &Output,
 ) -> l2tp::Result<()> {
-    let device = args
-        .device
-        .as_deref()
-        .map(IfName::new)
-        .transpose()?;
+    let device = args.device.as_deref().map(IfName::new).transpose()?;
 
     let encapsulation = match args.encap {
         EncapArg::Udp => {
@@ -521,7 +517,11 @@ async fn tunnel_create(
     })
 }
 
-async fn tunnel_change(args: TunnelChangeArgs, handle: &L2tpHandle, out: &Output) -> l2tp::Result<()> {
+async fn tunnel_change(
+    args: TunnelChangeArgs,
+    handle: &L2tpHandle,
+    out: &Output,
+) -> l2tp::Result<()> {
     let tunnel_id = TunnelId(args.tunnel_id);
     let info = handle.get_tunnel(tunnel_id).await?;
 
@@ -531,8 +531,7 @@ async fn tunnel_change(args: TunnelChangeArgs, handle: &L2tpHandle, out: &Output
                 let _ = resolve_udp_remote_for_local(local, remote)?;
             }
             Encapsulation::Ip { local, .. } => {
-                let remote_ip =
-                    parse_ip_addr(remote).map_err(l2tp::Error::InvalidIfName)?;
+                let remote_ip = parse_ip_addr(remote).map_err(l2tp::Error::InvalidIfName)?;
                 if local.ip_version() != remote_ip.ip_version() {
                     return Err(l2tp::Error::AddressFamilyMismatch);
                 }
@@ -561,15 +560,8 @@ async fn session_create(
     out: &Output,
 ) -> l2tp::Result<()> {
     let cookie = parse_hex_cookie(args.cookie.as_deref().unwrap_or(""), "cookie")?;
-    let peer_cookie = parse_hex_cookie(
-        args.peer_cookie.as_deref().unwrap_or(""),
-        "peer-cookie",
-    )?;
-    let ifname = args
-        .ifname
-        .as_deref()
-        .map(IfName::new)
-        .transpose()?;
+    let peer_cookie = parse_hex_cookie(args.peer_cookie.as_deref().unwrap_or(""), "peer-cookie")?;
+    let ifname = args.ifname.as_deref().map(IfName::new).transpose()?;
 
     let config = SessionConfig {
         tunnel_id: TunnelId(args.tunnel_id),
@@ -626,9 +618,7 @@ fn random_tunnel_id(attempt: u32) -> u32 {
         .unwrap_or(Duration::from_secs(0))
         .as_nanos() as u64;
     let pid = std::process::id() as u64;
-    let mixed = now
-        ^ (pid << 32)
-        ^ (attempt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mixed = now ^ (pid << 32) ^ (attempt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let span = u32::MAX - 999_999;
     1_000_000 + ((mixed as u32) % span)
 }
@@ -723,7 +713,7 @@ async fn send_l2tp_ack(payload: L2tpMessage) -> l2tp::Result<()> {
 }
 
 fn genetlink_to_io(err: genetlink::GenetlinkError) -> l2tp::Error {
-    l2tp::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))
+    l2tp::Error::Io(std::io::Error::other(err.to_string()))
 }
 
 fn normalize_errno(code: i32) -> i32 {
