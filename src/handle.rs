@@ -31,8 +31,7 @@ impl L2tpHandle {
     /// Tokio executor.
     pub async fn new() -> crate::Result<Self> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 "tokio runtime is required for L2tpHandle::new()",
             )
         })?;
@@ -293,7 +292,7 @@ fn first_attributes<'a>(
 }
 
 fn to_io_error(err: genetlink::GenetlinkError) -> crate::Error {
-    io::Error::new(io::ErrorKind::Other, err.to_string()).into()
+    io::Error::other(err.to_string()).into()
 }
 
 fn normalize_errno(code: i32) -> i32 {
