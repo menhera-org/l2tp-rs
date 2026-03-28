@@ -1,0 +1,20 @@
+[package]
+name = "l2tp"
+version = "0.1.0"
+edition = "2021"
+homepage = "https://github.com/menhera-org/l2tp-rs"
+repository = "https://github.com/menhera-org/l2tp-rs"
+keywords = ["l2tp", "netlink", "linux"]
+license = "MIT"
+readme = "README.md"
+description = "High-level L2TP interface for Linux kernel"
+
+[dependencies]
+netlink-packet-l2tp    = "0.2.0"
+netlink-packet-core    = "0.8"
+netlink-packet-generic = "0.4"
+genetlink              = "0.2.6"
+tokio                  = { version = "1", features = ["net", "io-util", "sync", "rt"] }
+libc                   = "0.2"
+thiserror              = "2"
+futures                = "0.3"
