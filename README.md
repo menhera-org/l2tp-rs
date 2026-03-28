@@ -15,7 +15,7 @@ It does **not** configure interfaces/bridges/routes (`rtnetlink` tasks belong in
 
 ```toml
 [dependencies]
-l2tp = "0.1"
+l2tp = "0.2.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
