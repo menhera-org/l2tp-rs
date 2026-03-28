@@ -30,11 +30,8 @@ impl L2tpHandle {
     /// internal Generic Netlink connection task is spawned onto the current
     /// Tokio executor.
     pub async fn new() -> crate::Result<Self> {
-        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
-            io::Error::other(
-                "tokio runtime is required for L2tpHandle::new()",
-            )
-        })?;
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| io::Error::other("tokio runtime is required for L2tpHandle::new()"))?;
         let (connection, genl, _unsolicited) = genetlink::new_connection()?;
         runtime.spawn(connection);
 
