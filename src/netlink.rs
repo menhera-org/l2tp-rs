@@ -39,7 +39,9 @@ pub(crate) fn encode_tunnel_create(config: &TunnelConfig, fd: Option<RawFd>) -> 
                     attrs.push(L2tpAttribute::UdpSport(local.port()));
                     attrs.push(L2tpAttribute::UdpDport(remote.port()));
                 }
-                _ => {}
+                _ => {
+                    unreachable!("TunnelConfig invariant: local and remote must be same IP version")
+                }
             }
             attrs.push(L2tpAttribute::UdpCsum(*udp_csum));
             if *udp_zero_csum6_tx {
@@ -60,7 +62,9 @@ pub(crate) fn encode_tunnel_create(config: &TunnelConfig, fd: Option<RawFd>) -> 
                     attrs.push(L2tpAttribute::Ip6Saddr(*local));
                     attrs.push(L2tpAttribute::Ip6Daddr(*remote));
                 }
-                _ => {}
+                _ => {
+                    unreachable!("TunnelConfig invariant: local and remote must be same IP version")
+                }
             }
         }
     }
@@ -562,6 +566,41 @@ mod tests {
             a,
             L2tpAttribute::Fd(_)
         )));
+    }
+
+    #[test]
+    #[should_panic(expected = "TunnelConfig invariant: local and remote must be same IP version")]
+    fn encode_tunnel_create_panics_on_udp_family_mismatch() {
+        let cfg = TunnelConfig {
+            tunnel_id: TunnelId(1),
+            peer_tunnel_id: TunnelId(2),
+            encapsulation: Encapsulation::Udp {
+                local: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1000)),
+                remote: UdpEndpoint::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1001, 0, 0)),
+                udp_csum: false,
+                udp_zero_csum6_tx: false,
+                udp_zero_csum6_rx: false,
+            },
+            ifname: None,
+        };
+
+        let _ = encode_tunnel_create(&cfg, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "TunnelConfig invariant: local and remote must be same IP version")]
+    fn encode_tunnel_create_panics_on_ip_family_mismatch() {
+        let cfg = TunnelConfig {
+            tunnel_id: TunnelId(11),
+            peer_tunnel_id: TunnelId(12),
+            encapsulation: Encapsulation::Ip {
+                local: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+                remote: IpEndpoint::V6(Ipv6Addr::LOCALHOST),
+            },
+            ifname: None,
+        };
+
+        let _ = encode_tunnel_create(&cfg, None);
     }
 
     #[test]

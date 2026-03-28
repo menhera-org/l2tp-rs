@@ -1,10 +1,10 @@
 use crate::{Encapsulation, IfName, TunnelId, TunnelSocket, TunnelStats};
 
 pub struct TunnelConfig {
-    pub tunnel_id: TunnelId,
-    pub peer_tunnel_id: TunnelId,
-    pub encapsulation: Encapsulation,
-    pub ifname: Option<IfName>,
+    pub(crate) tunnel_id: TunnelId,
+    pub(crate) peer_tunnel_id: TunnelId,
+    pub(crate) encapsulation: Encapsulation,
+    pub(crate) ifname: Option<IfName>,
 }
 
 impl TunnelConfig {
