@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct TunnelStats {
     pub tx_packets: u64,
     pub tx_bytes: u64,
@@ -8,7 +8,7 @@ pub struct TunnelStats {
     pub rx_errors: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct SessionStats {
     pub tx_packets: u64,
     pub tx_bytes: u64,

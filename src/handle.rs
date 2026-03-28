@@ -193,7 +193,7 @@ impl L2tpHandle {
         netlink::decode_session_stats(attrs)
     }
 
-    pub(crate) async fn modify_tunnel(
+    pub async fn modify_tunnel(
         &self,
         tunnel_id: TunnelId,
         params: TunnelModify,
@@ -202,7 +202,7 @@ impl L2tpHandle {
             .await
     }
 
-    pub(crate) async fn modify_session(
+    pub async fn modify_session(
         &self,
         tunnel_id: TunnelId,
         session_id: SessionId,
