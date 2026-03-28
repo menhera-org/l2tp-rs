@@ -447,3 +447,373 @@ fn from_l2tp_l2spec(value: L2tpL2SpecType) -> crate::Result<L2SpecType> {
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    fn has_attr(attrs: &[L2tpAttribute], f: impl Fn(&L2tpAttribute) -> bool) -> bool {
+        attrs.iter().any(f)
+    }
+
+    #[test]
+    fn encode_tunnel_create_udp_v4_includes_required_attributes() {
+        let cfg = TunnelConfig::new(
+            TunnelId(10),
+            TunnelId(20),
+            Encapsulation::Udp {
+                local: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1111)),
+                remote: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 2222)),
+                udp_csum: true,
+                udp_zero_csum6_tx: true,
+                udp_zero_csum6_rx: true,
+            },
+            Some(IfName::new("l2tp0").unwrap()),
+        )
+        .unwrap();
+
+        let msg = encode_tunnel_create(&cfg, Some(7));
+        assert!(matches!(
+            msg.cmd,
+            netlink_packet_l2tp::L2tpCmd::TunnelCreate
+        ));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::ConnId(10)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::PeerConnId(20)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::ProtoVersion(3)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::EncapType(L2tpEncapType::Udp)
+        )));
+        assert!(has_attr(
+            &msg.attributes,
+            |a| matches!(a, L2tpAttribute::IpSaddr(ip) if *ip == Ipv4Addr::new(10, 0, 0, 1))
+        ));
+        assert!(has_attr(
+            &msg.attributes,
+            |a| matches!(a, L2tpAttribute::IpDaddr(ip) if *ip == Ipv4Addr::new(10, 0, 0, 2))
+        ));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::UdpSport(1111)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::UdpDport(2222)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::UdpCsum(true)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::UdpZeroCsum6Tx
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::UdpZeroCsum6Rx
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::Fd(7)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::IfName(name) if name == "l2tp0"
+        )));
+    }
+
+    #[test]
+    fn encode_tunnel_create_ip_v6_includes_ip_fields() {
+        let cfg = TunnelConfig::new(
+            TunnelId(30),
+            TunnelId(40),
+            Encapsulation::Ip {
+                local: IpEndpoint::V6(Ipv6Addr::LOCALHOST),
+                remote: IpEndpoint::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 3, 4, 5, 6)),
+            },
+            None,
+        )
+        .unwrap();
+
+        let msg = encode_tunnel_create(&cfg, None);
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::EncapType(L2tpEncapType::Ip)
+        )));
+        assert!(has_attr(
+            &msg.attributes,
+            |a| matches!(a, L2tpAttribute::Ip6Saddr(ip) if *ip == Ipv6Addr::LOCALHOST)
+        ));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::Ip6Daddr(_)
+        )));
+        assert!(!has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::Fd(_)
+        )));
+    }
+
+    #[test]
+    fn encode_tunnel_modify_only_emits_optional_fields() {
+        let msg = encode_tunnel_modify(
+            TunnelId(42),
+            &TunnelModify {
+                udp_csum: Some(false),
+            },
+        );
+        assert_eq!(msg.attributes.len(), 2);
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::ConnId(42)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::UdpCsum(false)
+        )));
+    }
+
+    #[test]
+    fn encode_session_create_includes_cookies_and_flags() {
+        let cfg = SessionConfig {
+            tunnel_id: TunnelId(1),
+            session_id: SessionId(2),
+            peer_session_id: SessionId(3),
+            pseudowire_type: PseudowireType::Eth,
+            l2spec_type: L2SpecType::Default,
+            cookie: crate::Cookie::try_from_bytes(vec![1, 2, 3, 4]).unwrap(),
+            peer_cookie: crate::Cookie::none(),
+            recv_seq: true,
+            send_seq: true,
+            lns_mode: true,
+            recv_timeout_ms: Some(999),
+            ifname: Some(IfName::new("l2tpeth0").unwrap()),
+        };
+
+        let msg = encode_session_create(&cfg);
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::ConnId(1)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::SessionId(2)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::PeerSessionId(3)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::PwType(L2tpPwType::Eth)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::L2SpecType(L2tpL2SpecType::Default)
+        )));
+        assert!(has_attr(
+            &msg.attributes,
+            |a| matches!(a, L2tpAttribute::Cookie(v) if v.as_slice() == [1, 2, 3, 4])
+        ));
+        assert!(has_attr(
+            &msg.attributes,
+            |a| matches!(a, L2tpAttribute::PeerCookie(v) if v.is_empty())
+        ));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::RecvSeq(true)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::SendSeq(true)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::LnsMode(true)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::RecvTimeout(999)
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::IfName(name) if name == "l2tpeth0"
+        )));
+    }
+
+    #[test]
+    fn encode_session_get_dump_handles_optional_tunnel_id() {
+        let with = encode_session_get_dump(Some(TunnelId(77)));
+        assert_eq!(with.attributes.len(), 1);
+        assert!(matches!(with.attributes[0], L2tpAttribute::ConnId(77)));
+
+        let without = encode_session_get_dump(None);
+        assert!(without.attributes.is_empty());
+    }
+
+    #[test]
+    fn decode_tunnel_info_udp_v6_round_trip() {
+        let attrs = vec![
+            L2tpAttribute::ConnId(100),
+            L2tpAttribute::PeerConnId(200),
+            L2tpAttribute::ProtoVersion(3),
+            L2tpAttribute::EncapType(L2tpEncapType::Udp),
+            L2tpAttribute::Ip6Saddr(Ipv6Addr::LOCALHOST),
+            L2tpAttribute::Ip6Daddr(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            L2tpAttribute::UdpSport(5555),
+            L2tpAttribute::UdpDport(6666),
+            L2tpAttribute::UdpCsum(true),
+            L2tpAttribute::UdpZeroCsum6Tx,
+            L2tpAttribute::UsingIpsec(true),
+            L2tpAttribute::IfName("l2tpv6".into()),
+        ];
+
+        let info = decode_tunnel_info(&attrs).unwrap();
+        assert_eq!(info.tunnel_id, TunnelId(100));
+        assert_eq!(info.peer_tunnel_id, TunnelId(200));
+        assert_eq!(info.proto_version, 3);
+        assert!(info.using_ipsec);
+        assert_eq!(info.ifname.unwrap().as_str(), "l2tpv6");
+
+        match info.encapsulation {
+            Encapsulation::Udp {
+                local,
+                remote,
+                udp_csum,
+                udp_zero_csum6_tx,
+                udp_zero_csum6_rx,
+            } => {
+                assert!(udp_csum);
+                assert!(udp_zero_csum6_tx);
+                assert!(!udp_zero_csum6_rx);
+                assert!(matches!(local, UdpEndpoint::V6(SocketAddrV6 { .. })));
+                assert!(matches!(remote, UdpEndpoint::V6(SocketAddrV6 { .. })));
+            }
+            _ => panic!("unexpected encapsulation"),
+        }
+    }
+
+    #[test]
+    fn decode_tunnel_info_missing_mandatory_attribute_fails() {
+        let attrs = vec![
+            L2tpAttribute::PeerConnId(2),
+            L2tpAttribute::ProtoVersion(3),
+            L2tpAttribute::EncapType(L2tpEncapType::Ip),
+            L2tpAttribute::IpSaddr(Ipv4Addr::LOCALHOST),
+            L2tpAttribute::IpDaddr(Ipv4Addr::LOCALHOST),
+        ];
+        let err = decode_tunnel_info(&attrs).unwrap_err();
+        assert!(matches!(err, crate::Error::KernelError { .. }));
+    }
+
+    #[test]
+    fn decode_session_info_round_trip() {
+        let attrs = vec![
+            L2tpAttribute::ConnId(7),
+            L2tpAttribute::SessionId(8),
+            L2tpAttribute::PeerSessionId(9),
+            L2tpAttribute::PwType(L2tpPwType::Ppp),
+            L2tpAttribute::L2SpecType(L2tpL2SpecType::None),
+            L2tpAttribute::RecvSeq(true),
+            L2tpAttribute::SendSeq(false),
+            L2tpAttribute::LnsMode(true),
+            L2tpAttribute::RecvTimeout(3000),
+            L2tpAttribute::IfName("sess0".into()),
+            L2tpAttribute::UsingIpsec(true),
+        ];
+
+        let info = decode_session_info(&attrs).unwrap();
+        assert_eq!(info.tunnel_id, TunnelId(7));
+        assert_eq!(info.session_id, SessionId(8));
+        assert_eq!(info.peer_session_id, SessionId(9));
+        assert_eq!(info.pseudowire_type, PseudowireType::Ppp);
+        assert_eq!(info.l2spec_type, L2SpecType::None);
+        assert!(info.recv_seq);
+        assert!(!info.send_seq);
+        assert!(info.lns_mode);
+        assert_eq!(info.recv_timeout_ms, Some(3000));
+        assert_eq!(info.ifname.unwrap().as_str(), "sess0");
+        assert!(info.using_ipsec);
+    }
+
+    #[test]
+    fn decode_session_info_rejects_unknown_pw_or_l2spec() {
+        let attrs_unknown_pw = vec![
+            L2tpAttribute::ConnId(1),
+            L2tpAttribute::SessionId(2),
+            L2tpAttribute::PeerSessionId(3),
+            L2tpAttribute::PwType(L2tpPwType::Other(777)),
+            L2tpAttribute::L2SpecType(L2tpL2SpecType::None),
+        ];
+        let err = decode_session_info(&attrs_unknown_pw).unwrap_err();
+        assert!(matches!(err, crate::Error::KernelError { .. }));
+
+        let attrs_unknown_l2spec = vec![
+            L2tpAttribute::ConnId(1),
+            L2tpAttribute::SessionId(2),
+            L2tpAttribute::PeerSessionId(3),
+            L2tpAttribute::PwType(L2tpPwType::Eth),
+            L2tpAttribute::L2SpecType(L2tpL2SpecType::Other(9)),
+        ];
+        let err = decode_session_info(&attrs_unknown_l2spec).unwrap_err();
+        assert!(matches!(err, crate::Error::KernelError { .. }));
+    }
+
+    #[test]
+    fn decode_tunnel_stats_extracts_fields() {
+        let attrs = vec![L2tpAttribute::Stats(vec![
+            L2tpStatsAttr::TxPackets(11),
+            L2tpStatsAttr::TxBytes(12),
+            L2tpStatsAttr::TxErrors(13),
+            L2tpStatsAttr::RxPackets(21),
+            L2tpStatsAttr::RxBytes(22),
+            L2tpStatsAttr::RxErrors(23),
+        ])];
+
+        let stats = decode_tunnel_stats(&attrs).unwrap();
+        assert_eq!(stats.tx_packets, 11);
+        assert_eq!(stats.tx_bytes, 12);
+        assert_eq!(stats.tx_errors, 13);
+        assert_eq!(stats.rx_packets, 21);
+        assert_eq!(stats.rx_bytes, 22);
+        assert_eq!(stats.rx_errors, 23);
+    }
+
+    #[test]
+    fn decode_session_stats_extracts_fields() {
+        let attrs = vec![L2tpAttribute::Stats(vec![
+            L2tpStatsAttr::TxPackets(1),
+            L2tpStatsAttr::TxBytes(2),
+            L2tpStatsAttr::TxErrors(3),
+            L2tpStatsAttr::RxPackets(4),
+            L2tpStatsAttr::RxBytes(5),
+            L2tpStatsAttr::RxErrors(6),
+            L2tpStatsAttr::RxSeqDiscards(7),
+            L2tpStatsAttr::RxOosPackets(8),
+            L2tpStatsAttr::RxCookieDiscards(9),
+            L2tpStatsAttr::RxInvalid(10),
+        ])];
+
+        let stats = decode_session_stats(&attrs).unwrap();
+        assert_eq!(stats.tx_packets, 1);
+        assert_eq!(stats.tx_bytes, 2);
+        assert_eq!(stats.tx_errors, 3);
+        assert_eq!(stats.rx_packets, 4);
+        assert_eq!(stats.rx_bytes, 5);
+        assert_eq!(stats.rx_errors, 6);
+        assert_eq!(stats.rx_seq_discards, 7);
+        assert_eq!(stats.rx_oos_packets, 8);
+        assert_eq!(stats.rx_cookie_discards, 9);
+        assert_eq!(stats.rx_invalid, 10);
+    }
+}

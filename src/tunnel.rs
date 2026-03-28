@@ -104,3 +104,69 @@ impl Drop for TunnelHandle {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{IpEndpoint, UdpEndpoint};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    #[test]
+    fn tunnel_config_new_accepts_matching_udp_families() {
+        let config = TunnelConfig::new(
+            TunnelId(10),
+            TunnelId(20),
+            Encapsulation::Udp {
+                local: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 10000)),
+                remote: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 10001)),
+                udp_csum: true,
+                udp_zero_csum6_tx: false,
+                udp_zero_csum6_rx: false,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(config.tunnel_id, TunnelId(10));
+        assert_eq!(config.peer_tunnel_id, TunnelId(20));
+    }
+
+    #[test]
+    fn tunnel_config_new_rejects_mismatched_udp_families() {
+        let err = match TunnelConfig::new(
+            TunnelId(1),
+            TunnelId(2),
+            Encapsulation::Udp {
+                local: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1701)),
+                remote: UdpEndpoint::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1701, 0, 0)),
+                udp_csum: false,
+                udp_zero_csum6_tx: false,
+                udp_zero_csum6_rx: false,
+            },
+            None,
+        ) {
+            Ok(_) => panic!("expected address family mismatch"),
+            Err(e) => e,
+        };
+
+        assert!(matches!(err, crate::Error::AddressFamilyMismatch));
+    }
+
+    #[test]
+    fn tunnel_config_new_rejects_mismatched_ip_families() {
+        let err = match TunnelConfig::new(
+            TunnelId(1),
+            TunnelId(2),
+            Encapsulation::Ip {
+                local: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+                remote: IpEndpoint::V6(Ipv6Addr::LOCALHOST),
+            },
+            None,
+        ) {
+            Ok(_) => panic!("expected address family mismatch"),
+            Err(e) => e,
+        };
+
+        assert!(matches!(err, crate::Error::AddressFamilyMismatch));
+    }
+}

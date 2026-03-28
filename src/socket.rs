@@ -324,3 +324,163 @@ fn l2tp_sockaddr(endpoint: &IpEndpoint, conn_id: u32) -> SockAddr {
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket};
+    use std::time::Duration;
+
+    fn as_v4(addr: SocketAddr) -> SocketAddrV4 {
+        match addr {
+            SocketAddr::V4(v4) => v4,
+            SocketAddr::V6(v6) => panic!("expected IPv4 address, got {v6}"),
+        }
+    }
+
+    fn bind_v4_local() -> Option<UdpSocket> {
+        match UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => None,
+            Err(e) => panic!("failed to bind local UDP socket: {e}"),
+        }
+    }
+
+    #[test]
+    fn udp_constructor_rejects_family_mismatch() {
+        let local = UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1701));
+        let remote = UdpEndpoint::V6(std::net::SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1701, 0, 0));
+
+        let err = match TunnelSocket::udp(&local, &remote, None) {
+            Ok(_) => panic!("expected address family mismatch"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, crate::Error::AddressFamilyMismatch));
+    }
+
+    #[test]
+    fn ip_constructor_rejects_family_mismatch() {
+        let local = IpEndpoint::V4(Ipv4Addr::LOCALHOST);
+        let remote = IpEndpoint::V6(Ipv6Addr::LOCALHOST);
+
+        let err = match TunnelSocket::ip(&local, &remote, None, 42) {
+            Ok(_) => panic!("expected address family mismatch"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, crate::Error::AddressFamilyMismatch));
+    }
+
+    #[test]
+    fn udp_local_addr_and_reconnect_work() {
+        let Some(receiver1) = bind_v4_local() else {
+            return;
+        };
+        let Some(receiver2) = bind_v4_local() else {
+            return;
+        };
+        receiver1
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        receiver2
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+
+        let receiver1_addr = as_v4(receiver1.local_addr().unwrap());
+        let receiver2_addr = as_v4(receiver2.local_addr().unwrap());
+
+        let tunnel_socket = match TunnelSocket::udp(
+            &UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            &UdpEndpoint::V4(receiver1_addr),
+            None,
+        ) {
+            Ok(s) => s,
+            Err(crate::Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+                return;
+            }
+            Err(e) => panic!("unexpected tunnel socket error: {e:?}"),
+        };
+
+        let local = tunnel_socket.local_addr_udp().unwrap();
+        match local {
+            UdpEndpoint::V4(v4) => assert_ne!(v4.port(), 0),
+            UdpEndpoint::V6(v6) => panic!("unexpected v6 local address: {v6}"),
+        }
+
+        // SAFETY: the file descriptor is a valid connected UDP socket and
+        // buffer pointers are valid for their length.
+        let rc = unsafe { libc::send(tunnel_socket.as_raw_fd(), b"one".as_ptr().cast(), 3, 0) };
+        assert_eq!(rc, 3);
+
+        let mut buf = [0u8; 64];
+        let (n1, _) = receiver1.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n1], b"one");
+
+        tunnel_socket
+            .reconnect_udp(&UdpEndpoint::V4(receiver2_addr))
+            .unwrap();
+
+        // SAFETY: the file descriptor is a valid connected UDP socket and
+        // buffer pointers are valid for their length.
+        let rc = unsafe { libc::send(tunnel_socket.as_raw_fd(), b"two".as_ptr().cast(), 3, 0) };
+        assert_eq!(rc, 3);
+
+        let (n2, _) = receiver2.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n2], b"two");
+
+        let recv_again = receiver1.recv_from(&mut buf);
+        assert!(matches!(
+            recv_again,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[test]
+    fn reconnect_udp_and_local_addr_reject_unmanaged_socket() {
+        let fd = match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
+            Ok(fd) => fd,
+            Err(crate::Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+                return;
+            }
+            Err(e) => panic!("unexpected socket create error: {e:?}"),
+        };
+        let sock = TunnelSocket {
+            fd,
+            encap: SocketEncap::Ip,
+        };
+
+        let err = sock
+            .reconnect_udp(&UdpEndpoint::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                1701,
+            )))
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::UnmanagedSocket));
+
+        let err = sock.local_addr_udp().unwrap_err();
+        assert!(matches!(err, crate::Error::UnmanagedSocket));
+    }
+
+    #[test]
+    fn set_ipv6_dontfrag_on_ipv4_socket_returns_kernel_error() {
+        let Some(receiver) = bind_v4_local() else {
+            return;
+        };
+        let receiver_addr = as_v4(receiver.local_addr().unwrap());
+
+        let sock = match TunnelSocket::udp(
+            &UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            &UdpEndpoint::V4(receiver_addr),
+            None,
+        ) {
+            Ok(s) => s,
+            Err(crate::Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+                return;
+            }
+            Err(e) => panic!("unexpected tunnel socket error: {e:?}"),
+        };
+
+        let err = sock.set_ipv6_dontfrag(true).unwrap_err();
+        assert!(matches!(err, crate::Error::KernelError { .. }));
+    }
+}

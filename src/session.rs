@@ -118,3 +118,26 @@ impl Drop for SessionHandle {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_eth_constructor_sets_expected_defaults() {
+        let config = SessionConfig::eth(TunnelId(1), SessionId(2), SessionId(3));
+
+        assert_eq!(config.tunnel_id, TunnelId(1));
+        assert_eq!(config.session_id, SessionId(2));
+        assert_eq!(config.peer_session_id, SessionId(3));
+        assert_eq!(config.pseudowire_type, PseudowireType::Eth);
+        assert_eq!(config.l2spec_type, L2SpecType::None);
+        assert_eq!(config.cookie.as_bytes(), &[]);
+        assert_eq!(config.peer_cookie.as_bytes(), &[]);
+        assert!(!config.recv_seq);
+        assert!(!config.send_seq);
+        assert!(!config.lns_mode);
+        assert_eq!(config.recv_timeout_ms, None);
+        assert_eq!(config.ifname, None);
+    }
+}
