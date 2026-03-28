@@ -323,7 +323,7 @@ pub(crate) fn decode_session_info(attrs: &[L2tpAttribute]) -> crate::Result<Sess
         session_id: required(session_id, "L2TP_ATTR_SESSION_ID")?,
         peer_session_id: required(peer_session_id, "L2TP_ATTR_PEER_SESSION_ID")?,
         pseudowire_type: required(pseudowire_type, "L2TP_ATTR_PW_TYPE")?,
-        l2spec_type: required(l2spec_type, "L2TP_ATTR_L2SPEC_TYPE")?,
+        l2spec_type: l2spec_type.unwrap_or_default(),
         recv_seq,
         send_seq,
         lns_mode,
@@ -744,6 +744,23 @@ mod tests {
         assert_eq!(info.recv_timeout_ms, Some(3000));
         assert_eq!(info.ifname.unwrap().as_str(), "sess0");
         assert!(info.using_ipsec);
+    }
+
+    #[test]
+    fn decode_session_info_missing_l2spec_defaults_to_none() {
+        let attrs = vec![
+            L2tpAttribute::ConnId(7),
+            L2tpAttribute::SessionId(8),
+            L2tpAttribute::PeerSessionId(9),
+            L2tpAttribute::PwType(L2tpPwType::Eth),
+        ];
+
+        let info = decode_session_info(&attrs).unwrap();
+        assert_eq!(info.tunnel_id, TunnelId(7));
+        assert_eq!(info.session_id, SessionId(8));
+        assert_eq!(info.peer_session_id, SessionId(9));
+        assert_eq!(info.pseudowire_type, PseudowireType::Eth);
+        assert_eq!(info.l2spec_type, L2SpecType::None);
     }
 
     #[test]
