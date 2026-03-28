@@ -10,11 +10,41 @@ const IPPROTO_L2TP: libc::c_int = 115;
 pub struct TunnelSocket {
     fd: OwnedFd,
     encap: SocketEncap,
+    family: SocketFamily,
 }
 
 enum SocketEncap {
     Udp,
     Ip,
+}
+
+#[derive(Clone, Copy)]
+enum SocketFamily {
+    V4,
+    V6,
+}
+
+impl SocketFamily {
+    fn from_udp(endpoint: &UdpEndpoint) -> Self {
+        match endpoint {
+            UdpEndpoint::V4(_) => Self::V4,
+            UdpEndpoint::V6(_) => Self::V6,
+        }
+    }
+
+    fn from_ip(endpoint: &IpEndpoint) -> Self {
+        match endpoint {
+            IpEndpoint::V4(_) => Self::V4,
+            IpEndpoint::V6(_) => Self::V6,
+        }
+    }
+
+    fn ip_version(self) -> u8 {
+        match self {
+            Self::V4 => 4,
+            Self::V6 => 6,
+        }
+    }
 }
 
 #[repr(C)]
@@ -93,6 +123,7 @@ impl TunnelSocket {
         Ok(Self {
             fd,
             encap: SocketEncap::Udp,
+            family: SocketFamily::from_udp(local),
         })
     }
 
@@ -126,6 +157,7 @@ impl TunnelSocket {
         Ok(Self {
             fd,
             encap: SocketEncap::Ip,
+            family: SocketFamily::from_ip(local),
         })
     }
 
@@ -161,6 +193,9 @@ impl TunnelSocket {
     pub fn reconnect_udp(&self, new_remote: &UdpEndpoint) -> crate::Result<()> {
         if let SocketEncap::Ip = self.encap {
             return Err(crate::Error::UnmanagedSocket);
+        }
+        if self.family.ip_version() != new_remote.ip_version() {
+            return Err(crate::Error::AddressFamilyMismatch);
         }
 
         let remote_addr = udp_sockaddr(new_remote);
@@ -450,6 +485,7 @@ mod tests {
         let sock = TunnelSocket {
             fd,
             encap: SocketEncap::Ip,
+            family: SocketFamily::V4,
         };
 
         let err = sock
@@ -485,6 +521,36 @@ mod tests {
 
         let err = sock.set_ipv6_dontfrag(true).unwrap_err();
         assert!(matches!(err, crate::Error::KernelError { .. }));
+    }
+
+    #[test]
+    fn reconnect_udp_rejects_family_mismatch_with_clear_error() {
+        let Some(receiver) = bind_v4_local() else {
+            return;
+        };
+        let receiver_addr = as_v4(receiver.local_addr().unwrap());
+
+        let sock = match TunnelSocket::udp(
+            &UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            &UdpEndpoint::V4(receiver_addr),
+            None,
+        ) {
+            Ok(s) => s,
+            Err(crate::Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+                return;
+            }
+            Err(e) => panic!("unexpected tunnel socket error: {e:?}"),
+        };
+
+        let err = sock
+            .reconnect_udp(&UdpEndpoint::V6(std::net::SocketAddrV6::new(
+                Ipv6Addr::LOCALHOST,
+                1701,
+                0,
+                0,
+            )))
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::AddressFamilyMismatch));
     }
 
     #[test]
