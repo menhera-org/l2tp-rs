@@ -1,15 +1,11 @@
 mod output;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use futures::StreamExt;
 use l2tp::{
     Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, L2tpHandle, PseudowireType,
     SessionConfig, SessionId, SessionInfo, SessionModify, TunnelConfig, TunnelId, TunnelModify,
     TunnelSocket, UdpEndpoint,
 };
-use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_REQUEST};
-use netlink_packet_generic::GenlMessage;
-use netlink_packet_l2tp::{L2tpAttribute, L2tpMessage};
 use output::Output;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::process::ExitCode;
@@ -118,9 +114,6 @@ struct TunnelDeleteArgs {
 struct TunnelChangeArgs {
     #[arg(long)]
     tunnel_id: u32,
-
-    #[arg(long)]
-    remote: Option<String>,
 
     #[arg(long, conflicts_with = "no_udp_csum")]
     udp_csum: bool,
@@ -313,27 +306,6 @@ fn resolve_udp_endpoints(
     }
 }
 
-fn resolve_udp_remote_for_local(
-    local: &UdpEndpoint,
-    remote_str: &str,
-) -> l2tp::Result<UdpEndpoint> {
-    let remote = parse_udp_addr(remote_str).map_err(l2tp::Error::InvalidIfName)?;
-    if remote_str.parse::<SocketAddr>().is_err() {
-        return Err(l2tp::Error::InvalidIfName(format!(
-            "remote address must include port: '{remote_str}'"
-        )));
-    }
-    match (local, remote) {
-        (UdpEndpoint::V6(_), UdpEndpoint::V4(v4)) => Ok(UdpEndpoint::V6(
-            SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0),
-        )),
-        (_, remote) if local.ip_version() == remote.ip_version() => Ok(remote),
-        _ => Err(l2tp::Error::InvalidIfName(
-            "remote address family does not match local; use [::ffff:x.x.x.x]:port for IPv4 remote with IPv6 local".to_string(),
-        )),
-    }
-}
-
 fn parse_ip_addr(s: &str) -> Result<IpEndpoint, String> {
     match s.parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => Ok(IpEndpoint::V4(v4)),
@@ -415,7 +387,7 @@ async fn run_session(cmd: SessionCmd, handle: &L2tpHandle, out: &Output) -> l2tp
             ));
             Ok(())
         }
-        SessionCmd::Change(args) => session_change(args, out).await,
+        SessionCmd::Change(args) => session_change(args, handle, out).await,
         SessionCmd::Show(args) => {
             let info = handle
                 .get_session(TunnelId(args.tunnel_id), SessionId(args.session_id))
@@ -523,25 +495,6 @@ async fn tunnel_change(
     out: &Output,
 ) -> l2tp::Result<()> {
     let tunnel_id = TunnelId(args.tunnel_id);
-    let info = handle.get_tunnel(tunnel_id).await?;
-
-    if let Some(remote) = args.remote.as_deref() {
-        match &info.encapsulation {
-            Encapsulation::Udp { local, .. } => {
-                let _ = resolve_udp_remote_for_local(local, remote)?;
-            }
-            Encapsulation::Ip { local, .. } => {
-                let remote_ip = parse_ip_addr(remote).map_err(l2tp::Error::InvalidIfName)?;
-                if local.ip_version() != remote_ip.ip_version() {
-                    return Err(l2tp::Error::AddressFamilyMismatch);
-                }
-            }
-        }
-        return Err(l2tp::Error::KernelError {
-            code: libc::ENOTSUP,
-            message: "remote address change requires the tunnel to have been created in the same process; use 'tunnel delete' and 'tunnel create' to change the remote address".to_string(),
-        });
-    }
 
     let udp_csum = flag_pair(args.udp_csum, args.no_udp_csum);
     if udp_csum.is_none() {
@@ -549,7 +502,9 @@ async fn tunnel_change(
         return Ok(());
     }
 
-    send_tunnel_modify(tunnel_id, TunnelModify { udp_csum }).await?;
+    handle
+        .modify_tunnel(tunnel_id, TunnelModify { udp_csum })
+        .await?;
     out.success(&format!("updated tunnel {}", args.tunnel_id));
     Ok(())
 }
@@ -587,7 +542,11 @@ async fn session_create(
     Ok(())
 }
 
-async fn session_change(args: SessionChangeArgs, out: &Output) -> l2tp::Result<()> {
+async fn session_change(
+    args: SessionChangeArgs,
+    handle: &L2tpHandle,
+    out: &Output,
+) -> l2tp::Result<()> {
     let modify = SessionModify {
         recv_seq: flag_pair(args.recv_seq, args.no_recv_seq),
         send_seq: flag_pair(args.send_seq, args.no_send_seq),
@@ -604,7 +563,9 @@ async fn session_change(args: SessionChangeArgs, out: &Output) -> l2tp::Result<(
         return Ok(());
     }
 
-    send_session_modify(TunnelId(args.tunnel_id), SessionId(args.session_id), modify).await?;
+    handle
+        .modify_session(TunnelId(args.tunnel_id), SessionId(args.session_id), modify)
+        .await?;
     out.success(&format!(
         "updated session {} in tunnel {}",
         args.session_id, args.tunnel_id
@@ -638,89 +599,6 @@ fn map_l2spec(v: L2SpecArg) -> L2SpecType {
     match v {
         L2SpecArg::None => L2SpecType::None,
         L2SpecArg::Default => L2SpecType::Default,
-    }
-}
-
-async fn send_tunnel_modify(tunnel_id: TunnelId, params: TunnelModify) -> l2tp::Result<()> {
-    let mut attrs = vec![L2tpAttribute::ConnId(tunnel_id.0)];
-    if let Some(v) = params.udp_csum {
-        attrs.push(L2tpAttribute::UdpCsum(v));
-    }
-    let msg = L2tpMessage::tunnel_modify(attrs);
-    send_l2tp_ack(msg).await
-}
-
-async fn send_session_modify(
-    tunnel_id: TunnelId,
-    session_id: SessionId,
-    params: SessionModify,
-) -> l2tp::Result<()> {
-    let mut attrs = vec![
-        L2tpAttribute::ConnId(tunnel_id.0),
-        L2tpAttribute::SessionId(session_id.0),
-    ];
-    if let Some(v) = params.recv_seq {
-        attrs.push(L2tpAttribute::RecvSeq(v));
-    }
-    if let Some(v) = params.send_seq {
-        attrs.push(L2tpAttribute::SendSeq(v));
-    }
-    if let Some(v) = params.lns_mode {
-        attrs.push(L2tpAttribute::LnsMode(v));
-    }
-    if let Some(v) = params.recv_timeout_ms {
-        attrs.push(L2tpAttribute::RecvTimeout(v));
-    }
-    let msg = L2tpMessage::session_modify(attrs);
-    send_l2tp_ack(msg).await
-}
-
-async fn send_l2tp_ack(payload: L2tpMessage) -> l2tp::Result<()> {
-    let (connection, mut genl, _unsolicited) = genetlink::new_connection()?;
-    tokio::spawn(connection);
-
-    let family_id = genl
-        .resolve_family_id::<L2tpMessage>()
-        .await
-        .map_err(|e| l2tp::Error::FamilyResolution(e.to_string()))?;
-
-    let mut genl_msg = GenlMessage::from_payload(payload);
-    genl_msg.set_resolved_family_id(family_id);
-
-    let mut request = NetlinkMessage::from(genl_msg);
-    request.header.flags = NLM_F_REQUEST | NLM_F_ACK;
-    request.finalize();
-
-    let mut stream = genl.send_request(request).map_err(genetlink_to_io)?;
-    while let Some(item) = stream.next().await {
-        let message = item?;
-        match message.payload {
-            NetlinkPayload::Error(err) => {
-                if let Some(code) = err.code {
-                    return Err(l2tp::Error::KernelError {
-                        code: normalize_errno(code.get()),
-                        message: err.to_string(),
-                    });
-                }
-            }
-            NetlinkPayload::Done(_) => break,
-            NetlinkPayload::Noop | NetlinkPayload::Overrun(_) => {}
-            NetlinkPayload::InnerMessage(_) => {}
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn genetlink_to_io(err: genetlink::GenetlinkError) -> l2tp::Error {
-    l2tp::Error::Io(std::io::Error::other(err.to_string()))
-}
-
-fn normalize_errno(code: i32) -> i32 {
-    if code < 0 {
-        -code
-    } else {
-        code
     }
 }
 

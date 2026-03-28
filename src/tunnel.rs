@@ -1,4 +1,4 @@
-use crate::{Encapsulation, TunnelId, TunnelSocket, TunnelStats};
+use crate::{Encapsulation, IpEndpoint, TunnelId, TunnelSocket, TunnelStats, UdpEndpoint};
 
 pub struct TunnelConfig {
     pub(crate) tunnel_id: TunnelId,
@@ -81,6 +81,16 @@ impl TunnelHandle {
 
     pub async fn modify(&self, params: TunnelModify) -> crate::Result<()> {
         self.handle.modify_tunnel(self.tunnel_id, params).await
+    }
+
+    pub fn reconnect_udp(&self, new_remote: &UdpEndpoint) -> crate::Result<()> {
+        let socket = self.socket.as_ref().ok_or(crate::Error::UnmanagedSocket)?;
+        socket.reconnect_udp(new_remote)
+    }
+
+    pub fn reconnect_ip(&self, new_remote: &IpEndpoint) -> crate::Result<()> {
+        let socket = self.socket.as_ref().ok_or(crate::Error::UnmanagedSocket)?;
+        socket.reconnect_ip(new_remote)
     }
 }
 

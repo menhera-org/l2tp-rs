@@ -1,6 +1,6 @@
 [package]
 name = "l2tp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 homepage = "https://github.com/menhera-org/l2tp-rs"
 repository = "https://github.com/menhera-org/l2tp-rs"

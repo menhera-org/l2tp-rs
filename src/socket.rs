@@ -202,6 +202,18 @@ impl TunnelSocket {
         connect(self.fd.as_raw_fd(), &remote_addr)
     }
 
+    pub fn reconnect_ip(&self, new_remote: &IpEndpoint) -> crate::Result<()> {
+        if let SocketEncap::Udp = self.encap {
+            return Err(crate::Error::UnmanagedSocket);
+        }
+        if self.family.ip_version() != new_remote.ip_version() {
+            return Err(crate::Error::AddressFamilyMismatch);
+        }
+
+        let remote_addr = l2tp_sockaddr(new_remote, 0);
+        connect(self.fd.as_raw_fd(), &remote_addr)
+    }
+
     pub fn local_addr_udp(&self) -> crate::Result<UdpEndpoint> {
         if let SocketEncap::Ip = self.encap {
             return Err(crate::Error::UnmanagedSocket);
@@ -549,6 +561,48 @@ mod tests {
                 0,
                 0,
             )))
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::AddressFamilyMismatch));
+    }
+
+    #[test]
+    fn reconnect_ip_rejects_udp_socket() {
+        let fd = match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
+            Ok(fd) => fd,
+            Err(crate::Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+                return;
+            }
+            Err(e) => panic!("unexpected socket create error: {e:?}"),
+        };
+        let sock = TunnelSocket {
+            fd,
+            encap: SocketEncap::Udp,
+            family: SocketFamily::V4,
+        };
+
+        let err = sock
+            .reconnect_ip(&IpEndpoint::V4(Ipv4Addr::LOCALHOST))
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::UnmanagedSocket));
+    }
+
+    #[test]
+    fn reconnect_ip_rejects_family_mismatch_with_clear_error() {
+        let fd = match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
+            Ok(fd) => fd,
+            Err(crate::Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+                return;
+            }
+            Err(e) => panic!("unexpected socket create error: {e:?}"),
+        };
+        let sock = TunnelSocket {
+            fd,
+            encap: SocketEncap::Ip,
+            family: SocketFamily::V4,
+        };
+
+        let err = sock
+            .reconnect_ip(&IpEndpoint::V6(Ipv6Addr::LOCALHOST))
             .unwrap_err();
         assert!(matches!(err, crate::Error::AddressFamilyMismatch));
     }
