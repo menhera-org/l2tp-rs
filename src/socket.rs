@@ -10,6 +10,8 @@ const IPPROTO_L2TP: libc::c_int = 115;
 /// Owned tunnel socket used by managed tunnels (`L2TP_ATTR_FD`).
 ///
 /// Dropping this type closes the file descriptor.
+/// Per the kernel L2TP API, closing the tunnel socket tears down the
+/// associated tunnel and sessions.
 pub struct TunnelSocket {
     fd: OwnedFd,
     encap: SocketEncap,

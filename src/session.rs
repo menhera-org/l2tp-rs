@@ -24,7 +24,10 @@ pub struct SessionConfig {
     pub lns_mode: bool,
     /// Receive timeout in milliseconds.
     pub recv_timeout_ms: Option<u64>,
-    /// Optional interface name for session netdevice creation.
+    /// Optional interface name for `SESSION_CREATE`.
+    ///
+    /// For Ethernet pseudowires, this names the `l2tpeth*` netdevice created
+    /// by the kernel. Tunnel objects do not have an `ifname`.
     pub ifname: Option<IfName>,
 }
 

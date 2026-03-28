@@ -101,6 +101,13 @@ Use `IfName` with managed sockets:
 
 `SO_BINDTODEVICE` typically requires `CAP_NET_ADMIN`.
 
+## Kernel Semantics Notes
+
+- `L2TP_ATTR_IFNAME` applies to sessions (`SESSION_CREATE`/session lookups), not tunnels.
+  Tunnels do not create a netdevice.
+- Managed tunnels are fd-backed. When the managed tunnel socket is closed, the kernel
+  tears down that tunnel and its sessions.
+
 ## Unmanaged Tunnels
 
 For kernel-managed tunnels without `L2TP_ATTR_FD`:
@@ -124,7 +131,9 @@ let sstats = handle.session_stats(TunnelId(1000), SessionId(3000)).await?;
 
 - `TunnelHandle` and `SessionHandle` default to `auto_delete = true`.
 - On drop, they spawn best-effort async delete calls.
-- Use `set_auto_delete(false)` if you want to manage cleanup explicitly.
+- Use `set_auto_delete(false)` if you want to avoid those best-effort netlink delete calls.
+- For managed tunnels, dropping the handle still closes the owned tunnel socket fd,
+  which causes the kernel to remove the tunnel/session datapath.
 
 ## Running Tests
 

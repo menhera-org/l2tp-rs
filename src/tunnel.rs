@@ -81,7 +81,11 @@ impl TunnelHandle {
         self.socket.as_mut()
     }
 
-    /// Enables or disables best-effort tunnel deletion on drop.
+    /// Enables or disables best-effort netlink `TUNNEL_DELETE` on drop.
+    ///
+    /// Note: for managed tunnels, dropping the handle also drops the managed
+    /// socket fd, and the kernel closes the tunnel when that fd is closed even
+    /// if `auto_delete` is disabled.
     pub fn set_auto_delete(&mut self, v: bool) {
         self.auto_delete = v;
     }

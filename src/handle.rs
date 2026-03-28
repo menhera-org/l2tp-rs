@@ -45,6 +45,9 @@ impl L2tpHandle {
     }
 
     /// Creates a managed tunnel using an owned socket fd.
+    ///
+    /// The returned [`TunnelHandle`](crate::TunnelHandle) owns `socket`; when
+    /// that socket is dropped, the kernel tears down the tunnel.
     pub async fn create_tunnel(
         &self,
         config: TunnelConfig,
@@ -62,6 +65,9 @@ impl L2tpHandle {
     }
 
     /// Creates an unmanaged tunnel (no owned socket fd in this process).
+    ///
+    /// The kernel creates/manages the underlying socket using netlink tunnel
+    /// address attributes.
     pub async fn create_unmanaged_tunnel(
         &self,
         config: TunnelConfig,
