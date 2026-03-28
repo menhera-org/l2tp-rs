@@ -1,10 +1,9 @@
-use crate::{Encapsulation, IfName, TunnelId, TunnelSocket, TunnelStats};
+use crate::{Encapsulation, TunnelId, TunnelSocket, TunnelStats};
 
 pub struct TunnelConfig {
     pub(crate) tunnel_id: TunnelId,
     pub(crate) peer_tunnel_id: TunnelId,
     pub(crate) encapsulation: Encapsulation,
-    pub(crate) ifname: Option<IfName>,
 }
 
 impl TunnelConfig {
@@ -12,7 +11,6 @@ impl TunnelConfig {
         tunnel_id: TunnelId,
         peer_tunnel_id: TunnelId,
         encapsulation: Encapsulation,
-        ifname: Option<IfName>,
     ) -> crate::Result<Self> {
         match &encapsulation {
             Encapsulation::Udp { local, remote, .. } => {
@@ -31,7 +29,6 @@ impl TunnelConfig {
             tunnel_id,
             peer_tunnel_id,
             encapsulation,
-            ifname,
         })
     }
 }
@@ -42,7 +39,6 @@ pub struct TunnelInfo {
     pub peer_tunnel_id: TunnelId,
     pub proto_version: u8,
     pub encapsulation: Encapsulation,
-    pub ifname: Option<IfName>,
     pub using_ipsec: bool,
 }
 
@@ -123,7 +119,6 @@ mod tests {
                 udp_zero_csum6_tx: false,
                 udp_zero_csum6_rx: false,
             },
-            None,
         )
         .unwrap();
 
@@ -143,7 +138,6 @@ mod tests {
                 udp_zero_csum6_tx: false,
                 udp_zero_csum6_rx: false,
             },
-            None,
         ) {
             Ok(_) => panic!("expected address family mismatch"),
             Err(e) => e,
@@ -161,7 +155,6 @@ mod tests {
                 local: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
                 remote: IpEndpoint::V6(Ipv6Addr::LOCALHOST),
             },
-            None,
         ) {
             Ok(_) => panic!("expected address family mismatch"),
             Err(e) => e,

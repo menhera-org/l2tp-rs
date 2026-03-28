@@ -72,10 +72,6 @@ pub(crate) fn encode_tunnel_create(config: &TunnelConfig, fd: Option<RawFd>) -> 
     if let Some(fd) = fd {
         attrs.push(L2tpAttribute::Fd(fd));
     }
-    if let Some(ifname) = &config.ifname {
-        attrs.push(L2tpAttribute::IfName(ifname.as_str().to_string()));
-    }
-
     L2tpMessage::tunnel_create(attrs)
 }
 
@@ -184,7 +180,6 @@ pub(crate) fn decode_tunnel_info(attrs: &[L2tpAttribute]) -> crate::Result<Tunne
     let mut peer_tunnel_id = None;
     let mut proto_version = None;
     let mut encap_type = None;
-    let mut ifname: Option<IfName> = None;
     let mut using_ipsec = false;
 
     let mut ip_saddr_v4 = None;
@@ -203,7 +198,6 @@ pub(crate) fn decode_tunnel_info(attrs: &[L2tpAttribute]) -> crate::Result<Tunne
             L2tpAttribute::PeerConnId(v) => peer_tunnel_id = Some(TunnelId(*v)),
             L2tpAttribute::ProtoVersion(v) => proto_version = Some(*v),
             L2tpAttribute::EncapType(v) => encap_type = Some(*v),
-            L2tpAttribute::IfName(v) => ifname = Some(IfName::new(v.clone())?),
             L2tpAttribute::UsingIpsec(v) => using_ipsec = *v,
             L2tpAttribute::IpSaddr(v) => ip_saddr_v4 = Some(*v),
             L2tpAttribute::IpDaddr(v) => ip_daddr_v4 = Some(*v),
@@ -287,7 +281,6 @@ pub(crate) fn decode_tunnel_info(attrs: &[L2tpAttribute]) -> crate::Result<Tunne
         peer_tunnel_id,
         proto_version,
         encapsulation,
-        ifname,
         using_ipsec,
     })
 }
@@ -473,7 +466,6 @@ mod tests {
                 udp_zero_csum6_tx: true,
                 udp_zero_csum6_rx: true,
             },
-            Some(IfName::new("l2tp0").unwrap()),
         )
         .unwrap();
 
@@ -530,9 +522,9 @@ mod tests {
             a,
             L2tpAttribute::Fd(7)
         )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
+        assert!(!has_attr(&msg.attributes, |a| matches!(
             a,
-            L2tpAttribute::IfName(name) if name == "l2tp0"
+            L2tpAttribute::IfName(_)
         )));
     }
 
@@ -545,7 +537,6 @@ mod tests {
                 local: IpEndpoint::V6(Ipv6Addr::LOCALHOST),
                 remote: IpEndpoint::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 3, 4, 5, 6)),
             },
-            None,
         )
         .unwrap();
 
@@ -581,7 +572,6 @@ mod tests {
                 udp_zero_csum6_tx: false,
                 udp_zero_csum6_rx: false,
             },
-            ifname: None,
         };
 
         let _ = encode_tunnel_create(&cfg, None);
@@ -597,7 +587,6 @@ mod tests {
                 local: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
                 remote: IpEndpoint::V6(Ipv6Addr::LOCALHOST),
             },
-            ifname: None,
         };
 
         let _ = encode_tunnel_create(&cfg, None);
@@ -714,7 +703,7 @@ mod tests {
             L2tpAttribute::UdpCsum(true),
             L2tpAttribute::UdpZeroCsum6Tx,
             L2tpAttribute::UsingIpsec(true),
-            L2tpAttribute::IfName("l2tpv6".into()),
+            L2tpAttribute::IfName("ignored-on-tunnel".into()),
         ];
 
         let info = decode_tunnel_info(&attrs).unwrap();
@@ -722,7 +711,6 @@ mod tests {
         assert_eq!(info.peer_tunnel_id, TunnelId(200));
         assert_eq!(info.proto_version, 3);
         assert!(info.using_ipsec);
-        assert_eq!(info.ifname.unwrap().as_str(), "l2tpv6");
 
         match info.encapsulation {
             Encapsulation::Udp {

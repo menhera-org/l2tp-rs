@@ -50,7 +50,6 @@ async fn main() -> l2tp::Result<()> {
             udp_zero_csum6_tx: false,
             udp_zero_csum6_rx: false,
         },
-        None,
     )?;
 
     let tunnel = handle.create_tunnel(tunnel_cfg, socket).await?;
@@ -83,7 +82,6 @@ async fn main() -> l2tp::Result<()> {
         TunnelId(5000),
         TunnelId(6000),
         Encapsulation::Ip { local, remote },
-        None,
     )?;
 
     let _tunnel = handle.create_tunnel(cfg, socket).await?;

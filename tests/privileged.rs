@@ -72,7 +72,6 @@ fn privileged_unmanaged_tunnel_lifecycle_over_genl() {
                     udp_zero_csum6_tx: false,
                     udp_zero_csum6_rx: false,
                 },
-                None,
             )
             .unwrap_or_else(|e| panic!("TunnelConfig::new failed: {e}"));
 
@@ -138,7 +137,6 @@ fn privileged_session_lifecycle_over_genl() {
                     local: IpEndpoint::V4(Ipv4Addr::new(127, 0, 0, 1)),
                     remote: IpEndpoint::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 },
-                None,
             )
             .unwrap_or_else(|e| panic!("TunnelConfig::new failed: {e}"));
 
