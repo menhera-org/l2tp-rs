@@ -261,7 +261,7 @@ impl L2tpHandle {
                 NetlinkPayload::Error(err) => {
                     if let Some(code) = err.code {
                         return Err(crate::Error::KernelError {
-                            code: code.get(),
+                            code: normalize_errno(code.get()),
                             message: err.to_string(),
                         });
                     }
@@ -291,4 +291,29 @@ fn first_attributes<'a>(
 
 fn to_io_error(err: genetlink::GenetlinkError) -> crate::Error {
     io::Error::new(io::ErrorKind::Other, err.to_string()).into()
+}
+
+fn normalize_errno(code: i32) -> i32 {
+    if code < 0 {
+        -code
+    } else {
+        code
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_errno;
+
+    #[test]
+    fn normalize_errno_converts_negative_to_positive() {
+        assert_eq!(normalize_errno(-libc::EEXIST), libc::EEXIST);
+        assert_eq!(normalize_errno(-libc::EINVAL), libc::EINVAL);
+    }
+
+    #[test]
+    fn normalize_errno_keeps_non_negative_unchanged() {
+        assert_eq!(normalize_errno(0), 0);
+        assert_eq!(normalize_errno(libc::ENOENT), libc::ENOENT);
+    }
 }

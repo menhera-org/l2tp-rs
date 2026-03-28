@@ -29,7 +29,7 @@ fn next_id_base() -> u32 {
 
 fn is_eexist(err: &l2tp::Error) -> bool {
     match err {
-        l2tp::Error::KernelError { code, .. } => code.abs() == libc::EEXIST,
+        l2tp::Error::KernelError { code, .. } => *code == libc::EEXIST,
         _ => false,
     }
 }
