@@ -1,19 +1,32 @@
 use std::fmt;
 
+/// Kernel tunnel identifier (`L2TP_ATTR_CONN_ID`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TunnelId(pub u32);
+pub struct TunnelId(
+    /// Raw numeric tunnel identifier.
+    pub u32,
+);
 
+/// Kernel session identifier (`L2TP_ATTR_SESSION_ID`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SessionId(pub u32);
+pub struct SessionId(
+    /// Raw numeric session identifier.
+    pub u32,
+);
 
+/// Session cookie bytes.
+///
+/// Valid lengths are `0`, `4`, or `8`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cookie(Vec<u8>);
 
 impl Cookie {
+    /// Returns an empty cookie.
     pub fn none() -> Self {
         Self(Vec::new())
     }
 
+    /// Creates a cookie from bytes after validating its length.
     pub fn try_from_bytes(b: Vec<u8>) -> crate::Result<Self> {
         match b.len() {
             0 | 4 | 8 => Ok(Self(b)),
@@ -21,15 +34,21 @@ impl Cookie {
         }
     }
 
+    /// Returns the raw cookie bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
 
+/// Linux interface name (`IFNAMSIZ - 1` max bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IfName(String);
 
 impl IfName {
+    /// Validates and constructs an interface name.
+    ///
+    /// The name must be non-empty, must not contain NUL or `/`, and must be
+    /// at most `IFNAMSIZ - 1` bytes.
     pub fn new(s: impl Into<String>) -> crate::Result<Self> {
         let s = s.into();
         let b = s.as_bytes();
@@ -50,6 +69,7 @@ impl IfName {
         Ok(Self(s))
     }
 
+    /// Returns the interface name as `&str`.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -61,13 +81,17 @@ impl fmt::Display for IfName {
     }
 }
 
+/// UDP socket endpoint used for UDP encapsulated tunnels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UdpEndpoint {
+    /// IPv4 endpoint.
     V4(std::net::SocketAddrV4),
+    /// IPv6 endpoint.
     V6(std::net::SocketAddrV6),
 }
 
 impl UdpEndpoint {
+    /// Returns `4` for IPv4 endpoints and `6` for IPv6 endpoints.
     pub fn ip_version(&self) -> u8 {
         match self {
             Self::V4(_) => 4,
@@ -76,13 +100,17 @@ impl UdpEndpoint {
     }
 }
 
+/// IP endpoint used for IP encapsulated (`L2TPIP`) tunnels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpEndpoint {
+    /// IPv4 endpoint.
     V4(std::net::Ipv4Addr),
+    /// IPv6 endpoint.
     V6(std::net::Ipv6Addr),
 }
 
 impl IpEndpoint {
+    /// Returns `4` for IPv4 endpoints and `6` for IPv6 endpoints.
     pub fn ip_version(&self) -> u8 {
         match self {
             Self::V4(_) => 4,
@@ -91,35 +119,55 @@ impl IpEndpoint {
     }
 }
 
+/// Tunnel encapsulation parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Encapsulation {
+    /// UDP-encapsulated L2TPv3 tunnel.
     Udp {
+        /// Local UDP address.
         local: UdpEndpoint,
+        /// Remote UDP address.
         remote: UdpEndpoint,
+        /// Whether UDP checksum is enabled.
         udp_csum: bool,
+        /// Whether zero-checksum transmit is enabled for IPv6.
         udp_zero_csum6_tx: bool,
+        /// Whether zero-checksum receive is enabled for IPv6.
         udp_zero_csum6_rx: bool,
     },
+    /// IP-encapsulated L2TPv3 tunnel.
     Ip {
+        /// Local IP address.
         local: IpEndpoint,
+        /// Remote IP address.
         remote: IpEndpoint,
     },
 }
 
+/// Session pseudowire type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PseudowireType {
+    /// Ethernet pseudowire.
     Eth,
+    /// Ethernet VLAN pseudowire.
     EthVlan,
+    /// PPP pseudowire.
     Ppp,
+    /// PPP Access Concentrator pseudowire.
     PppAc,
+    /// IP pseudowire.
     Ip,
+    /// No pseudowire payload type.
     None,
 }
 
+/// L2-specific sublayer header type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum L2SpecType {
+    /// No L2-specific sublayer header.
     #[default]
     None,
+    /// Kernel default L2-specific sublayer header.
     Default,
 }
 

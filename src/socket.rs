@@ -7,6 +7,9 @@ use crate::{IfName, IpEndpoint, UdpEndpoint};
 const AF_L2TPIP: libc::c_int = 28;
 const IPPROTO_L2TP: libc::c_int = 115;
 
+/// Owned tunnel socket used by managed tunnels (`L2TP_ATTR_FD`).
+///
+/// Dropping this type closes the file descriptor.
 pub struct TunnelSocket {
     fd: OwnedFd,
     encap: SocketEncap,
@@ -94,6 +97,9 @@ impl SockAddr {
 }
 
 impl TunnelSocket {
+    /// Creates and connects a UDP socket for an L2TP tunnel.
+    ///
+    /// If `device` is provided, `SO_BINDTODEVICE` is applied before bind/connect.
     pub fn udp(
         local: &UdpEndpoint,
         remote: &UdpEndpoint,
@@ -127,6 +133,10 @@ impl TunnelSocket {
         })
     }
 
+    /// Creates and connects an IP-encapsulated L2TP socket.
+    ///
+    /// The local bind uses `tunnel_id` as `l2tp_conn_id`; the remote connect
+    /// uses conn_id `0`.
     pub fn ip(
         local: &IpEndpoint,
         remote: &IpEndpoint,
@@ -161,10 +171,12 @@ impl TunnelSocket {
         })
     }
 
+    /// Applies `SO_BINDTODEVICE` on this socket.
     pub fn bind_to_device(&self, device: &IfName) -> crate::Result<()> {
         set_bind_to_device(self.fd.as_raw_fd(), device)
     }
 
+    /// Sets `IPV6_DONTFRAG` for this socket.
     pub fn set_ipv6_dontfrag(&self, dontfrag: bool) -> crate::Result<()> {
         let value: libc::c_int = if dontfrag { 1 } else { 0 };
         // SAFETY: `value` is a valid pointer to a `c_int`, and `self.fd` is an
@@ -190,6 +202,7 @@ impl TunnelSocket {
         Ok(())
     }
 
+    /// Reconnects a managed UDP tunnel socket to a new remote endpoint.
     pub fn reconnect_udp(&self, new_remote: &UdpEndpoint) -> crate::Result<()> {
         if let SocketEncap::Ip = self.encap {
             return Err(crate::Error::UnmanagedSocket);
@@ -202,6 +215,7 @@ impl TunnelSocket {
         connect(self.fd.as_raw_fd(), &remote_addr)
     }
 
+    /// Reconnects a managed IP tunnel socket to a new remote endpoint.
     pub fn reconnect_ip(&self, new_remote: &IpEndpoint) -> crate::Result<()> {
         if let SocketEncap::Udp = self.encap {
             return Err(crate::Error::UnmanagedSocket);
@@ -214,6 +228,9 @@ impl TunnelSocket {
         connect(self.fd.as_raw_fd(), &remote_addr)
     }
 
+    /// Returns the current local UDP socket address.
+    ///
+    /// This is only valid for UDP-encapsulated managed sockets.
     pub fn local_addr_udp(&self) -> crate::Result<UdpEndpoint> {
         if let SocketEncap::Ip = self.encap {
             return Err(crate::Error::UnmanagedSocket);

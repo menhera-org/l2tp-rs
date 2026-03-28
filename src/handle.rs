@@ -13,6 +13,7 @@ use crate::{
     TunnelConfig, TunnelHandle, TunnelId, TunnelInfo, TunnelModify, TunnelSocket, TunnelStats,
 };
 
+/// Shared async handle for L2TP generic-netlink operations.
 #[derive(Clone)]
 pub struct L2tpHandle {
     inner: Arc<L2tpInner>,
@@ -43,6 +44,7 @@ impl L2tpHandle {
         })
     }
 
+    /// Creates a managed tunnel using an owned socket fd.
     pub async fn create_tunnel(
         &self,
         config: TunnelConfig,
@@ -59,6 +61,7 @@ impl L2tpHandle {
         })
     }
 
+    /// Creates an unmanaged tunnel (no owned socket fd in this process).
     pub async fn create_unmanaged_tunnel(
         &self,
         config: TunnelConfig,
@@ -74,6 +77,7 @@ impl L2tpHandle {
         })
     }
 
+    /// Creates a session in an existing tunnel.
     pub async fn create_session(&self, config: SessionConfig) -> crate::Result<SessionHandle> {
         let message = netlink::encode_session_create(&config);
         self.send_ack(message).await?;
@@ -91,6 +95,7 @@ impl L2tpHandle {
         })
     }
 
+    /// Returns information for a single tunnel.
     pub async fn get_tunnel(&self, tunnel_id: TunnelId) -> crate::Result<TunnelInfo> {
         let replies = self
             .send_and_collect(netlink::encode_tunnel_get(tunnel_id), NLM_F_REQUEST)
@@ -99,6 +104,7 @@ impl L2tpHandle {
         netlink::decode_tunnel_info(attrs)
     }
 
+    /// Returns information for a single session.
     pub async fn get_session(
         &self,
         tunnel_id: TunnelId,
@@ -114,6 +120,7 @@ impl L2tpHandle {
         netlink::decode_session_info(attrs)
     }
 
+    /// Lists all tunnels.
     pub async fn list_tunnels(&self) -> crate::Result<Vec<TunnelInfo>> {
         let replies = self
             .send_and_collect(
@@ -128,6 +135,7 @@ impl L2tpHandle {
         Ok(out)
     }
 
+    /// Lists all sessions that belong to a tunnel.
     pub async fn list_sessions(&self, tunnel_id: TunnelId) -> crate::Result<Vec<SessionInfo>> {
         let replies = self
             .send_and_collect(
@@ -142,6 +150,7 @@ impl L2tpHandle {
         Ok(out)
     }
 
+    /// Lists all sessions across all tunnels.
     pub async fn list_all_sessions(&self) -> crate::Result<Vec<SessionInfo>> {
         let replies = self
             .send_and_collect(
@@ -156,11 +165,13 @@ impl L2tpHandle {
         Ok(out)
     }
 
+    /// Deletes a tunnel.
     pub async fn delete_tunnel(&self, tunnel_id: TunnelId) -> crate::Result<()> {
         self.send_ack(netlink::encode_tunnel_delete(tunnel_id))
             .await
     }
 
+    /// Deletes a session from a tunnel.
     pub async fn delete_session(
         &self,
         tunnel_id: TunnelId,
@@ -170,6 +181,7 @@ impl L2tpHandle {
             .await
     }
 
+    /// Returns tunnel statistics.
     pub async fn tunnel_stats(&self, tunnel_id: TunnelId) -> crate::Result<TunnelStats> {
         let replies = self
             .send_and_collect(netlink::encode_tunnel_get(tunnel_id), NLM_F_REQUEST)
@@ -178,6 +190,7 @@ impl L2tpHandle {
         netlink::decode_tunnel_stats(attrs)
     }
 
+    /// Returns session statistics.
     pub async fn session_stats(
         &self,
         tunnel_id: TunnelId,
@@ -193,6 +206,7 @@ impl L2tpHandle {
         netlink::decode_session_stats(attrs)
     }
 
+    /// Applies mutable tunnel parameters.
     pub async fn modify_tunnel(
         &self,
         tunnel_id: TunnelId,
@@ -202,6 +216,7 @@ impl L2tpHandle {
             .await
     }
 
+    /// Applies mutable session parameters.
     pub async fn modify_session(
         &self,
         tunnel_id: TunnelId,

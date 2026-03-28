@@ -1,5 +1,6 @@
 use crate::{Encapsulation, IpEndpoint, TunnelId, TunnelSocket, TunnelStats, UdpEndpoint};
 
+/// Parameters for creating an L2TP tunnel.
 pub struct TunnelConfig {
     pub(crate) tunnel_id: TunnelId,
     pub(crate) peer_tunnel_id: TunnelId,
@@ -7,6 +8,7 @@ pub struct TunnelConfig {
 }
 
 impl TunnelConfig {
+    /// Creates a tunnel configuration and validates endpoint address families.
     pub fn new(
         tunnel_id: TunnelId,
         peer_tunnel_id: TunnelId,
@@ -33,20 +35,29 @@ impl TunnelConfig {
     }
 }
 
+/// Runtime information returned by the kernel for a tunnel.
 #[derive(Debug, Clone)]
 pub struct TunnelInfo {
+    /// Local tunnel identifier.
     pub tunnel_id: TunnelId,
+    /// Peer tunnel identifier.
     pub peer_tunnel_id: TunnelId,
+    /// L2TP protocol version.
     pub proto_version: u8,
+    /// Active encapsulation settings.
     pub encapsulation: Encapsulation,
+    /// Whether IPsec offload/protection is in use.
     pub using_ipsec: bool,
 }
 
+/// Mutable tunnel parameters.
 #[derive(Debug, Clone, Default)]
 pub struct TunnelModify {
+    /// Optional UDP checksum enable/disable update.
     pub udp_csum: Option<bool>,
 }
 
+/// Handle for managing a tunnel lifecycle.
 pub struct TunnelHandle {
     pub(crate) tunnel_id: TunnelId,
     pub(crate) socket: Option<TunnelSocket>,
@@ -55,39 +66,48 @@ pub struct TunnelHandle {
 }
 
 impl TunnelHandle {
+    /// Returns this handle's tunnel identifier.
     pub fn tunnel_id(&self) -> TunnelId {
         self.tunnel_id
     }
 
+    /// Returns the managed socket, if the tunnel was created as managed.
     pub fn socket(&self) -> Option<&TunnelSocket> {
         self.socket.as_ref()
     }
 
+    /// Returns a mutable managed socket reference, if present.
     pub fn socket_mut(&mut self) -> Option<&mut TunnelSocket> {
         self.socket.as_mut()
     }
 
+    /// Enables or disables best-effort tunnel deletion on drop.
     pub fn set_auto_delete(&mut self, v: bool) {
         self.auto_delete = v;
     }
 
+    /// Fetches current tunnel information from the kernel.
     pub async fn get(&self) -> crate::Result<TunnelInfo> {
         self.handle.get_tunnel(self.tunnel_id).await
     }
 
+    /// Fetches tunnel statistics from the kernel.
     pub async fn stats(&self) -> crate::Result<TunnelStats> {
         self.handle.tunnel_stats(self.tunnel_id).await
     }
 
+    /// Applies mutable tunnel parameters.
     pub async fn modify(&self, params: TunnelModify) -> crate::Result<()> {
         self.handle.modify_tunnel(self.tunnel_id, params).await
     }
 
+    /// Reconnects a managed UDP tunnel socket to a new remote endpoint.
     pub fn reconnect_udp(&self, new_remote: &UdpEndpoint) -> crate::Result<()> {
         let socket = self.socket.as_ref().ok_or(crate::Error::UnmanagedSocket)?;
         socket.reconnect_udp(new_remote)
     }
 
+    /// Reconnects a managed IP tunnel socket to a new remote endpoint.
     pub fn reconnect_ip(&self, new_remote: &IpEndpoint) -> crate::Result<()> {
         let socket = self.socket.as_ref().ok_or(crate::Error::UnmanagedSocket)?;
         socket.reconnect_ip(new_remote)
