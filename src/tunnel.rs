@@ -124,9 +124,16 @@ impl TunnelHandle {
     }
 
     /// Deletes the tunnel and waits for the kernel to acknowledge it.
+    /// Once polled inside a Tokio runtime, deletion continues even if the
+    /// caller cancels this future.
     pub async fn delete(mut self) -> crate::Result<()> {
-        self.auto_delete = false;
-        self.handle.delete_tunnel(self.tunnel_id).await
+        crate::handle::run_cleanup(async move {
+            self.handle.delete_tunnel(self.tunnel_id).await?;
+            self.auto_delete = false;
+            drop(self);
+            Ok(())
+        })
+        .await
     }
 
     /// Reconnects a managed UDP tunnel socket to a new remote endpoint.

@@ -184,7 +184,7 @@ match handle.create_unmanaged_tunnel(cfg).await {
 - `serde` derives on the statistics types now require the `serde` feature.
 - Modules are private; import everything from the crate root (e.g. `l2tp::L2tpHandle`).
 - `TunnelModify`, `TunnelHandle::modify` and `L2tpHandle::modify_tunnel` were removed:
-  the kernel ignored the request.
+  the kernel accepted these requests but did not apply their UDP checksum setting.
 - `TunnelSocket::ip` takes a `TunnelId` instead of a `u32`.
 - `Error` is `#[non_exhaustive]`. `Error::Netlink` holds a message instead of a
   `netlink-packet-core` type. Malformed kernel replies are reported as

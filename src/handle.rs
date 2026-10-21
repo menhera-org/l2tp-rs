@@ -2,9 +2,10 @@
 
 use std::{fmt, io, os::fd::AsRawFd, sync::Arc};
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use netlink_packet_core::{
-    NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
+    NLM_F_ACK, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_MULTIPART, NLM_F_REQUEST,
+    NetlinkMessage, NetlinkPayload,
 };
 use netlink_packet_generic::GenlMessage;
 use netlink_packet_l2tp::{L2tpAttribute, L2tpMessage};
@@ -49,7 +50,9 @@ impl L2tpHandle {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             io::Error::other("tokio runtime is required for L2tpHandle::new()")
         })?;
-        let (connection, genl, _unsolicited) = genetlink::new_connection()?;
+        let (mut connection, genl, _unsolicited) = genetlink::new_connection()?;
+        connection.set_forward_ack(true);
+        connection.set_forward_done(true);
         runtime.spawn(connection);
 
         Ok(Self {
@@ -109,33 +112,40 @@ impl L2tpHandle {
     }
 
     /// Creates a session in an existing tunnel.
+    /// Cancellation during the follow-up information lookup schedules
+    /// best-effort deletion of the acknowledged session.
     pub async fn create_session(
         &self,
         config: SessionConfig,
     ) -> crate::Result<SessionHandle> {
         let message = netlink::encode_session_create(&config)?;
         self.send_ack(message).await?;
+        self.get_created_session(config).await
+    }
 
-        let info =
-            match self.get_session(config.tunnel_id, config.session_id).await {
-                Ok(info) => info,
-                Err(err) => {
-                    // Without a handle the caller could not clean the session
-                    // up.
-                    let _ = self
-                        .delete_session(config.tunnel_id, config.session_id)
-                        .await;
-                    return Err(err);
-                }
-            };
-
-        Ok(SessionHandle {
+    async fn get_created_session(
+        &self,
+        config: SessionConfig,
+    ) -> crate::Result<SessionHandle> {
+        // Own the acknowledged session before the next await, so cancellation
+        // also triggers best-effort deletion.
+        let mut session = SessionHandle {
             tunnel_id: config.tunnel_id,
             session_id: config.session_id,
-            ifname: info.ifname,
+            ifname: None,
             auto_delete: true,
             handle: self.clone(),
-        })
+        };
+        match self.get_session(config.tunnel_id, config.session_id).await {
+            Ok(info) => {
+                session.ifname = info.ifname;
+                Ok(session)
+            }
+            Err(err) => {
+                let _ = session.delete().await;
+                Err(err)
+            }
+        }
     }
 
     /// Returns information for a single tunnel.
@@ -312,31 +322,95 @@ impl L2tpHandle {
         let mut handle = self.inner.genl.clone();
         let mut stream = handle.send_request(request).map_err(to_io_error)?;
 
-        let mut responses = Vec::new();
-        while let Some(item) = stream.next().await {
-            let message = item.map_err(crate::Error::netlink)?;
-            match message.payload {
-                NetlinkPayload::InnerMessage(inner) => responses.push(inner),
-                NetlinkPayload::Error(err) => {
-                    if let Some(code) = err.code {
-                        return Err(crate::Error::KernelError {
-                            code: normalize_errno(code.get()),
-                            message: err.to_string(),
-                        });
-                    }
-                }
-                NetlinkPayload::Done(_) => break,
-                NetlinkPayload::Overrun(_) => {
-                    return Err(crate::Error::Netlink(
-                        "netlink overrun: reply was truncated".to_string(),
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        Ok(responses)
+        collect_responses(&mut stream, flags).await
     }
+}
+
+async fn collect_responses<S>(
+    stream: S,
+    flags: u16,
+) -> crate::Result<Vec<GenlMessage<L2tpMessage>>>
+where
+    S: Stream<
+        Item = Result<
+            NetlinkMessage<GenlMessage<L2tpMessage>>,
+            netlink_packet_core::DecodeError,
+        >,
+    >,
+{
+    futures::pin_mut!(stream);
+    let expect_ack = flags & NLM_F_ACK != 0;
+    let mut expect_done = flags & NLM_F_DUMP == NLM_F_DUMP;
+    let mut responses = Vec::new();
+    while let Some(item) = stream.next().await {
+        let message = item.map_err(crate::Error::netlink)?;
+        if message.header.flags & NLM_F_DUMP_INTR != 0 {
+            return Err(crate::Error::Netlink(
+                "netlink dump was interrupted".to_string(),
+            ));
+        }
+        let multipart = message.header.flags & NLM_F_MULTIPART != 0;
+        match message.payload {
+            NetlinkPayload::InnerMessage(inner) => {
+                responses.push(inner);
+                expect_done |= multipart;
+                if !expect_ack && !expect_done {
+                    return Ok(responses);
+                }
+            }
+            NetlinkPayload::Error(err) => {
+                if let Some(code) = err.code {
+                    return Err(crate::Error::KernelError {
+                        code: normalize_errno(code.get()),
+                        message: err.to_string(),
+                    });
+                }
+                if expect_ack && !expect_done {
+                    return Ok(responses);
+                }
+            }
+            NetlinkPayload::Done(done) => {
+                if done.code != 0 {
+                    return Err(crate::Error::KernelError {
+                        code: normalize_errno(done.code),
+                        message: format!("netlink dump failed: {}", done.code),
+                    });
+                }
+                if expect_done {
+                    return Ok(responses);
+                }
+                return Err(crate::Error::UnexpectedReply(
+                    "unexpected netlink DONE".to_string(),
+                ));
+            }
+            NetlinkPayload::Overrun(_) => {
+                return Err(crate::Error::Netlink(
+                    "netlink overrun: reply was truncated".to_string(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "netlink reply stream closed before request completion",
+    )
+    .into())
+}
+
+// Keep the owning handle in a separate task: cancelling the caller must not
+// cancel a deletion after ownership has been consumed.
+pub(crate) async fn run_cleanup<F>(cleanup: F) -> crate::Result<()>
+where
+    F: std::future::Future<Output = crate::Result<()>> + Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+        io::Error::other("tokio runtime is required for deletion")
+    })?;
+    runtime
+        .spawn(cleanup)
+        .await
+        .map_err(|err| io::Error::other(err.to_string()))?
 }
 
 fn first_attributes<'a>(
@@ -359,7 +433,236 @@ fn normalize_errno(code: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{L2tpHandle, normalize_errno};
+    use netlink_packet_core::{DoneMessage, ErrorMessage};
+    use netlink_packet_l2tp::L2tpCmd;
+
+    use super::*;
+
+    type Reply = NetlinkMessage<GenlMessage<L2tpMessage>>;
+
+    fn reply() -> Reply {
+        NetlinkMessage::from(GenlMessage::from_payload(L2tpMessage::new(
+            L2tpCmd::TunnelGet,
+        )))
+    }
+
+    fn ack() -> Reply {
+        NetlinkMessage::new(
+            Default::default(),
+            NetlinkPayload::Error(ErrorMessage::default()),
+        )
+    }
+
+    fn done(code: i32) -> Reply {
+        let mut message = DoneMessage::default();
+        message.code = code;
+        NetlinkMessage::new(Default::default(), NetlinkPayload::Done(message))
+    }
+
+    fn collect(
+        messages: Vec<Reply>,
+        flags: u16,
+    ) -> crate::Result<Vec<GenlMessage<L2tpMessage>>> {
+        futures::executor::block_on(collect_responses(
+            futures::stream::iter(messages.into_iter().map(Ok)),
+            flags,
+        ))
+    }
+
+    #[test]
+    fn missing_ack_or_dump_completion_is_an_error() {
+        for flags in [
+            NLM_F_REQUEST,
+            NLM_F_REQUEST | NLM_F_ACK,
+            NLM_F_REQUEST | NLM_F_DUMP,
+        ] {
+            let err = collect(vec![], flags).unwrap_err();
+            assert_eq!(err.kind(), Some(io::ErrorKind::UnexpectedEof));
+        }
+        // An ordinary reply cannot substitute for the requested ACK.
+        assert!(collect(vec![reply()], NLM_F_REQUEST | NLM_F_ACK).is_err());
+        // A partial dump cannot substitute for DONE.
+        let mut partial = reply();
+        partial.header.flags = NLM_F_MULTIPART;
+        assert!(
+            collect(vec![partial.clone()], NLM_F_REQUEST | NLM_F_DUMP).is_err()
+        );
+        assert!(collect(vec![partial], NLM_F_REQUEST).is_err());
+    }
+
+    #[test]
+    fn request_completion_matches_request_type() {
+        assert!(
+            collect(vec![ack()], NLM_F_REQUEST | NLM_F_ACK)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(collect(vec![reply()], NLM_F_REQUEST).unwrap().len(), 1);
+        let mut partial = reply();
+        partial.header.flags = NLM_F_MULTIPART;
+        assert_eq!(
+            collect(vec![partial, done(0)], NLM_F_REQUEST | NLM_F_DUMP)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            collect(vec![done(0)], NLM_F_REQUEST | NLM_F_DUMP)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(collect(vec![ack()], NLM_F_REQUEST | NLM_F_DUMP).is_err());
+        assert!(collect(vec![done(0)], NLM_F_REQUEST | NLM_F_ACK).is_err());
+    }
+
+    #[test]
+    fn dump_errors_and_interruptions_are_not_success() {
+        assert_eq!(
+            collect(vec![done(-libc::EIO)], NLM_F_REQUEST | NLM_F_DUMP)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        for mut message in [reply(), done(0)] {
+            message.header.flags = NLM_F_DUMP_INTR;
+            assert!(matches!(
+                collect(vec![message], NLM_F_REQUEST | NLM_F_DUMP),
+                Err(crate::Error::Netlink(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn kernel_ack_errors_are_preserved() {
+        let mut error = ErrorMessage::default();
+        error.code = std::num::NonZeroI32::new(-libc::EPERM);
+        let message = NetlinkMessage::new(
+            Default::default(),
+            NetlinkPayload::Error(error),
+        );
+        assert_eq!(
+            collect(vec![message], NLM_F_REQUEST | NLM_F_ACK)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+    }
+
+    #[test]
+    fn deletion_continues_after_caller_cancellation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+            let mut deletion = Box::pin(run_cleanup(async move {
+                started_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+                completed_tx.send(()).unwrap();
+                Ok(())
+            }));
+            assert!(futures::poll!(deletion.as_mut()).is_pending());
+            started_rx.await.unwrap();
+            drop(deletion);
+            finish_tx.send(()).unwrap();
+            completed_rx
+                .await
+                .expect("deletion must finish after cancellation");
+        });
+    }
+
+    #[test]
+    fn deletion_propagates_failure() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let err = run_cleanup(async {
+                Err(crate::Error::KernelError {
+                    code: libc::EPERM,
+                    message: "denied".into(),
+                })
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+        });
+    }
+
+    #[test]
+    fn connection_shutdown_does_not_acknowledge_request() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (connection, genl, _unsolicited) =
+                match genetlink::new_connection() {
+                    Ok(connection) => connection,
+                    Err(err)
+                        if err.kind() == io::ErrorKind::PermissionDenied =>
+                    {
+                        return;
+                    }
+                    Err(err) => panic!("{err}"),
+                };
+            let handle = L2tpHandle {
+                inner: Arc::new(L2tpInner {
+                    genl,
+                    family_id: tokio::sync::OnceCell::new_with(Some(1234)),
+                }),
+            };
+            let mut request = Box::pin(handle.delete_tunnel(TunnelId(123)));
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            // No connection task ran, so the request never reached the kernel.
+            drop(connection);
+            assert_eq!(
+                request.await.unwrap_err().kind(),
+                Some(io::ErrorKind::UnexpectedEof)
+            );
+        });
+    }
+
+    #[test]
+    fn cancelled_session_lookup_keeps_cleanup_ownership() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (_connection, genl, _unsolicited) =
+                match genetlink::new_connection() {
+                    Ok(connection) => connection,
+                    Err(err)
+                        if err.kind() == io::ErrorKind::PermissionDenied =>
+                    {
+                        return;
+                    }
+                    Err(err) => panic!("{err}"),
+                };
+            let handle = L2tpHandle {
+                inner: Arc::new(L2tpInner {
+                    genl,
+                    family_id: tokio::sync::OnceCell::new_with(Some(1234)),
+                }),
+            };
+            // This is the post-ACK phase; the idle connection leaves GET
+            // pending.
+            let mut lookup = Box::pin(handle.get_created_session(
+                SessionConfig::eth(TunnelId(1), SessionId(2), SessionId(3)),
+            ));
+            assert!(futures::poll!(lookup.as_mut()).is_pending());
+            drop(lookup);
+            // On this single-thread runtime the cleanup task cannot run until
+            // we yield. Its reference proves Drop scheduled cleanup rather than
+            // discarding ownership of the acknowledged session.
+            assert_eq!(Arc::strong_count(&handle.inner), 2);
+        });
+    }
 
     #[test]
     fn normalize_errno_converts_negative_to_positive() {

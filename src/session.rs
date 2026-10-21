@@ -167,11 +167,18 @@ impl SessionHandle {
     }
 
     /// Deletes the session and waits for the kernel to acknowledge it.
+    /// Once polled inside a Tokio runtime, deletion continues even if the
+    /// caller cancels this future.
     pub async fn delete(mut self) -> crate::Result<()> {
-        self.auto_delete = false;
-        self.handle
-            .delete_session(self.tunnel_id, self.session_id)
-            .await
+        crate::handle::run_cleanup(async move {
+            self.handle
+                .delete_session(self.tunnel_id, self.session_id)
+                .await?;
+            self.auto_delete = false;
+            drop(self);
+            Ok(())
+        })
+        .await
     }
 }
 
