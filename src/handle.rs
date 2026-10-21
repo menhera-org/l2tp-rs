@@ -37,9 +37,14 @@ impl fmt::Debug for L2tpHandle {
 impl L2tpHandle {
     /// Create a new L2TP Generic Netlink handle.
     ///
-    /// This must be awaited while running inside a Tokio runtime because the
-    /// internal Generic Netlink connection task is spawned onto the current
-    /// Tokio executor.
+    /// This must be awaited while running inside a Tokio runtime with I/O
+    /// enabled, because the internal Generic Netlink connection task is
+    /// spawned onto the current Tokio executor. The handle is cheap to clone;
+    /// clones share one netlink connection.
+    ///
+    /// Requests that refer to a tunnel or session the kernel does not know
+    /// fail with [`Error::KernelError`](crate::Error::KernelError) carrying
+    /// `ENODEV`.
     pub async fn new() -> crate::Result<Self> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             io::Error::other("tokio runtime is required for L2tpHandle::new()")
@@ -61,6 +66,9 @@ impl L2tpHandle {
     /// that socket is dropped, the kernel tears down the tunnel.
     /// UDP checksum settings from `config` are applied to `socket` before
     /// registering it with the kernel.
+    ///
+    /// For IP encapsulation, `socket` must have been created by
+    /// [`TunnelSocket::ip`] with the same tunnel ID as `config`.
     pub async fn create_tunnel(
         &self,
         config: TunnelConfig,
@@ -82,7 +90,9 @@ impl L2tpHandle {
     /// Creates an unmanaged tunnel (no owned socket fd in this process).
     ///
     /// The kernel creates/manages the underlying socket using netlink tunnel
-    /// address attributes.
+    /// address attributes. The tunnel outlives this process; it is removed
+    /// when the returned handle is dropped (unless auto-delete is disabled),
+    /// by [`TunnelHandle::delete`], or by [`L2tpHandle::delete_tunnel`].
     pub async fn create_unmanaged_tunnel(
         &self,
         config: TunnelConfig,

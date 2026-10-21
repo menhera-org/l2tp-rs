@@ -56,6 +56,9 @@ impl TunnelConfig {
 }
 
 /// Runtime information returned by the kernel for a tunnel.
+///
+/// IPv6 scope IDs and flow labels are not reported by the kernel, so IPv6
+/// endpoints always have them set to `0`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TunnelInfo {

@@ -45,7 +45,7 @@ From a checkout, use `cargo run --features cli -- <args>`.
 
 ### Managed UDP tunnel + Ethernet session
 
-```rust
+```rust,no_run
 use l2tp::{
     Encapsulation, L2tpHandle, SessionConfig, SessionId, TunnelConfig, TunnelId,
     TunnelSocket, UdpEndpoint,
@@ -88,7 +88,7 @@ async fn main() -> l2tp::Result<()> {
 
 ### Managed IP-backed tunnel (IPv4 or IPv6)
 
-```rust
+```rust,no_run
 use l2tp::{Encapsulation, IpEndpoint, L2tpHandle, TunnelConfig, TunnelId, TunnelSocket};
 use std::net::Ipv4Addr;
 
@@ -139,14 +139,14 @@ Use `IfName` with managed sockets:
 
 For kernel-managed tunnels without `L2TP_ATTR_FD`:
 
-```rust
+```rust,ignore
 let cfg = TunnelConfig::new(/* ... */)?;
 let tunnel = handle.create_unmanaged_tunnel(cfg).await?;
 ```
 
 ## Common Operations
 
-```rust
+```rust,ignore
 let tunnels = handle.list_tunnels().await?;
 let sessions = handle.list_all_sessions().await?;
 
@@ -169,7 +169,7 @@ let sstats = handle.session_stats(TunnelId(1000), SessionId(3000)).await?;
 
 Match kernel errors by kind without depending on `libc`:
 
-```rust
+```rust,ignore
 match handle.create_unmanaged_tunnel(cfg).await {
     Err(e) if e.kind() == Some(std::io::ErrorKind::AlreadyExists) => { /* ID in use */ }
     other => { /* ... */ }

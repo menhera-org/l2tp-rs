@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! High-level async Linux L2TPv3 management over Generic Netlink.
+// The README is the crate documentation, so its examples are doctested.
+#![doc = include_str!("../README.md")]
 //!
 //! All public types are re-exported at the crate root.
 //!

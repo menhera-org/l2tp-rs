@@ -43,14 +43,17 @@ impl Cookie {
 }
 
 /// Linux interface name (`IFNAMSIZ - 1` max bytes).
+///
+/// Validation follows the kernel's `dev_valid_name()`, so names accepted here
+/// are not rejected later by the kernel for their spelling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IfName(String);
 
 impl IfName {
     /// Validates and constructs an interface name.
     ///
-    /// The name must be non-empty, must not contain NUL or `/`, and must be
-    /// at most `IFNAMSIZ - 1` bytes.
+    /// The name must be non-empty, at most `IFNAMSIZ - 1` bytes, not `.` or
+    /// `..`, and must not contain NUL, `/`, `:`, or ASCII whitespace.
     pub fn new(s: impl Into<String>) -> crate::Result<Self> {
         let s = s.into();
         let b = s.as_bytes();
@@ -61,10 +64,13 @@ impl IfName {
         if b.len() > (libc::IFNAMSIZ - 1) {
             return Err(crate::Error::InvalidIfName(s));
         }
-        if b.contains(&0) {
+        if s == "." || s == ".." {
             return Err(crate::Error::InvalidIfName(s));
         }
-        if b.contains(&b'/') {
+        // The kernel uses `isspace()`, which also matches vertical tab.
+        if b.iter().any(|&c| {
+            matches!(c, 0 | b'/' | b':' | 0x0b) || c.is_ascii_whitespace()
+        }) {
             return Err(crate::Error::InvalidIfName(s));
         }
 
@@ -130,11 +136,17 @@ pub enum Encapsulation {
         local: UdpEndpoint,
         /// Remote UDP address.
         remote: UdpEndpoint,
-        /// Whether UDP checksum is enabled.
+        /// Whether UDP checksums are sent for IPv4 traffic.
+        ///
+        /// For managed sockets this also covers IPv4 peers reached through
+        /// IPv4-mapped addresses on an IPv6 socket. The kernel ignores it for
+        /// unmanaged IPv6 tunnels, which always checksum IPv4-mapped traffic.
+        /// IPv6 UDP always carries checksums unless `udp_zero_csum6_tx` is
+        /// set.
         udp_csum: bool,
-        /// Whether zero-checksum transmit is enabled for IPv6.
+        /// Whether IPv6 packets are sent with a zero UDP checksum.
         udp_zero_csum6_tx: bool,
-        /// Whether zero-checksum receive is enabled for IPv6.
+        /// Whether IPv6 packets with a zero UDP checksum are accepted.
         udp_zero_csum6_rx: bool,
     },
     /// IP-encapsulated L2TPv3 tunnel.
@@ -226,6 +238,13 @@ mod tests {
             IfName::new("0123456789abcdef"),
             Err(crate::Error::InvalidIfName(_))
         ));
+        for bad in [".", "..", "eth:0", "a b", "a\tb", "a\x0bb"] {
+            assert!(
+                matches!(IfName::new(bad), Err(crate::Error::InvalidIfName(_))),
+                "{bad:?} should be rejected"
+            );
+        }
+        assert!(IfName::new("a.b").is_ok());
     }
 
     #[test]
