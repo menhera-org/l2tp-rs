@@ -5,6 +5,7 @@ use crate::{
 };
 
 /// Parameters for creating an L2TP tunnel.
+#[derive(Debug, Clone)]
 pub struct TunnelConfig {
     pub(crate) tunnel_id: TunnelId,
     pub(crate) peer_tunnel_id: TunnelId,
@@ -37,10 +38,26 @@ impl TunnelConfig {
             encapsulation,
         })
     }
+
+    /// Returns the local tunnel identifier.
+    pub fn tunnel_id(&self) -> TunnelId {
+        self.tunnel_id
+    }
+
+    /// Returns the peer tunnel identifier.
+    pub fn peer_tunnel_id(&self) -> TunnelId {
+        self.peer_tunnel_id
+    }
+
+    /// Returns the encapsulation settings.
+    pub fn encapsulation(&self) -> &Encapsulation {
+        &self.encapsulation
+    }
 }
 
 /// Runtime information returned by the kernel for a tunnel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TunnelInfo {
     /// Local tunnel identifier.
     pub tunnel_id: TunnelId,
@@ -54,14 +71,8 @@ pub struct TunnelInfo {
     pub using_ipsec: bool,
 }
 
-/// Mutable tunnel parameters.
-#[derive(Debug, Clone, Default)]
-pub struct TunnelModify {
-    /// Optional UDP checksum enable/disable update.
-    pub udp_csum: Option<bool>,
-}
-
 /// Handle for managing a tunnel lifecycle.
+#[derive(Debug)]
 pub struct TunnelHandle {
     pub(crate) tunnel_id: TunnelId,
     pub(crate) socket: Option<TunnelSocket>,
@@ -87,6 +98,11 @@ impl TunnelHandle {
 
     /// Enables or disables best-effort netlink `TUNNEL_DELETE` on drop.
     ///
+    /// The deletion runs on a task spawned onto the current Tokio runtime
+    /// after the handle is dropped, so it can race with creating a new tunnel
+    /// that reuses this ID; use [`TunnelHandle::delete`] to delete
+    /// deterministically. Without a Tokio runtime, nothing is deleted.
+    ///
     /// Note: for managed tunnels, dropping the handle also drops the managed
     /// socket fd, and the kernel closes the tunnel when that fd is closed even
     /// if `auto_delete` is disabled.
@@ -104,9 +120,10 @@ impl TunnelHandle {
         self.handle.tunnel_stats(self.tunnel_id).await
     }
 
-    /// Applies mutable tunnel parameters.
-    pub async fn modify(&self, params: TunnelModify) -> crate::Result<()> {
-        self.handle.modify_tunnel(self.tunnel_id, params).await
+    /// Deletes the tunnel and waits for the kernel to acknowledge it.
+    pub async fn delete(mut self) -> crate::Result<()> {
+        self.auto_delete = false;
+        self.handle.delete_tunnel(self.tunnel_id).await
     }
 
     /// Reconnects a managed UDP tunnel socket to a new remote endpoint.

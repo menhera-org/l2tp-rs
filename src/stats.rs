@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 /// Tunnel traffic/error counters.
-#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[non_exhaustive]
 pub struct TunnelStats {
     /// Transmitted packet count.
     pub tx_packets: u64,
@@ -18,7 +20,9 @@ pub struct TunnelStats {
 }
 
 /// Session traffic/error counters.
-#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[non_exhaustive]
 pub struct SessionStats {
     /// Transmitted packet count.
     pub tx_packets: u64,

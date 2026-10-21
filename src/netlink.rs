@@ -10,7 +10,7 @@ use netlink_packet_l2tp::{
 use crate::{
     Encapsulation, IfName, IpEndpoint, L2SpecType, PseudowireType,
     SessionConfig, SessionId, SessionInfo, SessionModify, SessionStats,
-    TunnelConfig, TunnelId, TunnelInfo, TunnelModify, TunnelStats, UdpEndpoint,
+    TunnelConfig, TunnelId, TunnelInfo, TunnelStats, UdpEndpoint,
 };
 
 // Only fixed-size attributes or checked variable-length attributes are passed
@@ -89,19 +89,6 @@ pub(crate) fn encode_tunnel_create(
 
 pub(crate) fn encode_tunnel_delete(id: TunnelId) -> L2tpMessage {
     message(L2tpCmd::TunnelDelete, vec![L2tpAttribute::ConnId(id.0)])
-}
-
-pub(crate) fn encode_tunnel_modify(
-    id: TunnelId,
-    params: &TunnelModify,
-) -> L2tpMessage {
-    let mut attrs = vec![L2tpAttribute::ConnId(id.0)];
-
-    if let Some(v) = params.udp_csum {
-        attrs.push(L2tpAttribute::UdpCsum(u8::from(v)));
-    }
-
-    message(L2tpCmd::TunnelModify, attrs)
 }
 
 pub(crate) fn encode_tunnel_get(id: TunnelId) -> L2tpMessage {
@@ -201,14 +188,8 @@ pub(crate) fn encode_session_get(
     )
 }
 
-pub(crate) fn encode_session_get_dump(
-    tunnel_id: Option<TunnelId>,
-) -> L2tpMessage {
-    let mut attrs = Vec::new();
-    if let Some(tunnel_id) = tunnel_id {
-        attrs.push(L2tpAttribute::ConnId(tunnel_id.0));
-    }
-    message(L2tpCmd::SessionGet, attrs)
+pub(crate) fn encode_session_get_dump() -> L2tpMessage {
+    message(L2tpCmd::SessionGet, Vec::new())
 }
 
 pub(crate) fn decode_tunnel_info(
@@ -315,17 +296,10 @@ pub(crate) fn decode_tunnel_info(
                 ));
             }
         }
-        L2tpEncapType::Other(v) => {
-            return Err(crate::Error::KernelError {
-                code: libc::EINVAL,
-                message: format!("unsupported encapsulation type {v}"),
-            });
-        }
-        _ => {
-            return Err(crate::Error::KernelError {
-                code: libc::EINVAL,
-                message: "unsupported encapsulation type".to_string(),
-            });
+        other => {
+            return Err(crate::Error::UnexpectedReply(format!(
+                "unsupported encapsulation type {other:?}"
+            )));
         }
     };
 
@@ -361,10 +335,10 @@ pub(crate) fn decode_session_info(
                 peer_session_id = Some(SessionId(*v))
             }
             L2tpAttribute::PwType(v) => {
-                pseudowire_type = Some(from_l2tp_pw(*v)?)
+                pseudowire_type = Some(from_l2tp_pw(*v))
             }
             L2tpAttribute::L2SpecType(v) => {
-                l2spec_type = Some(from_l2tp_l2spec(*v)?)
+                l2spec_type = Some(from_l2tp_l2spec(*v))
             }
             L2tpAttribute::RecvSeq(v) => recv_seq = *v != 0,
             L2tpAttribute::SendSeq(v) => send_seq = *v != 0,
@@ -459,10 +433,7 @@ fn required<T>(value: Option<T>, name: &str) -> crate::Result<T> {
 }
 
 fn missing_attr_error(message: &str) -> crate::Error {
-    crate::Error::KernelError {
-        code: libc::EINVAL,
-        message: message.to_string(),
-    }
+    crate::Error::UnexpectedReply(message.to_string())
 }
 
 fn to_l2tp_pw(value: PseudowireType) -> L2tpPwType {
@@ -473,25 +444,19 @@ fn to_l2tp_pw(value: PseudowireType) -> L2tpPwType {
         PseudowireType::PppAc => L2tpPwType::PppAc,
         PseudowireType::Ip => L2tpPwType::Ip,
         PseudowireType::None => L2tpPwType::None,
+        PseudowireType::Other(v) => L2tpPwType::from(v),
     }
 }
 
-fn from_l2tp_pw(value: L2tpPwType) -> crate::Result<PseudowireType> {
+fn from_l2tp_pw(value: L2tpPwType) -> PseudowireType {
     match value {
-        L2tpPwType::Eth => Ok(PseudowireType::Eth),
-        L2tpPwType::EthVlan => Ok(PseudowireType::EthVlan),
-        L2tpPwType::Ppp => Ok(PseudowireType::Ppp),
-        L2tpPwType::PppAc => Ok(PseudowireType::PppAc),
-        L2tpPwType::Ip => Ok(PseudowireType::Ip),
-        L2tpPwType::None => Ok(PseudowireType::None),
-        L2tpPwType::Other(v) => Err(crate::Error::KernelError {
-            code: libc::EINVAL,
-            message: format!("unsupported pseudowire type {v}"),
-        }),
-        _ => Err(crate::Error::KernelError {
-            code: libc::EINVAL,
-            message: "unsupported pseudowire type".to_string(),
-        }),
+        L2tpPwType::Eth => PseudowireType::Eth,
+        L2tpPwType::EthVlan => PseudowireType::EthVlan,
+        L2tpPwType::Ppp => PseudowireType::Ppp,
+        L2tpPwType::PppAc => PseudowireType::PppAc,
+        L2tpPwType::Ip => PseudowireType::Ip,
+        L2tpPwType::None => PseudowireType::None,
+        other => PseudowireType::Other(u16::from(other)),
     }
 }
 
@@ -499,17 +464,15 @@ fn to_l2tp_l2spec(value: L2SpecType) -> u8 {
     match value {
         L2SpecType::None => 0,
         L2SpecType::Default => 1,
+        L2SpecType::Other(v) => v,
     }
 }
 
-fn from_l2tp_l2spec(value: u8) -> crate::Result<L2SpecType> {
+fn from_l2tp_l2spec(value: u8) -> L2SpecType {
     match value {
-        0 => Ok(L2SpecType::None),
-        1 => Ok(L2SpecType::Default),
-        v => Err(crate::Error::KernelError {
-            code: libc::EINVAL,
-            message: format!("unsupported l2spec type {v}"),
-        }),
+        0 => L2SpecType::None,
+        1 => L2SpecType::Default,
+        v => L2SpecType::Other(v),
     }
 }
 
@@ -570,16 +533,9 @@ mod tests {
             encode_tunnel_delete(TunnelId(1)),
             encode_tunnel_get(TunnelId(1)),
             encode_tunnel_get_dump(),
-            encode_tunnel_modify(
-                TunnelId(1),
-                &TunnelModify {
-                    udp_csum: Some(false),
-                },
-            ),
             encode_session_delete(TunnelId(1), SessionId(2)),
             encode_session_get(TunnelId(1), SessionId(2)),
-            encode_session_get_dump(Some(TunnelId(1))),
-            encode_session_get_dump(None),
+            encode_session_get_dump(),
             encode_session_modify(
                 TunnelId(1),
                 SessionId(2),
@@ -802,25 +758,6 @@ mod tests {
     }
 
     #[test]
-    fn encode_tunnel_modify_only_emits_optional_fields() {
-        let msg = encode_tunnel_modify(
-            TunnelId(42),
-            &TunnelModify {
-                udp_csum: Some(false),
-            },
-        );
-        assert_eq!(msg.attributes.len(), 2);
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::ConnId(42)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::UdpCsum(0)
-        )));
-    }
-
-    #[test]
     fn encode_session_create_includes_cookies_and_flags() {
         let cfg = SessionConfig {
             tunnel_id: TunnelId(1),
@@ -889,13 +826,8 @@ mod tests {
     }
 
     #[test]
-    fn encode_session_get_dump_handles_optional_tunnel_id() {
-        let with = encode_session_get_dump(Some(TunnelId(77)));
-        assert_eq!(with.attributes.len(), 1);
-        assert!(matches!(with.attributes[0], L2tpAttribute::ConnId(77)));
-
-        let without = encode_session_get_dump(None);
-        assert!(without.attributes.is_empty());
+    fn encode_session_get_dump_has_no_filter() {
+        assert!(encode_session_get_dump().attributes.is_empty());
     }
 
     #[test]
@@ -951,7 +883,7 @@ mod tests {
             L2tpAttribute::IpDaddr(Ipv4Addr::LOCALHOST),
         ];
         let err = decode_tunnel_info(&attrs).unwrap_err();
-        assert!(matches!(err, crate::Error::KernelError { .. }));
+        assert!(matches!(err, crate::Error::UnexpectedReply(_)));
     }
 
     #[test]
@@ -1002,26 +934,34 @@ mod tests {
     }
 
     #[test]
-    fn decode_session_info_rejects_unknown_pw_or_l2spec() {
-        let attrs_unknown_pw = vec![
+    fn decode_session_info_keeps_unknown_pw_and_l2spec() {
+        let attrs = vec![
             L2tpAttribute::ConnId(1),
             L2tpAttribute::SessionId(2),
             L2tpAttribute::PeerSessionId(3),
             L2tpAttribute::PwType(L2tpPwType::Other(777)),
-            L2tpAttribute::L2SpecType(0),
-        ];
-        let err = decode_session_info(&attrs_unknown_pw).unwrap_err();
-        assert!(matches!(err, crate::Error::KernelError { .. }));
-
-        let attrs_unknown_l2spec = vec![
-            L2tpAttribute::ConnId(1),
-            L2tpAttribute::SessionId(2),
-            L2tpAttribute::PeerSessionId(3),
-            L2tpAttribute::PwType(L2tpPwType::Eth),
             L2tpAttribute::L2SpecType(9),
         ];
-        let err = decode_session_info(&attrs_unknown_l2spec).unwrap_err();
-        assert!(matches!(err, crate::Error::KernelError { .. }));
+        let info = decode_session_info(&attrs).unwrap();
+        assert_eq!(info.pseudowire_type, PseudowireType::Other(777));
+        assert_eq!(info.l2spec_type, L2SpecType::Other(9));
+    }
+
+    #[test]
+    fn unknown_pw_and_l2spec_round_trip_to_raw_values() {
+        let mut cfg =
+            SessionConfig::eth(TunnelId(1), SessionId(2), SessionId(3));
+        cfg.pseudowire_type = PseudowireType::Other(777);
+        cfg.l2spec_type = L2SpecType::Other(9);
+        let msg = encode_session_create(&cfg).unwrap();
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::PwType(L2tpPwType::Other(777))
+        )));
+        assert!(has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::L2SpecType(9)
+        )));
     }
 
     #[test]

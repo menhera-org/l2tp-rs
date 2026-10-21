@@ -148,6 +148,7 @@ pub enum Encapsulation {
 
 /// Session pseudowire type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PseudowireType {
     /// Ethernet pseudowire.
     Eth,
@@ -161,16 +162,21 @@ pub enum PseudowireType {
     Ip,
     /// No pseudowire payload type.
     None,
+    /// Raw `L2TP_PWTYPE_*` value not covered by the other variants.
+    Other(u16),
 }
 
 /// L2-specific sublayer header type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum L2SpecType {
     /// No L2-specific sublayer header.
     #[default]
     None,
     /// Kernel default L2-specific sublayer header.
     Default,
+    /// Raw `L2TP_L2SPECTYPE_*` value not covered by the other variants.
+    Other(u8),
 }
 
 #[cfg(test)]

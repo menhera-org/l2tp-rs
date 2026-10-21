@@ -6,7 +6,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 
-use crate::{IfName, IpEndpoint, UdpEndpoint};
+use crate::{IfName, IpEndpoint, TunnelId, UdpEndpoint};
 
 const AF_L2TPIP: libc::c_int = 28;
 const IPPROTO_L2TP: libc::c_int = 115;
@@ -16,18 +16,23 @@ const IPPROTO_L2TP: libc::c_int = 115;
 /// Dropping this type closes the file descriptor.
 /// Per the kernel L2TP API, closing the tunnel socket tears down the
 /// associated tunnel and sessions.
+///
+/// The descriptor is created with `SOCK_CLOEXEC`, so child processes do not
+/// inherit it and keep the tunnel alive.
+#[derive(Debug)]
 pub struct TunnelSocket {
     fd: OwnedFd,
     encap: SocketEncap,
     family: SocketFamily,
 }
 
+#[derive(Debug)]
 enum SocketEncap {
     Udp,
     Ip,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum SocketFamily {
     V4,
     V6,
@@ -150,13 +155,16 @@ impl TunnelSocket {
 
     /// Creates and connects an IP-encapsulated L2TP socket.
     ///
-    /// The local bind uses `tunnel_id` as `l2tp_conn_id`; the remote connect
+    /// The local bind uses `tunnel_id` as `l2tp_conn_id`, so it must match the
+    /// tunnel ID passed to [`L2tpHandle::create_tunnel`]; the remote connect
     /// uses conn_id `0`.
+    ///
+    /// [`L2tpHandle::create_tunnel`]: crate::L2tpHandle::create_tunnel
     pub fn ip(
         local: &IpEndpoint,
         remote: &IpEndpoint,
         device: Option<&IfName>,
-        tunnel_id: u32,
+        tunnel_id: TunnelId,
     ) -> crate::Result<Self> {
         if local.ip_version() != remote.ip_version() {
             return Err(crate::Error::AddressFamilyMismatch);
@@ -173,7 +181,7 @@ impl TunnelSocket {
             set_bind_to_device(fd.as_raw_fd(), device)?;
         }
 
-        let local_addr = l2tp_sockaddr(local, tunnel_id);
+        let local_addr = l2tp_sockaddr(local, tunnel_id.0);
         bind(fd.as_raw_fd(), &local_addr)?;
 
         let remote_addr = l2tp_sockaddr(remote, 0);
@@ -207,11 +215,7 @@ impl TunnelSocket {
         };
 
         if rc == -1 {
-            let err = std::io::Error::last_os_error();
-            return Err(crate::Error::KernelError {
-                code: err.raw_os_error().unwrap_or(libc::EINVAL),
-                message: err.to_string(),
-            });
+            return Err(std::io::Error::last_os_error().into());
         }
 
         Ok(())
@@ -220,7 +224,7 @@ impl TunnelSocket {
     /// Reconnects a managed UDP tunnel socket to a new remote endpoint.
     pub fn reconnect_udp(&self, new_remote: &UdpEndpoint) -> crate::Result<()> {
         if let SocketEncap::Ip = self.encap {
-            return Err(crate::Error::UnmanagedSocket);
+            return Err(crate::Error::EncapsulationMismatch);
         }
         if self.family.ip_version() != new_remote.ip_version() {
             return Err(crate::Error::AddressFamilyMismatch);
@@ -233,7 +237,7 @@ impl TunnelSocket {
     /// Reconnects a managed IP tunnel socket to a new remote endpoint.
     pub fn reconnect_ip(&self, new_remote: &IpEndpoint) -> crate::Result<()> {
         if let SocketEncap::Udp = self.encap {
-            return Err(crate::Error::UnmanagedSocket);
+            return Err(crate::Error::EncapsulationMismatch);
         }
         if self.family.ip_version() != new_remote.ip_version() {
             return Err(crate::Error::AddressFamilyMismatch);
@@ -245,10 +249,10 @@ impl TunnelSocket {
 
     /// Returns the current local UDP socket address.
     ///
-    /// This is only valid for UDP-encapsulated managed sockets.
+    /// This is only valid for UDP-encapsulated sockets.
     pub fn local_addr_udp(&self) -> crate::Result<UdpEndpoint> {
         if let SocketEncap::Ip = self.encap {
-            return Err(crate::Error::UnmanagedSocket);
+            return Err(crate::Error::EncapsulationMismatch);
         }
 
         // SAFETY: zero-initialization is valid for `sockaddr_storage`.
@@ -296,10 +300,10 @@ impl TunnelSocket {
                     sa.sin6_scope_id,
                 )))
             }
-            family => Err(crate::Error::KernelError {
-                code: libc::EAFNOSUPPORT,
-                message: format!("unexpected socket family {family}"),
-            }),
+            _ => {
+                Err(std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT)
+                    .into())
+            }
         }
     }
 }
@@ -317,7 +321,7 @@ fn socket(
 ) -> crate::Result<OwnedFd> {
     // SAFETY: parameters are passed directly to libc; on success this returns
     // a newly owned fd which is wrapped in `OwnedFd` exactly once.
-    let fd = unsafe { libc::socket(domain, ty, protocol) };
+    let fd = unsafe { libc::socket(domain, ty | libc::SOCK_CLOEXEC, protocol) };
     if fd == -1 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -461,7 +465,7 @@ mod tests {
         let local = IpEndpoint::V4(Ipv4Addr::LOCALHOST);
         let remote = IpEndpoint::V6(Ipv6Addr::LOCALHOST);
 
-        let err = match TunnelSocket::ip(&local, &remote, None, 42) {
+        let err = match TunnelSocket::ip(&local, &remote, None, TunnelId(42)) {
             Ok(_) => panic!("expected address family mismatch"),
             Err(e) => e,
         };
@@ -539,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_udp_and_local_addr_reject_unmanaged_socket() {
+    fn reconnect_udp_and_local_addr_reject_ip_socket() {
         let fd =
             match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
                 Ok(fd) => fd,
@@ -562,14 +566,14 @@ mod tests {
                 1701,
             )))
             .unwrap_err();
-        assert!(matches!(err, crate::Error::UnmanagedSocket));
+        assert!(matches!(err, crate::Error::EncapsulationMismatch));
 
         let err = sock.local_addr_udp().unwrap_err();
-        assert!(matches!(err, crate::Error::UnmanagedSocket));
+        assert!(matches!(err, crate::Error::EncapsulationMismatch));
     }
 
     #[test]
-    fn set_ipv6_dontfrag_on_ipv4_socket_returns_kernel_error() {
+    fn set_ipv6_dontfrag_on_ipv4_socket_returns_io_error() {
         let Some(receiver) = bind_v4_local() else {
             return;
         };
@@ -590,7 +594,25 @@ mod tests {
         };
 
         let err = sock.set_ipv6_dontfrag(true).unwrap_err();
-        assert!(matches!(err, crate::Error::KernelError { .. }));
+        assert!(matches!(err, crate::Error::Io(_)));
+        assert!(err.raw_os_error().is_some());
+    }
+
+    #[test]
+    fn sockets_are_close_on_exec() {
+        let fd = match socket(libc::AF_INET, libc::SOCK_DGRAM, 0) {
+            Ok(fd) => fd,
+            Err(crate::Error::Io(e))
+                if e.kind() == io::ErrorKind::PermissionDenied =>
+            {
+                return;
+            }
+            Err(e) => panic!("unexpected socket create error: {e:?}"),
+        };
+        // SAFETY: `fd` is an open descriptor owned by this test.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 
     #[test]
@@ -646,7 +668,7 @@ mod tests {
         let err = sock
             .reconnect_ip(&IpEndpoint::V4(Ipv4Addr::LOCALHOST))
             .unwrap_err();
-        assert!(matches!(err, crate::Error::UnmanagedSocket));
+        assert!(matches!(err, crate::Error::EncapsulationMismatch));
     }
 
     #[test]

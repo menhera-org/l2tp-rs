@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: MIT
 
+use std::io;
+
 /// Errors returned by this crate.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
-    /// Failed to decode a netlink payload.
+    /// Failed to decode a netlink message.
     #[error("netlink error: {0}")]
-    Netlink(#[from] netlink_packet_core_08::DecodeError),
+    Netlink(String),
+
+    /// The kernel sent a well-formed reply that this crate cannot use.
+    #[error("unexpected kernel reply: {0}")]
+    UnexpectedReply(String),
 
     /// Generic-netlink family discovery for `l2tp` failed.
     #[error("genetlink family resolution failed: {0}")]
@@ -13,7 +20,7 @@ pub enum Error {
 
     /// I/O failure returned by a socket or netlink operation.
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 
     /// Interface name validation failed.
     #[error("invalid interface name: {0}")]
@@ -28,6 +35,10 @@ pub enum Error {
         "address family mismatch: local and remote must be the same IP version"
     )]
     AddressFamilyMismatch,
+
+    /// The operation does not match the socket's encapsulation (UDP or IP).
+    #[error("encapsulation mismatch: operation does not apply to this socket")]
+    EncapsulationMismatch,
 
     /// Operation requires an owned tunnel socket fd in this process.
     #[error(
@@ -47,10 +58,29 @@ pub enum Error {
 }
 
 impl Error {
-    // Both `DecodeError` versions carry only a message, so nothing is lost
-    // here.
+    /// Returns the OS error code, for kernel and OS-level I/O errors.
+    pub fn raw_os_error(&self) -> Option<i32> {
+        match self {
+            Self::KernelError { code, .. } => Some(*code),
+            Self::Io(err) => err.raw_os_error(),
+            _ => None,
+        }
+    }
+
+    /// Returns the I/O error kind, so callers can match kernel errors such
+    /// as [`io::ErrorKind::AlreadyExists`] without depending on `libc`.
+    pub fn kind(&self) -> Option<io::ErrorKind> {
+        match self {
+            Self::KernelError { code, .. } => {
+                Some(io::Error::from_raw_os_error(*code).kind())
+            }
+            Self::Io(err) => Some(err.kind()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn netlink(err: netlink_packet_core::DecodeError) -> Self {
-        Self::Netlink(err.to_string().into())
+        Self::Netlink(err.to_string())
     }
 }
 
@@ -59,15 +89,25 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::Error;
 
     #[test]
-    fn netlink_variant_keeps_public_decode_error_type() {
-        let err: Error =
-            netlink_packet_core_08::DecodeError::from("legacy").into();
-        assert!(matches!(err, Error::Netlink(_)));
+    fn kernel_error_exposes_os_code_and_kind() {
+        let err = Error::KernelError {
+            code: libc::EEXIST,
+            message: "exists".to_string(),
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
+        assert_eq!(err.kind(), Some(io::ErrorKind::AlreadyExists));
+        assert_eq!(Error::AddressFamilyMismatch.kind(), None);
+    }
+
+    #[test]
+    fn netlink_decode_error_keeps_message() {
         let err =
-            Error::netlink(netlink_packet_core::DecodeError::from("current"));
-        assert_eq!(err.to_string(), "netlink error: current");
+            Error::netlink(netlink_packet_core::DecodeError::from("truncated"));
+        assert_eq!(err.to_string(), "netlink error: truncated");
     }
 }

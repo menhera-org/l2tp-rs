@@ -6,7 +6,7 @@ use l2tp::{
 };
 use serde::Serialize;
 
-use super::OutputFmt;
+use crate::cli::OutputFmt;
 
 pub struct Output {
     fmt: OutputFmt,
@@ -314,8 +314,8 @@ fn session_to_json(info: &SessionInfo) -> SessionInfoJson {
         tunnel_id: info.tunnel_id.0,
         session_id: info.session_id.0,
         peer_session_id: info.peer_session_id.0,
-        pseudowire_type: fmt_pw_type(info.pseudowire_type).to_string(),
-        l2spec_type: fmt_l2spec(info.l2spec_type).to_string(),
+        pseudowire_type: fmt_pw_type(info.pseudowire_type),
+        l2spec_type: fmt_l2spec(info.l2spec_type),
         recv_seq: info.recv_seq,
         send_seq: info.send_seq,
         lns_mode: info.lns_mode,
@@ -339,20 +339,24 @@ fn fmt_ip(ep: &IpEndpoint) -> String {
     }
 }
 
-fn fmt_pw_type(v: PseudowireType) -> &'static str {
+fn fmt_pw_type(v: PseudowireType) -> String {
     match v {
-        PseudowireType::Eth => "eth",
-        PseudowireType::EthVlan => "eth-vlan",
-        PseudowireType::Ppp => "ppp",
-        PseudowireType::PppAc => "ppp-ac",
-        PseudowireType::Ip => "ip",
-        PseudowireType::None => "none",
+        PseudowireType::Eth => "eth".to_string(),
+        PseudowireType::EthVlan => "eth-vlan".to_string(),
+        PseudowireType::Ppp => "ppp".to_string(),
+        PseudowireType::PppAc => "ppp-ac".to_string(),
+        PseudowireType::Ip => "ip".to_string(),
+        PseudowireType::None => "none".to_string(),
+        PseudowireType::Other(raw) => raw.to_string(),
+        other => format!("{other:?}"),
     }
 }
 
-fn fmt_l2spec(v: L2SpecType) -> &'static str {
+fn fmt_l2spec(v: L2SpecType) -> String {
     match v {
-        L2SpecType::None => "none",
-        L2SpecType::Default => "default",
+        L2SpecType::None => "none".to_string(),
+        L2SpecType::Default => "default".to_string(),
+        L2SpecType::Other(raw) => raw.to_string(),
+        other => format!("{other:?}"),
     }
 }

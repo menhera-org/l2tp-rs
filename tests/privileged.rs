@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 
+#![cfg(target_os = "linux")]
+
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     sync::atomic::{AtomicU32, Ordering},
@@ -9,7 +11,7 @@ use std::{
 use l2tp::{
     Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, L2tpHandle,
     PseudowireType, SessionConfig, SessionId, SessionModify, TunnelConfig,
-    TunnelId, TunnelModify, TunnelSocket, UdpEndpoint,
+    TunnelId, TunnelSocket, UdpEndpoint,
 };
 
 static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -33,10 +35,7 @@ fn next_id_base() -> u32 {
 }
 
 fn is_eexist(err: &l2tp::Error) -> bool {
-    match err {
-        l2tp::Error::KernelError { code, .. } => *code == libc::EEXIST,
-        _ => false,
-    }
+    err.kind() == Some(std::io::ErrorKind::AlreadyExists)
 }
 
 #[test]
@@ -113,13 +112,6 @@ fn privileged_unmanaged_tunnel_lifecycle_over_genl() {
         assert_eq!(info.tunnel_id, tunnel_id);
         assert_eq!(info.peer_tunnel_id, peer_tunnel_id);
         assert_eq!(info.proto_version, 3);
-
-        tunnel
-            .modify(TunnelModify {
-                udp_csum: Some(true),
-            })
-            .await
-            .unwrap_or_else(|e| panic!("tunnel modify failed: {e}"));
 
         handle
             .delete_tunnel(tunnel_id)

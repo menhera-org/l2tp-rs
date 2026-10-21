@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-use std::{io, os::fd::AsRawFd, sync::Arc};
+use std::{fmt, io, os::fd::AsRawFd, sync::Arc};
 
 use futures::StreamExt;
 use netlink_packet_core::{
@@ -12,7 +12,7 @@ use netlink_packet_l2tp::{L2tpAttribute, L2tpMessage};
 use crate::{
     SessionConfig, SessionHandle, SessionId, SessionInfo, SessionModify,
     SessionStats, TunnelConfig, TunnelHandle, TunnelId, TunnelInfo,
-    TunnelModify, TunnelSocket, TunnelStats, netlink,
+    TunnelSocket, TunnelStats, netlink,
 };
 
 /// Shared async handle for L2TP generic-netlink operations.
@@ -24,6 +24,14 @@ pub struct L2tpHandle {
 struct L2tpInner {
     genl: genetlink::GenetlinkHandle,
     family_id: tokio::sync::OnceCell<u16>,
+}
+
+impl fmt::Debug for L2tpHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("L2tpHandle")
+            .field("family_id", &self.inner.family_id.get())
+            .finish_non_exhaustive()
+    }
 }
 
 impl L2tpHandle {
@@ -49,7 +57,7 @@ impl L2tpHandle {
 
     /// Creates a managed tunnel using an owned socket fd.
     ///
-    /// The returned [`TunnelHandle`](crate::TunnelHandle) owns `socket`; when
+    /// The returned [`TunnelHandle`] owns `socket`; when
     /// that socket is dropped, the kernel tears down the tunnel.
     pub async fn create_tunnel(
         &self,
@@ -95,9 +103,18 @@ impl L2tpHandle {
         let message = netlink::encode_session_create(&config)?;
         self.send_ack(message).await?;
 
-        let info = self
-            .get_session(config.tunnel_id, config.session_id)
-            .await?;
+        let info =
+            match self.get_session(config.tunnel_id, config.session_id).await {
+                Ok(info) => info,
+                Err(err) => {
+                    // Without a handle the caller could not clean the session
+                    // up.
+                    let _ = self
+                        .delete_session(config.tunnel_id, config.session_id)
+                        .await;
+                    return Err(err);
+                }
+            };
 
         Ok(SessionHandle {
             tunnel_id: config.tunnel_id,
@@ -119,7 +136,7 @@ impl L2tpHandle {
                 NLM_F_REQUEST,
             )
             .await?;
-        let attrs = first_attributes(&replies, "tunnel not found")?;
+        let attrs = first_attributes(&replies, "empty reply to tunnel get")?;
         netlink::decode_tunnel_info(attrs)
     }
 
@@ -135,7 +152,7 @@ impl L2tpHandle {
                 NLM_F_REQUEST,
             )
             .await?;
-        let attrs = first_attributes(&replies, "session not found")?;
+        let attrs = first_attributes(&replies, "empty reply to session get")?;
         netlink::decode_session_info(attrs)
     }
 
@@ -159,24 +176,17 @@ impl L2tpHandle {
         &self,
         tunnel_id: TunnelId,
     ) -> crate::Result<Vec<SessionInfo>> {
-        let replies = self
-            .send_and_collect(
-                netlink::encode_session_get_dump(Some(tunnel_id)),
-                NLM_F_REQUEST | NLM_F_DUMP,
-            )
-            .await?;
-        let mut out = Vec::with_capacity(replies.len());
-        for reply in replies {
-            out.push(netlink::decode_session_info(&reply.payload.attributes)?);
-        }
-        Ok(out)
+        // The kernel's session dump ignores L2TP_ATTR_CONN_ID, so filter here.
+        let mut sessions = self.list_all_sessions().await?;
+        sessions.retain(|session| session.tunnel_id == tunnel_id);
+        Ok(sessions)
     }
 
     /// Lists all sessions across all tunnels.
     pub async fn list_all_sessions(&self) -> crate::Result<Vec<SessionInfo>> {
         let replies = self
             .send_and_collect(
-                netlink::encode_session_get_dump(None),
+                netlink::encode_session_get_dump(),
                 NLM_F_REQUEST | NLM_F_DUMP,
             )
             .await?;
@@ -217,7 +227,7 @@ impl L2tpHandle {
                 NLM_F_REQUEST,
             )
             .await?;
-        let attrs = first_attributes(&replies, "tunnel not found")?;
+        let attrs = first_attributes(&replies, "empty reply to tunnel get")?;
         netlink::decode_tunnel_stats(attrs)
     }
 
@@ -233,18 +243,8 @@ impl L2tpHandle {
                 NLM_F_REQUEST,
             )
             .await?;
-        let attrs = first_attributes(&replies, "session not found")?;
+        let attrs = first_attributes(&replies, "empty reply to session get")?;
         netlink::decode_session_stats(attrs)
-    }
-
-    /// Applies mutable tunnel parameters.
-    pub async fn modify_tunnel(
-        &self,
-        tunnel_id: TunnelId,
-        params: TunnelModify,
-    ) -> crate::Result<()> {
-        self.send_ack(netlink::encode_tunnel_modify(tunnel_id, &params))
-            .await
     }
 
     /// Applies mutable session parameters.
@@ -313,7 +313,11 @@ impl L2tpHandle {
                     }
                 }
                 NetlinkPayload::Done(_) => break,
-                NetlinkPayload::Noop | NetlinkPayload::Overrun(_) => {}
+                NetlinkPayload::Overrun(_) => {
+                    return Err(crate::Error::Netlink(
+                        "netlink overrun: reply was truncated".to_string(),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -329,10 +333,7 @@ fn first_attributes<'a>(
     replies
         .first()
         .map(|msg| msg.payload.attributes.as_slice())
-        .ok_or_else(|| crate::Error::KernelError {
-            code: libc::ENOENT,
-            message: context.to_string(),
-        })
+        .ok_or_else(|| crate::Error::UnexpectedReply(context.to_string()))
 }
 
 fn to_io_error(err: genetlink::GenetlinkError) -> crate::Error {

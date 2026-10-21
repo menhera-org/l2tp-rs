@@ -6,6 +6,7 @@ use crate::{
 };
 
 /// Parameters for creating an L2TP session.
+#[derive(Debug, Clone)]
 pub struct SessionConfig {
     /// Parent tunnel identifier.
     pub tunnel_id: TunnelId,
@@ -61,7 +62,8 @@ impl SessionConfig {
 }
 
 /// Runtime information returned by the kernel for a session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SessionInfo {
     /// Parent tunnel identifier.
     pub tunnel_id: TunnelId,
@@ -88,7 +90,7 @@ pub struct SessionInfo {
 }
 
 /// Mutable session parameters.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionModify {
     /// Optional receive sequence toggle.
     pub recv_seq: Option<bool>,
@@ -100,7 +102,15 @@ pub struct SessionModify {
     pub recv_timeout_ms: Option<u64>,
 }
 
+impl SessionModify {
+    /// Returns `true` when no parameter would be changed.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Handle for managing a session lifecycle.
+#[derive(Debug)]
 pub struct SessionHandle {
     pub(crate) tunnel_id: TunnelId,
     pub(crate) session_id: SessionId,
@@ -126,6 +136,11 @@ impl SessionHandle {
     }
 
     /// Enables or disables best-effort session deletion on drop.
+    ///
+    /// The deletion runs on a task spawned onto the current Tokio runtime
+    /// after the handle is dropped, so it can race with creating a new session
+    /// that reuses this ID; use [`SessionHandle::delete`] to delete
+    /// deterministically. Without a Tokio runtime, nothing is deleted.
     pub fn set_auto_delete(&mut self, v: bool) {
         self.auto_delete = v;
     }
@@ -148,6 +163,14 @@ impl SessionHandle {
     pub async fn modify(&self, params: SessionModify) -> crate::Result<()> {
         self.handle
             .modify_session(self.tunnel_id, self.session_id, params)
+            .await
+    }
+
+    /// Deletes the session and waits for the kernel to acknowledge it.
+    pub async fn delete(mut self) -> crate::Result<()> {
+        self.auto_delete = false;
+        self.handle
+            .delete_session(self.tunnel_id, self.session_id)
             .await
     }
 }
@@ -191,5 +214,17 @@ mod tests {
         assert!(!config.lns_mode);
         assert_eq!(config.recv_timeout_ms, None);
         assert_eq!(config.ifname, None);
+    }
+
+    #[test]
+    fn session_modify_is_empty_only_without_changes() {
+        assert!(SessionModify::default().is_empty());
+        assert!(
+            !SessionModify {
+                lns_mode: Some(false),
+                ..Default::default()
+            }
+            .is_empty()
+        );
     }
 }
