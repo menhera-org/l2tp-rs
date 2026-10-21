@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
-    fmt, io,
+    fmt,
+    io::{self, Read},
     net::{IpAddr, SocketAddr, SocketAddrV6},
     process::ExitCode,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -349,16 +350,19 @@ fn parse_hex_cookie(s: &str, field: &str) -> CliResult<Cookie> {
         )));
     }
 
+    // Work on bytes: slicing the `str` would panic on multi-byte characters.
     let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let pair = &s[i..i + 2];
-        let v = u8::from_str_radix(pair, 16).map_err(|_| {
+    for pair in s.as_bytes().chunks(2) {
+        if !pair.iter().all(u8::is_ascii_hexdigit) {
+            return Err(CliError::Usage(format!(
+                "invalid {field}: non-hex value"
+            )));
+        }
+        let hex = std::str::from_utf8(pair).unwrap_or_default();
+        let v = u8::from_str_radix(hex, 16).map_err(|_| {
             CliError::Usage(format!("invalid {field}: non-hex value"))
         })?;
         out.push(v);
-        i += 2;
     }
     Ok(Cookie::try_from_bytes(out)?)
 }
@@ -608,17 +612,26 @@ async fn session_change(
     Ok(())
 }
 
+// L2TPv3 relies on identifiers an off-path attacker cannot guess, so take them
+// from the OS RNG; the time/pid mix is only a fallback.
 fn random_tunnel_id(attempt: u32) -> u32 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_nanos() as u64;
-    let pid = std::process::id() as u64;
-    let mixed = now
-        ^ (pid << 32)
-        ^ (attempt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut bytes = [0u8; 4];
+    let random = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .map(|()| u32::from_ne_bytes(bytes));
+    let value = random.unwrap_or_else(|_| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_nanos() as u64;
+        let pid = u64::from(std::process::id());
+        let mixed = now
+            ^ (pid << 32)
+            ^ u64::from(attempt).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (mixed ^ (mixed >> 32)) as u32
+    });
     let span = u32::MAX - 999_999;
-    1_000_000 + ((mixed as u32) % span)
+    1_000_000 + (value % span)
 }
 
 fn map_pw(v: PwTypeArg) -> PseudowireType {
@@ -700,5 +713,40 @@ mod tests {
                 assert!(matches!(result, Err(CliError::Usage(_))));
             }
         }
+    }
+
+    #[test]
+    fn hex_cookie_parsing_rejects_bad_input_without_panicking() {
+        assert_eq!(
+            parse_hex_cookie("deadbeef", "cookie").unwrap().as_bytes(),
+            &[0xde, 0xad, 0xbe, 0xef]
+        );
+        assert!(
+            parse_hex_cookie("", "cookie")
+                .unwrap()
+                .as_bytes()
+                .is_empty()
+        );
+        // Multi-byte characters, sign characters and odd lengths are errors.
+        for bad in ["aéb", "éé", "+1+2+3+4", "abc", "zzzzzzzz"] {
+            assert!(
+                matches!(
+                    parse_hex_cookie(bad, "cookie"),
+                    Err(CliError::Usage(_))
+                ),
+                "{bad:?} should be rejected"
+            );
+        }
+        assert!(matches!(
+            parse_hex_cookie("abcdef", "cookie"),
+            Err(CliError::L2tp(l2tp::Error::InvalidCookieLength(3)))
+        ));
+    }
+
+    #[test]
+    fn random_tunnel_ids_stay_in_range_and_vary() {
+        let ids: Vec<u32> = (0..32).map(random_tunnel_id).collect();
+        assert!(ids.iter().all(|&id| id >= 1_000_000));
+        assert!(ids.windows(2).any(|w| w[0] != w[1]));
     }
 }

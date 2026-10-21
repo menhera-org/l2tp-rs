@@ -121,7 +121,7 @@ Use `IfName` with managed sockets:
 - After creation:
   - `tunnel.socket().unwrap().bind_to_device(&ifname)?`
 
-`SO_BINDTODEVICE` typically requires `CAP_NET_ADMIN`.
+`SO_BINDTODEVICE` requires `CAP_NET_RAW`.
 
 ## Kernel Semantics Notes
 

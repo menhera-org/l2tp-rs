@@ -4,12 +4,13 @@ version = "0.3.0"
 authors = ["metastable-void <mori@menhera.ad.jp>"]
 edition = "2024"
 rust-version = "1.89"
-homepage = "https://github.com/menhera-org/l2tp-rs"
 repository = "https://github.com/menhera-org/l2tp-rs"
 keywords = ["l2tp", "netlink", "linux"]
+categories = ["network-programming", "os::linux-apis"]
 license = "MIT"
 readme = "README.md"
 description = "High-level L2TP interface for Linux kernel"
+exclude = [".github/", ".licenserc.yaml"]
 
 [features]
 # Derive `serde` traits for the statistics types.

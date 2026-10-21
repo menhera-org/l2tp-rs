@@ -171,10 +171,11 @@ impl SessionHandle {
     /// caller cancels this future.
     pub async fn delete(mut self) -> crate::Result<()> {
         crate::handle::run_cleanup(async move {
+            // Once the delete is sent, a failure must not queue another one.
+            self.auto_delete = false;
             self.handle
                 .delete_session(self.tunnel_id, self.session_id)
                 .await?;
-            self.auto_delete = false;
             drop(self);
             Ok(())
         })

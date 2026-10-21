@@ -180,6 +180,10 @@ impl L2tpHandle {
     }
 
     /// Lists all tunnels.
+    ///
+    /// If the kernel's tables change during the dump, this fails with an error
+    /// whose [`kind`](crate::Error::kind) is [`io::ErrorKind::Interrupted`];
+    /// retrying usually succeeds.
     pub async fn list_tunnels(&self) -> crate::Result<Vec<TunnelInfo>> {
         let replies = self
             .send_and_collect(
@@ -206,6 +210,10 @@ impl L2tpHandle {
     }
 
     /// Lists all sessions across all tunnels.
+    ///
+    /// If the kernel's tables change during the dump, this fails with an error
+    /// whose [`kind`](crate::Error::kind) is [`io::ErrorKind::Interrupted`];
+    /// retrying usually succeeds.
     pub async fn list_all_sessions(&self) -> crate::Result<Vec<SessionInfo>> {
         let replies = self
             .send_and_collect(
@@ -345,9 +353,12 @@ where
     while let Some(item) = stream.next().await {
         let message = item.map_err(crate::Error::netlink)?;
         if message.header.flags & NLM_F_DUMP_INTR != 0 {
-            return Err(crate::Error::Netlink(
-                "netlink dump was interrupted".to_string(),
-            ));
+            // The kernel changed its tables mid-dump; a retry usually works.
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "netlink dump was interrupted by concurrent changes",
+            )
+            .into());
         }
         let multipart = message.header.flags & NLM_F_MULTIPART != 0;
         match message.payload {
@@ -525,10 +536,12 @@ mod tests {
         );
         for mut message in [reply(), done(0)] {
             message.header.flags = NLM_F_DUMP_INTR;
-            assert!(matches!(
-                collect(vec![message], NLM_F_REQUEST | NLM_F_DUMP),
-                Err(crate::Error::Netlink(_))
-            ));
+            assert_eq!(
+                collect(vec![message], NLM_F_REQUEST | NLM_F_DUMP)
+                    .unwrap_err()
+                    .kind(),
+                Some(io::ErrorKind::Interrupted)
+            );
         }
     }
 

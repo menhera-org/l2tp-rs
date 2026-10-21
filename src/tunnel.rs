@@ -128,8 +128,9 @@ impl TunnelHandle {
     /// caller cancels this future.
     pub async fn delete(mut self) -> crate::Result<()> {
         crate::handle::run_cleanup(async move {
-            self.handle.delete_tunnel(self.tunnel_id).await?;
+            // Once the delete is sent, a failure must not queue another one.
             self.auto_delete = false;
+            self.handle.delete_tunnel(self.tunnel_id).await?;
             drop(self);
             Ok(())
         })

@@ -39,7 +39,7 @@ fn is_eexist(err: &l2tp::Error) -> bool {
 }
 
 #[test]
-#[ignore = "requires CAP_NET_ADMIN/root (SO_BINDTODEVICE)"]
+#[ignore = "requires CAP_NET_RAW/root (SO_BINDTODEVICE)"]
 fn privileged_bind_to_device_on_loopback() {
     let local = UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
     let remote = UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999));

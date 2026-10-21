@@ -248,7 +248,7 @@ impl TunnelSocket {
         Ok(())
     }
 
-    /// Applies `SO_BINDTODEVICE` on this socket.
+    /// Applies `SO_BINDTODEVICE` on this socket; this requires `CAP_NET_RAW`.
     pub fn bind_to_device(&self, device: &IfName) -> crate::Result<()> {
         set_bind_to_device(self.fd.as_raw_fd(), device)
     }
