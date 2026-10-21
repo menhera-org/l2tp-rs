@@ -225,3 +225,54 @@ fn privileged_session_lifecycle_over_genl() {
             .unwrap_or_else(|e| panic!("delete_tunnel failed: {e}"));
     });
 }
+
+#[test]
+#[ignore = "requires kernel l2tp_ip support"]
+fn privileged_managed_ipv4_ip_socket_uses_inet_family() {
+    let socket = TunnelSocket::ip(
+        &IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+        &IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+        None,
+        TunnelId(next_id_base()),
+    )
+    .expect("create an IPv4 L2TP/IP socket");
+    drop(socket);
+}
+
+#[cfg(feature = "cli")]
+#[test]
+#[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp generic-netlink support"]
+fn privileged_cli_tunnel_survives_process_exit() {
+    let id = next_id_base();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_l2tp"))
+        .args([
+            "tunnel",
+            "create",
+            "--tunnel-id",
+            &id.to_string(),
+            "--peer-tunnel-id",
+            &(id + 1).to_string(),
+            "--local",
+            "127.0.0.1:0",
+            "--remote",
+            "127.0.0.1:17012",
+        ])
+        .output()
+        .expect("run l2tp tunnel create");
+    runtime().block_on(async {
+        let handle = L2tpHandle::new().await.unwrap();
+        let info = handle.get_tunnel(TunnelId(id)).await;
+        // Clean up before asserting, including when creation returned an error.
+        let cleanup = handle.delete_tunnel(TunnelId(id)).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            info.expect("tunnel must survive CLI exit").tunnel_id,
+            TunnelId(id)
+        );
+        cleanup.expect("delete CLI-created tunnel");
+    });
+}

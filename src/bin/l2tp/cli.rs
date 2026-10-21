@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use l2tp::{
     Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, L2tpHandle,
     PseudowireType, SessionConfig, SessionId, SessionInfo, SessionModify,
-    TunnelConfig, TunnelId, TunnelSocket, UdpEndpoint,
+    TunnelConfig, TunnelId, UdpEndpoint,
 };
 
 use crate::output::Output;
@@ -457,12 +457,26 @@ async fn run_session(
     }
 }
 
+fn validate_persistent_tunnel_options(
+    args: &TunnelCreateArgs,
+) -> CliResult<()> {
+    if args.device.is_some() || args.ipv6_dontfrag {
+        return Err(CliError::Usage(
+            "--device and --ipv6-dontfrag require an owned socket and are not \
+             supported for persistent CLI tunnels; use the library's managed \
+             tunnel API"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn tunnel_create(
     args: TunnelCreateArgs,
     handle: &L2tpHandle,
     out: &Output,
 ) -> CliResult<()> {
-    let device = args.device.as_deref().map(IfName::new).transpose()?;
+    validate_persistent_tunnel_options(&args)?;
 
     let encapsulation = match args.encap {
         EncapArg::Udp => {
@@ -505,19 +519,7 @@ async fn tunnel_create(
             encapsulation.clone(),
         )?;
 
-        let socket = match &encapsulation {
-            Encapsulation::Udp { local, remote, .. } => {
-                TunnelSocket::udp(local, remote, device.as_ref())?
-            }
-            Encapsulation::Ip { local, remote } => {
-                TunnelSocket::ip(local, remote, device.as_ref(), tunnel_id)?
-            }
-        };
-        if args.ipv6_dontfrag {
-            socket.set_ipv6_dontfrag(true)?;
-        }
-
-        match handle.create_tunnel(config, socket).await {
+        match handle.create_unmanaged_tunnel(config).await {
             Ok(mut tunnel) => {
                 tunnel.set_auto_delete(false);
                 out.success(&format!("created tunnel {}", tunnel_id.0));
@@ -660,6 +662,43 @@ pub(crate) async fn main() -> ExitCode {
         Err(e) => {
             out.error(&e.to_string());
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_tunnel_options_reject_socket_only_flags() {
+        for extra in [vec![], vec!["--device", "lo"], vec!["--ipv6-dontfrag"]] {
+            let mut argv = vec![
+                "l2tp",
+                "tunnel",
+                "create",
+                "--peer-tunnel-id",
+                "2",
+                "--remote",
+                "127.0.0.1:1701",
+            ];
+            argv.extend(&extra);
+            let Cli {
+                cmd:
+                    Cmd::Tunnel(TunnelArgs {
+                        cmd: TunnelCmd::Create(args),
+                    }),
+                ..
+            } = Cli::try_parse_from(argv).unwrap()
+            else {
+                panic!("expected tunnel create");
+            };
+            let result = validate_persistent_tunnel_options(&args);
+            if extra.is_empty() {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(CliError::Usage(_))));
+            }
         }
     }
 }

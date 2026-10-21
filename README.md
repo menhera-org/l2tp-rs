@@ -208,3 +208,11 @@ Privileged tests (require root/CAP_NET_ADMIN and matching kernel modules):
 ```bash
 cargo test --test privileged -- --ignored
 ```
+
+## CLI tunnel lifetime
+
+`l2tp tunnel create` creates an unmanaged, kernel-owned tunnel that survives
+command exit. Remove it with `l2tp tunnel delete`. Checksum flags apply to the
+kernel-created socket. The socket-only flags `--device` and `--ipv6-dontfrag`
+are unsupported by persistent CLI tunnels and return an error; use the library's
+managed tunnel API when those socket options are needed.

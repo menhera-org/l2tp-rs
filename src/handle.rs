@@ -59,11 +59,14 @@ impl L2tpHandle {
     ///
     /// The returned [`TunnelHandle`] owns `socket`; when
     /// that socket is dropped, the kernel tears down the tunnel.
+    /// UDP checksum settings from `config` are applied to `socket` before
+    /// registering it with the kernel.
     pub async fn create_tunnel(
         &self,
         config: TunnelConfig,
         socket: TunnelSocket,
     ) -> crate::Result<TunnelHandle> {
+        socket.configure(&config.encapsulation)?;
         let message =
             netlink::encode_tunnel_create(&config, Some(socket.as_raw_fd()))?;
         self.send_ack(message).await?;

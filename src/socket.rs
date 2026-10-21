@@ -6,9 +6,8 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 
-use crate::{IfName, IpEndpoint, TunnelId, UdpEndpoint};
+use crate::{Encapsulation, IfName, IpEndpoint, TunnelId, UdpEndpoint};
 
-const AF_L2TPIP: libc::c_int = 28;
 const IPPROTO_L2TP: libc::c_int = 115;
 
 /// Owned tunnel socket used by managed tunnels (`L2TP_ATTR_FD`).
@@ -171,7 +170,7 @@ impl TunnelSocket {
         }
 
         let family = match local {
-            IpEndpoint::V4(_) => AF_L2TPIP,
+            IpEndpoint::V4(_) => libc::AF_INET,
             IpEndpoint::V6(_) => libc::AF_INET6,
         };
 
@@ -192,6 +191,61 @@ impl TunnelSocket {
             encap: SocketEncap::Ip,
             family: SocketFamily::from_ip(local),
         })
+    }
+
+    pub(crate) fn configure(
+        &self,
+        encapsulation: &Encapsulation,
+    ) -> crate::Result<()> {
+        match (encapsulation, &self.encap) {
+            (
+                Encapsulation::Udp {
+                    local,
+                    remote,
+                    udp_csum,
+                    udp_zero_csum6_tx,
+                    udp_zero_csum6_rx,
+                },
+                SocketEncap::Udp,
+            ) => {
+                if self.family.ip_version() != local.ip_version()
+                    || self.family.ip_version() != remote.ip_version()
+                {
+                    return Err(crate::Error::AddressFamilyMismatch);
+                }
+                // SO_NO_CHECK controls IPv4 transmission, including mapped IPv4
+                // traffic on a dual-stack IPv6 socket.
+                set_socket_bool(
+                    self.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NO_CHECK,
+                    !udp_csum,
+                )?;
+                if matches!(self.family, SocketFamily::V6) {
+                    set_socket_bool(
+                        self.as_raw_fd(),
+                        libc::IPPROTO_UDP,
+                        libc::UDP_NO_CHECK6_TX,
+                        *udp_zero_csum6_tx,
+                    )?;
+                    set_socket_bool(
+                        self.as_raw_fd(),
+                        libc::IPPROTO_UDP,
+                        libc::UDP_NO_CHECK6_RX,
+                        *udp_zero_csum6_rx,
+                    )?;
+                }
+            }
+            (Encapsulation::Ip { local, remote }, SocketEncap::Ip) => {
+                if self.family.ip_version() != local.ip_version()
+                    || self.family.ip_version() != remote.ip_version()
+                {
+                    return Err(crate::Error::AddressFamilyMismatch);
+                }
+            }
+            _ => return Err(crate::Error::EncapsulationMismatch),
+        }
+        Ok(())
     }
 
     /// Applies `SO_BINDTODEVICE` on this socket.
@@ -351,6 +405,29 @@ fn connect(fd: RawFd, addr: &SockAddr) -> crate::Result<()> {
     Ok(())
 }
 
+fn set_socket_bool(
+    fd: RawFd,
+    level: libc::c_int,
+    option: libc::c_int,
+    enabled: bool,
+) -> crate::Result<()> {
+    let value = libc::c_int::from(enabled);
+    // SAFETY: value is an initialized c_int and its size is passed exactly.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            option,
+            (&value as *const libc::c_int).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 fn set_bind_to_device(fd: RawFd, device: &IfName) -> crate::Result<()> {
     let bytes = device.as_str().as_bytes();
     // SAFETY: `bytes` points to readable memory of length `bytes.len()`, and
@@ -395,7 +472,7 @@ fn udp_sockaddr(endpoint: &UdpEndpoint) -> SockAddr {
 fn l2tp_sockaddr(endpoint: &IpEndpoint, conn_id: u32) -> SockAddr {
     match endpoint {
         IpEndpoint::V4(addr) => SockAddr::L2tpV4(SockaddrL2tpIp {
-            l2tp_family: AF_L2TPIP as libc::sa_family_t,
+            l2tp_family: libc::AF_INET as libc::sa_family_t,
             l2tp_unused: 0,
             l2tp_addr: libc::in_addr {
                 s_addr: u32::from_ne_bytes(addr.octets()),
@@ -440,6 +517,119 @@ mod tests {
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => None,
             Err(e) => panic!("failed to bind local UDP socket: {e}"),
         }
+    }
+
+    fn socket_option(
+        fd: RawFd,
+        level: libc::c_int,
+        option: libc::c_int,
+    ) -> libc::c_int {
+        let mut value = 0 as libc::c_int;
+        let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: value is writable for len bytes and fd is an open socket.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                option,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        value
+    }
+
+    #[test]
+    fn managed_udp_checksum_options_follow_configuration() {
+        for family in [SocketFamily::V4, SocketFamily::V6] {
+            let domain = match family {
+                SocketFamily::V4 => libc::AF_INET,
+                SocketFamily::V6 => libc::AF_INET6,
+            };
+            let fd = match socket(domain, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
+                Ok(fd) => fd,
+                Err(crate::Error::Io(e))
+                    if e.kind() == io::ErrorKind::PermissionDenied =>
+                {
+                    return;
+                }
+                Err(e) => panic!("{e}"),
+            };
+            let sock = TunnelSocket {
+                fd,
+                encap: SocketEncap::Udp,
+                family,
+            };
+            let endpoint = match family {
+                SocketFamily::V4 => UdpEndpoint::V4(SocketAddrV4::new(
+                    Ipv4Addr::LOCALHOST,
+                    1701,
+                )),
+                SocketFamily::V6 => {
+                    UdpEndpoint::V6(std::net::SocketAddrV6::new(
+                        Ipv6Addr::LOCALHOST,
+                        1701,
+                        0,
+                        0,
+                    ))
+                }
+            };
+            for enabled in [true, false] {
+                sock.configure(&Encapsulation::Udp {
+                    local: endpoint.clone(),
+                    remote: endpoint.clone(),
+                    udp_csum: !enabled,
+                    udp_zero_csum6_tx: enabled,
+                    udp_zero_csum6_rx: enabled,
+                })
+                .unwrap();
+                assert_eq!(
+                    socket_option(
+                        sock.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_NO_CHECK
+                    ),
+                    i32::from(enabled)
+                );
+                if matches!(family, SocketFamily::V6) {
+                    assert_eq!(
+                        socket_option(
+                            sock.as_raw_fd(),
+                            libc::IPPROTO_UDP,
+                            libc::UDP_NO_CHECK6_TX
+                        ),
+                        i32::from(enabled)
+                    );
+                    assert_eq!(
+                        socket_option(
+                            sock.as_raw_fd(),
+                            libc::IPPROTO_UDP,
+                            libc::UDP_NO_CHECK6_RX
+                        ),
+                        i32::from(enabled)
+                    );
+                }
+            }
+            assert!(matches!(
+                sock.configure(&Encapsulation::Ip {
+                    local: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+                    remote: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+                }),
+                Err(crate::Error::EncapsulationMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn ipv4_l2tp_sockaddr_uses_inet_family() {
+        let SockAddr::L2tpV4(addr) =
+            l2tp_sockaddr(&IpEndpoint::V4(Ipv4Addr::LOCALHOST), 42)
+        else {
+            panic!("expected IPv4 L2TP address");
+        };
+        assert_eq!(i32::from(addr.l2tp_family), libc::AF_INET);
+        assert_eq!(addr.l2tp_conn_id, 42);
     }
 
     #[test]
