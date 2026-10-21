@@ -1,15 +1,20 @@
+// SPDX-License-Identifier: MIT
+
 mod output;
+
+use std::{
+    net::{IpAddr, SocketAddr, SocketAddrV6},
+    process::ExitCode,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use l2tp::{
-    Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, L2tpHandle, PseudowireType,
-    SessionConfig, SessionId, SessionInfo, SessionModify, TunnelConfig, TunnelId, TunnelModify,
-    TunnelSocket, UdpEndpoint,
+    Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, L2tpHandle,
+    PseudowireType, SessionConfig, SessionId, SessionInfo, SessionModify,
+    TunnelConfig, TunnelId, TunnelModify, TunnelSocket, UdpEndpoint,
 };
 use output::Output;
-use std::net::{IpAddr, SocketAddr, SocketAddrV6};
-use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum OutputFmt {
@@ -268,7 +273,9 @@ fn parse_udp_addr(s: &str) -> Result<UdpEndpoint, String> {
 
     if let Ok(ip) = s.parse::<IpAddr>() {
         return Ok(match ip {
-            IpAddr::V4(v4) => UdpEndpoint::V4(std::net::SocketAddrV4::new(v4, 0)),
+            IpAddr::V4(v4) => {
+                UdpEndpoint::V4(std::net::SocketAddrV4::new(v4, 0))
+            }
             IpAddr::V6(v6) => UdpEndpoint::V6(SocketAddrV6::new(v6, 0, 0, 0)),
         });
     }
@@ -280,8 +287,10 @@ fn resolve_udp_endpoints(
     local_str: Option<&str>,
     remote_str: &str,
 ) -> l2tp::Result<(UdpEndpoint, UdpEndpoint)> {
-    let local = parse_udp_addr(local_str.unwrap_or("::")).map_err(l2tp::Error::InvalidIfName)?;
-    let remote = parse_udp_addr(remote_str).map_err(l2tp::Error::InvalidIfName)?;
+    let local = parse_udp_addr(local_str.unwrap_or("::"))
+        .map_err(l2tp::Error::InvalidIfName)?;
+    let remote =
+        parse_udp_addr(remote_str).map_err(l2tp::Error::InvalidIfName)?;
 
     if remote_str.parse::<SocketAddr>().is_err() {
         return Err(l2tp::Error::InvalidIfName(format!(
@@ -299,9 +308,13 @@ fn resolve_udp_endpoints(
             ));
             Ok((local, mapped))
         }
-        (_, remote) if local.ip_version() == remote.ip_version() => Ok((local, remote)),
+        (_, remote) if local.ip_version() == remote.ip_version() => {
+            Ok((local, remote))
+        }
         _ => Err(l2tp::Error::InvalidIfName(
-            "remote address family does not match local; use [::ffff:x.x.x.x]:port for IPv4 remote with IPv6 local".to_string(),
+            "remote address family does not match local; use \
+             [::ffff:x.x.x.x]:port for IPv4 remote with IPv6 local"
+                .to_string(),
         )),
     }
 }
@@ -329,8 +342,11 @@ fn parse_hex_cookie(s: &str, field: &str) -> l2tp::Result<Cookie> {
     let mut i = 0usize;
     while i < bytes.len() {
         let pair = &s[i..i + 2];
-        let v = u8::from_str_radix(pair, 16)
-            .map_err(|_| l2tp::Error::InvalidIfName(format!("invalid {field}: non-hex value")))?;
+        let v = u8::from_str_radix(pair, 16).map_err(|_| {
+            l2tp::Error::InvalidIfName(format!(
+                "invalid {field}: non-hex value"
+            ))
+        })?;
         out.push(v);
         i += 2;
     }
@@ -347,7 +363,11 @@ fn flag_pair(on: bool, off: bool) -> Option<bool> {
     }
 }
 
-async fn run_tunnel(cmd: TunnelCmd, handle: &L2tpHandle, out: &Output) -> l2tp::Result<()> {
+async fn run_tunnel(
+    cmd: TunnelCmd,
+    handle: &L2tpHandle,
+    out: &Output,
+) -> l2tp::Result<()> {
     match cmd {
         TunnelCmd::Create(args) => tunnel_create(args, handle, out).await,
         TunnelCmd::Delete(args) => {
@@ -374,12 +394,19 @@ async fn run_tunnel(cmd: TunnelCmd, handle: &L2tpHandle, out: &Output) -> l2tp::
     }
 }
 
-async fn run_session(cmd: SessionCmd, handle: &L2tpHandle, out: &Output) -> l2tp::Result<()> {
+async fn run_session(
+    cmd: SessionCmd,
+    handle: &L2tpHandle,
+    out: &Output,
+) -> l2tp::Result<()> {
     match cmd {
         SessionCmd::Create(args) => session_create(args, handle, out).await,
         SessionCmd::Delete(args) => {
             handle
-                .delete_session(TunnelId(args.tunnel_id), SessionId(args.session_id))
+                .delete_session(
+                    TunnelId(args.tunnel_id),
+                    SessionId(args.session_id),
+                )
                 .await?;
             out.success(&format!(
                 "deleted session {} in tunnel {}",
@@ -390,13 +417,18 @@ async fn run_session(cmd: SessionCmd, handle: &L2tpHandle, out: &Output) -> l2tp
         SessionCmd::Change(args) => session_change(args, handle, out).await,
         SessionCmd::Show(args) => {
             let info = handle
-                .get_session(TunnelId(args.tunnel_id), SessionId(args.session_id))
+                .get_session(
+                    TunnelId(args.tunnel_id),
+                    SessionId(args.session_id),
+                )
                 .await?;
             out.session_info(&info);
             Ok(())
         }
         SessionCmd::List(args) => {
-            let sessions: Vec<SessionInfo> = if args.all || args.tunnel_id.is_none() {
+            let sessions: Vec<SessionInfo> = if args.all
+                || args.tunnel_id.is_none()
+            {
                 handle.list_all_sessions().await?
             } else {
                 handle
@@ -408,7 +440,10 @@ async fn run_session(cmd: SessionCmd, handle: &L2tpHandle, out: &Output) -> l2tp
         }
         SessionCmd::Stats(args) => {
             let stats = handle
-                .session_stats(TunnelId(args.tunnel_id), SessionId(args.session_id))
+                .session_stats(
+                    TunnelId(args.tunnel_id),
+                    SessionId(args.session_id),
+                )
                 .await?;
             out.session_stats(args.tunnel_id, args.session_id, &stats);
             Ok(())
@@ -425,7 +460,8 @@ async fn tunnel_create(
 
     let encapsulation = match args.encap {
         EncapArg::Udp => {
-            let (local, remote) = resolve_udp_endpoints(args.local.as_deref(), &args.remote)?;
+            let (local, remote) =
+                resolve_udp_endpoints(args.local.as_deref(), &args.remote)?;
             Encapsulation::Udp {
                 local,
                 remote,
@@ -436,10 +472,14 @@ async fn tunnel_create(
         }
         EncapArg::Ip => {
             let local_s = args.local.as_deref().ok_or_else(|| {
-                l2tp::Error::InvalidIfName("--local is required for --encap ip".to_string())
+                l2tp::Error::InvalidIfName(
+                    "--local is required for --encap ip".to_string(),
+                )
             })?;
-            let local = parse_ip_addr(local_s).map_err(l2tp::Error::InvalidIfName)?;
-            let remote = parse_ip_addr(&args.remote).map_err(l2tp::Error::InvalidIfName)?;
+            let local =
+                parse_ip_addr(local_s).map_err(l2tp::Error::InvalidIfName)?;
+            let remote = parse_ip_addr(&args.remote)
+                .map_err(l2tp::Error::InvalidIfName)?;
             if local.ip_version() != remote.ip_version() {
                 return Err(l2tp::Error::AddressFamilyMismatch);
             }
@@ -454,7 +494,11 @@ async fn tunnel_create(
             None => random_tunnel_id(attempt as u32),
         });
         let peer_tunnel_id = TunnelId(args.peer_tunnel_id);
-        let config = TunnelConfig::new(tunnel_id, peer_tunnel_id, encapsulation.clone())?;
+        let config = TunnelConfig::new(
+            tunnel_id,
+            peer_tunnel_id,
+            encapsulation.clone(),
+        )?;
 
         let socket = match &encapsulation {
             Encapsulation::Udp { local, remote, .. } => {
@@ -485,7 +529,8 @@ async fn tunnel_create(
 
     Err(l2tp::Error::KernelError {
         code: libc::EEXIST,
-        message: "failed to allocate unique tunnel id after 32 attempts".to_string(),
+        message: "failed to allocate unique tunnel id after 32 attempts"
+            .to_string(),
     })
 }
 
@@ -514,8 +559,12 @@ async fn session_create(
     handle: &L2tpHandle,
     out: &Output,
 ) -> l2tp::Result<()> {
-    let cookie = parse_hex_cookie(args.cookie.as_deref().unwrap_or(""), "cookie")?;
-    let peer_cookie = parse_hex_cookie(args.peer_cookie.as_deref().unwrap_or(""), "peer-cookie")?;
+    let cookie =
+        parse_hex_cookie(args.cookie.as_deref().unwrap_or(""), "cookie")?;
+    let peer_cookie = parse_hex_cookie(
+        args.peer_cookie.as_deref().unwrap_or(""),
+        "peer-cookie",
+    )?;
     let ifname = args.ifname.as_deref().map(IfName::new).transpose()?;
 
     let config = SessionConfig {
@@ -564,7 +613,11 @@ async fn session_change(
     }
 
     handle
-        .modify_session(TunnelId(args.tunnel_id), SessionId(args.session_id), modify)
+        .modify_session(
+            TunnelId(args.tunnel_id),
+            SessionId(args.session_id),
+            modify,
+        )
         .await?;
     out.success(&format!(
         "updated session {} in tunnel {}",
@@ -579,7 +632,9 @@ fn random_tunnel_id(attempt: u32) -> u32 {
         .unwrap_or(Duration::from_secs(0))
         .as_nanos() as u64;
     let pid = std::process::id() as u64;
-    let mixed = now ^ (pid << 32) ^ (attempt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mixed = now
+        ^ (pid << 32)
+        ^ (attempt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let span = u32::MAX - 999_999;
     1_000_000 + ((mixed as u32) % span)
 }

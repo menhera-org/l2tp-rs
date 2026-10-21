@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! High-level async Linux L2TPv3 management over Generic Netlink.
 
 /// Error definitions and crate-local [`Result`](crate::Result) type.
@@ -30,6 +32,6 @@ pub use stats::{SessionStats, TunnelStats};
 pub use tunnel::{TunnelConfig, TunnelHandle, TunnelInfo, TunnelModify};
 /// Core shared type definitions.
 pub use types::{
-    Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, PseudowireType, SessionId, TunnelId,
-    UdpEndpoint,
+    Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, PseudowireType,
+    SessionId, TunnelId, UdpEndpoint,
 };

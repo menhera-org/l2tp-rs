@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 use std::fmt;
 
 /// Kernel tunnel identifier (`L2TP_ATTR_CONN_ID`).
@@ -173,8 +175,9 @@ pub enum L2SpecType {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    use super::*;
 
     #[test]
     fn cookie_accepts_valid_lengths() {
@@ -221,8 +224,10 @@ mod tests {
 
     #[test]
     fn endpoint_ip_versions_are_reported() {
-        let udp4 = UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1701));
-        let udp6 = UdpEndpoint::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1701, 0, 0));
+        let udp4 =
+            UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1701));
+        let udp6 =
+            UdpEndpoint::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1701, 0, 0));
         let ip4 = IpEndpoint::V4(Ipv4Addr::LOCALHOST);
         let ip6 = IpEndpoint::V6(Ipv6Addr::LOCALHOST);
 

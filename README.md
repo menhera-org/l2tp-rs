@@ -7,6 +7,7 @@ It does **not** configure interfaces/bridges/routes (`rtnetlink` tasks belong in
 
 ## Requirements
 
+- Rust 1.89 or newer (required by the netlink dependencies).
 - Linux kernel with L2TP Generic Netlink support (`l2tp` family).
 - Tokio runtime.
 - `CAP_NET_ADMIN` (or root) for most create/modify/delete operations.

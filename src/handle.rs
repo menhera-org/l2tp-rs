@@ -1,16 +1,18 @@
-use std::io;
-use std::os::fd::AsRawFd;
-use std::sync::Arc;
+// SPDX-License-Identifier: MIT
+
+use std::{io, os::fd::AsRawFd, sync::Arc};
 
 use futures::StreamExt;
-use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST};
+use netlink_packet_core::{
+    NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
+};
 use netlink_packet_generic::GenlMessage;
 use netlink_packet_l2tp::{L2tpAttribute, L2tpMessage};
 
-use crate::netlink;
 use crate::{
-    SessionConfig, SessionHandle, SessionId, SessionInfo, SessionModify, SessionStats,
-    TunnelConfig, TunnelHandle, TunnelId, TunnelInfo, TunnelModify, TunnelSocket, TunnelStats,
+    SessionConfig, SessionHandle, SessionId, SessionInfo, SessionModify,
+    SessionStats, TunnelConfig, TunnelHandle, TunnelId, TunnelInfo,
+    TunnelModify, TunnelSocket, TunnelStats, netlink,
 };
 
 /// Shared async handle for L2TP generic-netlink operations.
@@ -31,8 +33,9 @@ impl L2tpHandle {
     /// internal Generic Netlink connection task is spawned onto the current
     /// Tokio executor.
     pub async fn new() -> crate::Result<Self> {
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| io::Error::other("tokio runtime is required for L2tpHandle::new()"))?;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            io::Error::other("tokio runtime is required for L2tpHandle::new()")
+        })?;
         let (connection, genl, _unsolicited) = genetlink::new_connection()?;
         runtime.spawn(connection);
 
@@ -53,7 +56,8 @@ impl L2tpHandle {
         config: TunnelConfig,
         socket: TunnelSocket,
     ) -> crate::Result<TunnelHandle> {
-        let message = netlink::encode_tunnel_create(&config, Some(socket.as_raw_fd()));
+        let message =
+            netlink::encode_tunnel_create(&config, Some(socket.as_raw_fd()))?;
         self.send_ack(message).await?;
 
         Ok(TunnelHandle {
@@ -72,7 +76,7 @@ impl L2tpHandle {
         &self,
         config: TunnelConfig,
     ) -> crate::Result<TunnelHandle> {
-        let message = netlink::encode_tunnel_create(&config, None);
+        let message = netlink::encode_tunnel_create(&config, None)?;
         self.send_ack(message).await?;
 
         Ok(TunnelHandle {
@@ -84,8 +88,11 @@ impl L2tpHandle {
     }
 
     /// Creates a session in an existing tunnel.
-    pub async fn create_session(&self, config: SessionConfig) -> crate::Result<SessionHandle> {
-        let message = netlink::encode_session_create(&config);
+    pub async fn create_session(
+        &self,
+        config: SessionConfig,
+    ) -> crate::Result<SessionHandle> {
+        let message = netlink::encode_session_create(&config)?;
         self.send_ack(message).await?;
 
         let info = self
@@ -102,9 +109,15 @@ impl L2tpHandle {
     }
 
     /// Returns information for a single tunnel.
-    pub async fn get_tunnel(&self, tunnel_id: TunnelId) -> crate::Result<TunnelInfo> {
+    pub async fn get_tunnel(
+        &self,
+        tunnel_id: TunnelId,
+    ) -> crate::Result<TunnelInfo> {
         let replies = self
-            .send_and_collect(netlink::encode_tunnel_get(tunnel_id), NLM_F_REQUEST)
+            .send_and_collect(
+                netlink::encode_tunnel_get(tunnel_id),
+                NLM_F_REQUEST,
+            )
             .await?;
         let attrs = first_attributes(&replies, "tunnel not found")?;
         netlink::decode_tunnel_info(attrs)
@@ -142,7 +155,10 @@ impl L2tpHandle {
     }
 
     /// Lists all sessions that belong to a tunnel.
-    pub async fn list_sessions(&self, tunnel_id: TunnelId) -> crate::Result<Vec<SessionInfo>> {
+    pub async fn list_sessions(
+        &self,
+        tunnel_id: TunnelId,
+    ) -> crate::Result<Vec<SessionInfo>> {
         let replies = self
             .send_and_collect(
                 netlink::encode_session_get_dump(Some(tunnel_id)),
@@ -172,7 +188,10 @@ impl L2tpHandle {
     }
 
     /// Deletes a tunnel.
-    pub async fn delete_tunnel(&self, tunnel_id: TunnelId) -> crate::Result<()> {
+    pub async fn delete_tunnel(
+        &self,
+        tunnel_id: TunnelId,
+    ) -> crate::Result<()> {
         self.send_ack(netlink::encode_tunnel_delete(tunnel_id))
             .await
     }
@@ -188,9 +207,15 @@ impl L2tpHandle {
     }
 
     /// Returns tunnel statistics.
-    pub async fn tunnel_stats(&self, tunnel_id: TunnelId) -> crate::Result<TunnelStats> {
+    pub async fn tunnel_stats(
+        &self,
+        tunnel_id: TunnelId,
+    ) -> crate::Result<TunnelStats> {
         let replies = self
-            .send_and_collect(netlink::encode_tunnel_get(tunnel_id), NLM_F_REQUEST)
+            .send_and_collect(
+                netlink::encode_tunnel_get(tunnel_id),
+                NLM_F_REQUEST,
+            )
             .await?;
         let attrs = first_attributes(&replies, "tunnel not found")?;
         netlink::decode_tunnel_stats(attrs)
@@ -242,8 +267,9 @@ impl L2tpHandle {
             .get_or_try_init(|| async {
                 self.inner
                     .genl
-                    .resolve_family_id::<L2tpMessage>()
+                    .resolve_family::<L2tpMessage>()
                     .await
+                    .map(|family| family.id)
                     .map_err(|e| crate::Error::FamilyResolution(e.to_string()))
             })
             .await?;
@@ -275,7 +301,7 @@ impl L2tpHandle {
 
         let mut responses = Vec::new();
         while let Some(item) = stream.next().await {
-            let message = item?;
+            let message = item.map_err(crate::Error::netlink)?;
             match message.payload {
                 NetlinkPayload::InnerMessage(inner) => responses.push(inner),
                 NetlinkPayload::Error(err) => {
@@ -314,16 +340,12 @@ fn to_io_error(err: genetlink::GenetlinkError) -> crate::Error {
 }
 
 fn normalize_errno(code: i32) -> i32 {
-    if code < 0 {
-        -code
-    } else {
-        code
-    }
+    if code < 0 { -code } else { code }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_errno, L2tpHandle};
+    use super::{L2tpHandle, normalize_errno};
 
     #[test]
     fn normalize_errno_converts_negative_to_positive() {

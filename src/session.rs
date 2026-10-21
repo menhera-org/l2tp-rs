@@ -1,4 +1,9 @@
-use crate::{Cookie, IfName, L2SpecType, PseudowireType, SessionId, SessionStats, TunnelId};
+// SPDX-License-Identifier: MIT
+
+use crate::{
+    Cookie, IfName, L2SpecType, PseudowireType, SessionId, SessionStats,
+    TunnelId,
+};
 
 /// Parameters for creating an L2TP session.
 pub struct SessionConfig {
@@ -33,7 +38,11 @@ pub struct SessionConfig {
 
 impl SessionConfig {
     /// Creates a basic Ethernet pseudowire session configuration.
-    pub fn eth(tunnel_id: TunnelId, session_id: SessionId, peer_session_id: SessionId) -> Self {
+    pub fn eth(
+        tunnel_id: TunnelId,
+        session_id: SessionId,
+        peer_session_id: SessionId,
+    ) -> Self {
         Self {
             tunnel_id,
             session_id,
@@ -167,7 +176,8 @@ mod tests {
 
     #[test]
     fn session_eth_constructor_sets_expected_defaults() {
-        let config = SessionConfig::eth(TunnelId(1), SessionId(2), SessionId(3));
+        let config =
+            SessionConfig::eth(TunnelId(1), SessionId(2), SessionId(3));
 
         assert_eq!(config.tunnel_id, TunnelId(1));
         assert_eq!(config.session_id, SessionId(2));

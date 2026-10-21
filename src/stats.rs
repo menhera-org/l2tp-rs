@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 /// Tunnel traffic/error counters.
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct TunnelStats {

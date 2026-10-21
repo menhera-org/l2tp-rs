@@ -1,6 +1,8 @@
+// SPDX-License-Identifier: MIT
+
 use l2tp::{
-    Encapsulation, IpEndpoint, L2SpecType, PseudowireType, SessionInfo, SessionStats, TunnelInfo,
-    TunnelStats, UdpEndpoint,
+    Encapsulation, IpEndpoint, L2SpecType, PseudowireType, SessionInfo,
+    SessionStats, TunnelInfo, TunnelStats, UdpEndpoint,
 };
 use serde::Serialize;
 
@@ -66,7 +68,8 @@ impl Output {
                 }
             }
             OutputFmt::Json => {
-                let v: Vec<TunnelInfoJson> = tunnels.iter().map(tunnel_to_json).collect();
+                let v: Vec<TunnelInfoJson> =
+                    tunnels.iter().map(tunnel_to_json).collect();
                 println!("{}", serde_json::to_string_pretty(&v).unwrap());
             }
         }
@@ -117,13 +120,19 @@ impl Output {
                 }
             }
             OutputFmt::Json => {
-                let v: Vec<SessionInfoJson> = sessions.iter().map(session_to_json).collect();
+                let v: Vec<SessionInfoJson> =
+                    sessions.iter().map(session_to_json).collect();
                 println!("{}", serde_json::to_string_pretty(&v).unwrap());
             }
         }
     }
 
-    pub fn session_stats(&self, tunnel_id: u32, session_id: u32, stats: &SessionStats) {
+    pub fn session_stats(
+        &self,
+        tunnel_id: u32,
+        session_id: u32,
+        stats: &SessionStats,
+    ) {
         match self.fmt {
             OutputFmt::Text => {
                 println!("session {session_id} in tunnel {tunnel_id} stats");
@@ -136,7 +145,8 @@ impl Output {
                     stats.rx_packets, stats.rx_bytes, stats.rx_errors
                 );
                 println!(
-                    "  rx-extra: seq_discards={} oos_packets={} cookie_discards={} invalid={}",
+                    "  rx-extra: seq_discards={} oos_packets={} \
+                     cookie_discards={} invalid={}",
                     stats.rx_seq_discards,
                     stats.rx_oos_packets,
                     stats.rx_cookie_discards,

@@ -1,4 +1,8 @@
-use crate::{Encapsulation, IpEndpoint, TunnelId, TunnelSocket, TunnelStats, UdpEndpoint};
+// SPDX-License-Identifier: MIT
+
+use crate::{
+    Encapsulation, IpEndpoint, TunnelId, TunnelSocket, TunnelStats, UdpEndpoint,
+};
 
 /// Parameters for creating an L2TP tunnel.
 pub struct TunnelConfig {
@@ -107,13 +111,15 @@ impl TunnelHandle {
 
     /// Reconnects a managed UDP tunnel socket to a new remote endpoint.
     pub fn reconnect_udp(&self, new_remote: &UdpEndpoint) -> crate::Result<()> {
-        let socket = self.socket.as_ref().ok_or(crate::Error::UnmanagedSocket)?;
+        let socket =
+            self.socket.as_ref().ok_or(crate::Error::UnmanagedSocket)?;
         socket.reconnect_udp(new_remote)
     }
 
     /// Reconnects a managed IP tunnel socket to a new remote endpoint.
     pub fn reconnect_ip(&self, new_remote: &IpEndpoint) -> crate::Result<()> {
-        let socket = self.socket.as_ref().ok_or(crate::Error::UnmanagedSocket)?;
+        let socket =
+            self.socket.as_ref().ok_or(crate::Error::UnmanagedSocket)?;
         socket.reconnect_ip(new_remote)
     }
 }
@@ -137,9 +143,10 @@ impl Drop for TunnelHandle {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
     use super::*;
     use crate::{IpEndpoint, UdpEndpoint};
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
     #[test]
     fn tunnel_config_new_accepts_matching_udp_families() {
@@ -147,8 +154,14 @@ mod tests {
             TunnelId(10),
             TunnelId(20),
             Encapsulation::Udp {
-                local: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 10000)),
-                remote: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 10001)),
+                local: UdpEndpoint::V4(SocketAddrV4::new(
+                    Ipv4Addr::LOCALHOST,
+                    10000,
+                )),
+                remote: UdpEndpoint::V4(SocketAddrV4::new(
+                    Ipv4Addr::LOCALHOST,
+                    10001,
+                )),
                 udp_csum: true,
                 udp_zero_csum6_tx: false,
                 udp_zero_csum6_rx: false,
@@ -166,8 +179,16 @@ mod tests {
             TunnelId(1),
             TunnelId(2),
             Encapsulation::Udp {
-                local: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1701)),
-                remote: UdpEndpoint::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1701, 0, 0)),
+                local: UdpEndpoint::V4(SocketAddrV4::new(
+                    Ipv4Addr::LOCALHOST,
+                    1701,
+                )),
+                remote: UdpEndpoint::V6(SocketAddrV6::new(
+                    Ipv6Addr::LOCALHOST,
+                    1701,
+                    0,
+                    0,
+                )),
                 udp_csum: false,
                 udp_zero_csum6_tx: false,
                 udp_zero_csum6_rx: false,

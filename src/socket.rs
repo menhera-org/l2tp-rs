@@ -1,6 +1,10 @@
-use std::mem::{size_of, zeroed};
-use std::net::{Ipv4Addr, Ipv6Addr};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+// SPDX-License-Identifier: MIT
+
+use std::{
+    mem::{size_of, zeroed},
+    net::{Ipv4Addr, Ipv6Addr},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+};
 
 use crate::{IfName, IpEndpoint, UdpEndpoint};
 
@@ -81,10 +85,18 @@ enum SockAddr {
 impl SockAddr {
     fn as_ptr(&self) -> *const libc::sockaddr {
         match self {
-            Self::V4(v) => v as *const libc::sockaddr_in as *const libc::sockaddr,
-            Self::V6(v) => v as *const libc::sockaddr_in6 as *const libc::sockaddr,
-            Self::L2tpV4(v) => v as *const SockaddrL2tpIp as *const libc::sockaddr,
-            Self::L2tpV6(v) => v as *const SockaddrL2tpIp6 as *const libc::sockaddr,
+            Self::V4(v) => {
+                v as *const libc::sockaddr_in as *const libc::sockaddr
+            }
+            Self::V6(v) => {
+                v as *const libc::sockaddr_in6 as *const libc::sockaddr
+            }
+            Self::L2tpV4(v) => {
+                v as *const SockaddrL2tpIp as *const libc::sockaddr
+            }
+            Self::L2tpV6(v) => {
+                v as *const SockaddrL2tpIp6 as *const libc::sockaddr
+            }
         }
     }
 
@@ -101,7 +113,8 @@ impl SockAddr {
 impl TunnelSocket {
     /// Creates and connects a UDP socket for an L2TP tunnel.
     ///
-    /// If `device` is provided, `SO_BINDTODEVICE` is applied before bind/connect.
+    /// If `device` is provided, `SO_BINDTODEVICE` is applied before
+    /// bind/connect.
     pub fn udp(
         local: &UdpEndpoint,
         remote: &UdpEndpoint,
@@ -260,7 +273,8 @@ impl TunnelSocket {
                 // SAFETY: kernel reported AF_INET, so interpreting as
                 // `sockaddr_in` is valid.
                 let sa = unsafe {
-                    *(&storage as *const libc::sockaddr_storage as *const libc::sockaddr_in)
+                    *(&storage as *const libc::sockaddr_storage
+                        as *const libc::sockaddr_in)
                 };
                 let ip = Ipv4Addr::from(sa.sin_addr.s_addr.to_ne_bytes());
                 let port = u16::from_be(sa.sin_port);
@@ -270,7 +284,8 @@ impl TunnelSocket {
                 // SAFETY: kernel reported AF_INET6, so interpreting as
                 // `sockaddr_in6` is valid.
                 let sa = unsafe {
-                    *(&storage as *const libc::sockaddr_storage as *const libc::sockaddr_in6)
+                    *(&storage as *const libc::sockaddr_storage
+                        as *const libc::sockaddr_in6)
                 };
                 let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
                 let port = u16::from_be(sa.sin6_port);
@@ -295,7 +310,11 @@ impl AsRawFd for TunnelSocket {
     }
 }
 
-fn socket(domain: libc::c_int, ty: libc::c_int, protocol: libc::c_int) -> crate::Result<OwnedFd> {
+fn socket(
+    domain: libc::c_int,
+    ty: libc::c_int,
+    protocol: libc::c_int,
+) -> crate::Result<OwnedFd> {
     // SAFETY: parameters are passed directly to libc; on success this returns
     // a newly owned fd which is wrapped in `OwnedFd` exactly once.
     let fd = unsafe { libc::socket(domain, ty, protocol) };
@@ -395,11 +414,14 @@ fn l2tp_sockaddr(endpoint: &IpEndpoint, conn_id: u32) -> SockAddr {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io,
+        mem::size_of,
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket},
+        time::Duration,
+    };
+
     use super::*;
-    use std::io;
-    use std::mem::size_of;
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket};
-    use std::time::Duration;
 
     fn as_v4(addr: SocketAddr) -> SocketAddrV4 {
         match addr {
@@ -418,8 +440,14 @@ mod tests {
 
     #[test]
     fn udp_constructor_rejects_family_mismatch() {
-        let local = UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1701));
-        let remote = UdpEndpoint::V6(std::net::SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1701, 0, 0));
+        let local =
+            UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1701));
+        let remote = UdpEndpoint::V6(std::net::SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            1701,
+            0,
+            0,
+        ));
 
         let err = match TunnelSocket::udp(&local, &remote, None) {
             Ok(_) => panic!("expected address family mismatch"),
@@ -464,7 +492,9 @@ mod tests {
             None,
         ) {
             Ok(s) => s,
-            Err(crate::Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+            Err(crate::Error::Io(e))
+                if e.kind() == io::ErrorKind::PermissionDenied =>
+            {
                 return;
             }
             Err(e) => panic!("unexpected tunnel socket error: {e:?}"),
@@ -478,7 +508,9 @@ mod tests {
 
         // SAFETY: the file descriptor is a valid connected UDP socket and
         // buffer pointers are valid for their length.
-        let rc = unsafe { libc::send(tunnel_socket.as_raw_fd(), b"one".as_ptr().cast(), 3, 0) };
+        let rc = unsafe {
+            libc::send(tunnel_socket.as_raw_fd(), b"one".as_ptr().cast(), 3, 0)
+        };
         assert_eq!(rc, 3);
 
         let mut buf = [0u8; 64];
@@ -491,7 +523,9 @@ mod tests {
 
         // SAFETY: the file descriptor is a valid connected UDP socket and
         // buffer pointers are valid for their length.
-        let rc = unsafe { libc::send(tunnel_socket.as_raw_fd(), b"two".as_ptr().cast(), 3, 0) };
+        let rc = unsafe {
+            libc::send(tunnel_socket.as_raw_fd(), b"two".as_ptr().cast(), 3, 0)
+        };
         assert_eq!(rc, 3);
 
         let (n2, _) = receiver2.recv_from(&mut buf).unwrap();
@@ -506,13 +540,16 @@ mod tests {
 
     #[test]
     fn reconnect_udp_and_local_addr_reject_unmanaged_socket() {
-        let fd = match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
-            Ok(fd) => fd,
-            Err(crate::Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
-                return;
-            }
-            Err(e) => panic!("unexpected socket create error: {e:?}"),
-        };
+        let fd =
+            match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
+                Ok(fd) => fd,
+                Err(crate::Error::Io(e))
+                    if e.kind() == io::ErrorKind::PermissionDenied =>
+                {
+                    return;
+                }
+                Err(e) => panic!("unexpected socket create error: {e:?}"),
+            };
         let sock = TunnelSocket {
             fd,
             encap: SocketEncap::Ip,
@@ -544,7 +581,9 @@ mod tests {
             None,
         ) {
             Ok(s) => s,
-            Err(crate::Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+            Err(crate::Error::Io(e))
+                if e.kind() == io::ErrorKind::PermissionDenied =>
+            {
                 return;
             }
             Err(e) => panic!("unexpected tunnel socket error: {e:?}"),
@@ -567,7 +606,9 @@ mod tests {
             None,
         ) {
             Ok(s) => s,
-            Err(crate::Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+            Err(crate::Error::Io(e))
+                if e.kind() == io::ErrorKind::PermissionDenied =>
+            {
                 return;
             }
             Err(e) => panic!("unexpected tunnel socket error: {e:?}"),
@@ -586,13 +627,16 @@ mod tests {
 
     #[test]
     fn reconnect_ip_rejects_udp_socket() {
-        let fd = match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
-            Ok(fd) => fd,
-            Err(crate::Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
-                return;
-            }
-            Err(e) => panic!("unexpected socket create error: {e:?}"),
-        };
+        let fd =
+            match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
+                Ok(fd) => fd,
+                Err(crate::Error::Io(e))
+                    if e.kind() == io::ErrorKind::PermissionDenied =>
+                {
+                    return;
+                }
+                Err(e) => panic!("unexpected socket create error: {e:?}"),
+            };
         let sock = TunnelSocket {
             fd,
             encap: SocketEncap::Udp,
@@ -607,13 +651,16 @@ mod tests {
 
     #[test]
     fn reconnect_ip_rejects_family_mismatch_with_clear_error() {
-        let fd = match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
-            Ok(fd) => fd,
-            Err(crate::Error::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
-                return;
-            }
-            Err(e) => panic!("unexpected socket create error: {e:?}"),
-        };
+        let fd =
+            match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
+                Ok(fd) => fd,
+                Err(crate::Error::Io(e))
+                    if e.kind() == io::ErrorKind::PermissionDenied =>
+                {
+                    return;
+                }
+                Err(e) => panic!("unexpected socket create error: {e:?}"),
+            };
         let sock = TunnelSocket {
             fd,
             encap: SocketEncap::Ip,

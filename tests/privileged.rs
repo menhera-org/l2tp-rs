@@ -1,11 +1,16 @@
-use l2tp::{
-    Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, L2tpHandle, PseudowireType,
-    SessionConfig, SessionId, SessionModify, TunnelConfig, TunnelId, TunnelModify, TunnelSocket,
-    UdpEndpoint,
+// SPDX-License-Identifier: MIT
+
+use std::{
+    net::{Ipv4Addr, SocketAddrV4},
+    sync::atomic::{AtomicU32, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
-use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use l2tp::{
+    Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, L2tpHandle,
+    PseudowireType, SessionConfig, SessionId, SessionModify, TunnelConfig,
+    TunnelId, TunnelModify, TunnelSocket, UdpEndpoint,
+};
 
 static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -39,7 +44,8 @@ fn is_eexist(err: &l2tp::Error) -> bool {
 fn privileged_bind_to_device_on_loopback() {
     let local = UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
     let remote = UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999));
-    let device = IfName::new("lo").unwrap_or_else(|e| panic!("invalid ifname: {e}"));
+    let device =
+        IfName::new("lo").unwrap_or_else(|e| panic!("invalid ifname: {e}"));
 
     let socket = TunnelSocket::udp(&local, &remote, None)
         .unwrap_or_else(|e| panic!("failed to create UDP tunnel socket: {e}"));
@@ -66,8 +72,14 @@ fn privileged_unmanaged_tunnel_lifecycle_over_genl() {
                 tunnel_id,
                 peer_tunnel_id,
                 Encapsulation::Udp {
-                    local: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 17011)),
-                    remote: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 17012)),
+                    local: UdpEndpoint::V4(SocketAddrV4::new(
+                        Ipv4Addr::LOCALHOST,
+                        17011,
+                    )),
+                    remote: UdpEndpoint::V4(SocketAddrV4::new(
+                        Ipv4Addr::LOCALHOST,
+                        17012,
+                    )),
                     udp_csum: false,
                     udp_zero_csum6_tx: false,
                     udp_zero_csum6_rx: false,
@@ -87,9 +99,11 @@ fn privileged_unmanaged_tunnel_lifecycle_over_genl() {
             }
         }
 
-        let (tunnel_id, peer_tunnel_id) = selected_ids
-            .unwrap_or_else(|| panic!("could not allocate unique tunnel id after retries"));
-        let mut tunnel = tunnel_opt.unwrap_or_else(|| panic!("missing tunnel after creation"));
+        let (tunnel_id, peer_tunnel_id) = selected_ids.unwrap_or_else(|| {
+            panic!("could not allocate unique tunnel id after retries")
+        });
+        let mut tunnel = tunnel_opt
+            .unwrap_or_else(|| panic!("missing tunnel after creation"));
         tunnel.set_auto_delete(false);
 
         let info = tunnel
@@ -143,7 +157,12 @@ fn privileged_session_lifecycle_over_genl() {
             match handle.create_unmanaged_tunnel(tunnel_config).await {
                 Ok(mut tunnel) => {
                     tunnel.set_auto_delete(false);
-                    selected_ids = Some((tunnel_id, peer_tunnel_id, session_id, peer_session_id));
+                    selected_ids = Some((
+                        tunnel_id,
+                        peer_tunnel_id,
+                        session_id,
+                        peer_session_id,
+                    ));
                     tunnel_opt = Some(tunnel);
                     break;
                 }
@@ -152,11 +171,15 @@ fn privileged_session_lifecycle_over_genl() {
             }
         }
 
-        let (tunnel_id, _peer_tunnel_id, session_id, peer_session_id) = selected_ids
-            .unwrap_or_else(|| {
-                panic!("could not allocate unique tunnel/session ids after retries")
+        let (tunnel_id, _peer_tunnel_id, session_id, peer_session_id) =
+            selected_ids.unwrap_or_else(|| {
+                panic!(
+                    "could not allocate unique tunnel/session ids after \
+                     retries"
+                )
             });
-        let mut tunnel = tunnel_opt.unwrap_or_else(|| panic!("missing tunnel after creation"));
+        let mut tunnel = tunnel_opt
+            .unwrap_or_else(|| panic!("missing tunnel after creation"));
         tunnel.set_auto_delete(false);
 
         let session_config = SessionConfig {
