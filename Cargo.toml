@@ -39,6 +39,8 @@ thiserror              = "2"
 futures                = "0.3"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+bytes                  = "1"
+netlink-sys            = "0.9"
 # README examples are compiled as doctests.
 tokio                  = { version = "1", features = ["rt-multi-thread", "macros"] }
 

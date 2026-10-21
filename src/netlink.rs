@@ -46,6 +46,15 @@ pub(crate) fn encode_tunnel_create(
                     attrs.push(L2tpAttribute::UdpDport(remote.port()));
                 }
                 (UdpEndpoint::V6(local), UdpEndpoint::V6(remote)) => {
+                    // udp_sock_create6 only applies the IPv6 checksum
+                    // options. Mapped peers use the IPv4 transmit path, whose
+                    // SO_NO_CHECK setting requires a userspace-owned socket.
+                    if fd.is_none()
+                        && !udp_csum
+                        && remote.ip().to_ipv4_mapped().is_some()
+                    {
+                        return Err(crate::Error::UnmanagedUdpChecksum);
+                    }
                     attrs.push(L2tpAttribute::Ip6Saddr(*local.ip()));
                     attrs.push(L2tpAttribute::Ip6Daddr(*remote.ip()));
                     attrs.push(L2tpAttribute::UdpSport(local.port()));
@@ -577,6 +586,49 @@ mod tests {
             L2tpAttribute::UdpCsum(_)
         )));
         assert_wire_round_trip(message);
+    }
+
+    #[test]
+    fn mapped_udp_checksum_requires_managed_socket_when_disabled() {
+        let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        for local in [Ipv6Addr::UNSPECIFIED, mapped] {
+            for (remote, udp_csum, fd, rejected) in [
+                (mapped, false, None, true),
+                (mapped, true, None, false),
+                (mapped, false, Some(7), false),
+                (mapped, true, Some(7), false),
+                (Ipv6Addr::LOCALHOST, false, None, false),
+            ] {
+                // IPv6 checksum flags must not bypass the IPv4 check.
+                for udp_zero_csum6_tx in [false, true] {
+                    let cfg = TunnelConfig::new(
+                        TunnelId(1),
+                        TunnelId(2),
+                        Encapsulation::Udp {
+                            local: UdpEndpoint::V6(SocketAddrV6::new(
+                                local, 1000, 0, 0,
+                            )),
+                            remote: UdpEndpoint::V6(SocketAddrV6::new(
+                                remote, 1001, 0, 0,
+                            )),
+                            udp_csum,
+                            udp_zero_csum6_tx,
+                            udp_zero_csum6_rx: false,
+                        },
+                    )
+                    .unwrap();
+                    let result = encode_tunnel_create(&cfg, fd);
+                    if rejected {
+                        assert!(matches!(
+                            result,
+                            Err(crate::Error::UnmanagedUdpChecksum)
+                        ));
+                    } else {
+                        assert_wire_round_trip(result.unwrap());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

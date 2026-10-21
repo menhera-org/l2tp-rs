@@ -139,8 +139,10 @@ pub enum Encapsulation {
         /// Whether UDP checksums are sent for IPv4 traffic.
         ///
         /// For managed sockets this also covers IPv4 peers reached through
-        /// IPv4-mapped addresses on an IPv6 socket. The kernel ignores it for
-        /// unmanaged IPv6 tunnels, which always checksum IPv4-mapped traffic.
+        /// IPv4-mapped addresses on an IPv6 socket. Unmanaged tunnels with
+        /// an IPv4-mapped peer reject `false` with
+        /// [`Error::UnmanagedUdpChecksum`](crate::Error::UnmanagedUdpChecksum);
+        /// use IPv4 endpoints or a managed socket to disable those checksums.
         /// IPv6 UDP always carries checksums unless `udp_zero_csum6_tx` is
         /// set.
         udp_csum: bool,

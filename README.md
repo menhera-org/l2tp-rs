@@ -157,6 +157,9 @@ let sstats = handle.session_stats(TunnelId(1000), SessionId(3000)).await?;
 ## Handle Lifetime
 
 - `TunnelHandle` and `SessionHandle` default to `auto_delete = true`.
+- Tunnel and session creation keeps ownership through the kernel acknowledgement
+  even if the caller is cancelled. Successful creations that the caller no longer
+  receives are cleaned up. Keep the Tokio runtime running until this work finishes.
 - On drop, they spawn best-effort async delete calls onto the current Tokio runtime.
   These run after the drop returns, so they can race with re-creating the same ID.
 - Prefer `tunnel.delete().await?` / `session.delete().await?`, which delete
@@ -216,3 +219,9 @@ command exit. Remove it with `l2tp tunnel delete`. Checksum flags apply to the
 kernel-created socket. The socket-only flags `--device` and `--ipv6-dontfrag`
 are unsupported by persistent CLI tunnels and return an error; use the library's
 managed tunnel API when those socket options are needed.
+
+`--no-udp-csum` is rejected when the remote peer is IPv4-mapped on an IPv6
+socket, including when an IPv4 `--remote` is automatically mapped to match an
+IPv6 `--local`. Use IPv4 endpoints for both addresses, or the library's managed
+tunnel API, to disable IPv4 checksums. Mapped tunnels with checksums enabled
+remain supported.

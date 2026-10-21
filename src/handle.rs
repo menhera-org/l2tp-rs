@@ -72,6 +72,12 @@ impl L2tpHandle {
     ///
     /// For IP encapsulation, `socket` must have been created by
     /// [`TunnelSocket::ip`] with the same tunnel ID as `config`.
+    ///
+    /// Once started inside a Tokio runtime, creation continues through the
+    /// kernel's acknowledgement even if the caller cancels this future. The
+    /// socket stays owned until then; an unclaimed tunnel is dropped with
+    /// auto-delete enabled. The runtime must keep running for cleanup to
+    /// finish.
     pub async fn create_tunnel(
         &self,
         config: TunnelConfig,
@@ -80,14 +86,17 @@ impl L2tpHandle {
         socket.configure(&config.encapsulation)?;
         let message =
             netlink::encode_tunnel_create(&config, Some(socket.as_raw_fd()))?;
-        self.send_ack(message).await?;
-
-        Ok(TunnelHandle {
-            tunnel_id: config.tunnel_id,
-            socket: Some(socket),
-            auto_delete: true,
-            handle: self.clone(),
+        let handle = self.clone();
+        run_creation(async move {
+            handle.send_ack(message).await?;
+            Ok(TunnelHandle {
+                tunnel_id: config.tunnel_id,
+                socket: Some(socket),
+                auto_delete: true,
+                handle,
+            })
         })
+        .await
     }
 
     /// Creates an unmanaged tunnel (no owned socket fd in this process).
@@ -96,31 +105,49 @@ impl L2tpHandle {
     /// address attributes. The tunnel outlives this process; it is removed
     /// when the returned handle is dropped (unless auto-delete is disabled),
     /// by [`TunnelHandle::delete`], or by [`L2tpHandle::delete_tunnel`].
+    /// Disabling UDP checksums for an IPv4-mapped peer returns
+    /// [`Error::UnmanagedUdpChecksum`](crate::Error::UnmanagedUdpChecksum);
+    /// use IPv4 endpoints or a managed socket for this setting.
+    ///
+    /// Once started inside a Tokio runtime, creation continues through the
+    /// kernel's acknowledgement even if the caller cancels this future. An
+    /// unclaimed tunnel is dropped with auto-delete enabled. The runtime must
+    /// keep running for this best-effort cleanup to finish.
     pub async fn create_unmanaged_tunnel(
         &self,
         config: TunnelConfig,
     ) -> crate::Result<TunnelHandle> {
         let message = netlink::encode_tunnel_create(&config, None)?;
-        self.send_ack(message).await?;
-
-        Ok(TunnelHandle {
-            tunnel_id: config.tunnel_id,
-            socket: None,
-            auto_delete: true,
-            handle: self.clone(),
+        let handle = self.clone();
+        run_creation(async move {
+            handle.send_ack(message).await?;
+            Ok(TunnelHandle {
+                tunnel_id: config.tunnel_id,
+                socket: None,
+                auto_delete: true,
+                handle,
+            })
         })
+        .await
     }
 
     /// Creates a session in an existing tunnel.
-    /// Cancellation during the follow-up information lookup schedules
-    /// best-effort deletion of the acknowledged session.
+    ///
+    /// Once started inside a Tokio runtime, creation continues through the
+    /// kernel's acknowledgement and follow-up lookup even if the caller cancels
+    /// this future. An unclaimed session is dropped with auto-delete enabled.
+    /// The runtime must keep running for this best-effort cleanup to finish.
     pub async fn create_session(
         &self,
         config: SessionConfig,
     ) -> crate::Result<SessionHandle> {
         let message = netlink::encode_session_create(&config)?;
-        self.send_ack(message).await?;
-        self.get_created_session(config).await
+        let handle = self.clone();
+        run_creation(async move {
+            handle.send_ack(message).await?;
+            handle.get_created_session(config).await
+        })
+        .await
     }
 
     async fn get_created_session(
@@ -407,6 +434,50 @@ where
         "netlink reply stream closed before request completion",
     )
     .into())
+}
+
+struct CreationResult<T> {
+    value: Option<crate::Result<T>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl<T> Drop for CreationResult<T> {
+    fn drop(&mut self) {
+        // A completed JoinHandle's output can be dropped by a cancelling
+        // caller outside Tokio. Restore the creating runtime so an unclaimed
+        // tunnel/session can still schedule its best-effort deletion.
+        let _guard = self.runtime.enter();
+        drop(self.value.take());
+    }
+}
+
+// The task owns the socket/request until ACK, then owns the resulting RAII
+// handle. Dropping the caller's JoinHandle detaches the task; its unclaimed
+// result is dropped with auto-delete enabled. Do not construct that handle
+// before a successful ACK: deleting after EEXIST could remove someone else's
+// tunnel or session.
+async fn run_creation<F, T>(creation: F) -> crate::Result<T>
+where
+    F: std::future::Future<Output = crate::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+        io::Error::other("tokio runtime is required for creation")
+    })?;
+    let cleanup_runtime = runtime.clone();
+    let mut result = runtime
+        .spawn(async move {
+            CreationResult {
+                value: Some(creation.await),
+                runtime: cleanup_runtime,
+            }
+        })
+        .await
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    result
+        .value
+        .take()
+        .expect("creation task returned a result")
 }
 
 // Keep the owning handle in a separate task: cancelling the caller must not
@@ -704,3 +775,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod creation_tests;

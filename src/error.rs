@@ -47,6 +47,14 @@ pub enum Error {
     )]
     UnmanagedSocket,
 
+    /// The kernel cannot disable IPv4 UDP checksums on an unmanaged IPv6
+    /// socket connected to an IPv4-mapped peer.
+    #[error(
+        "disabling UDP checksums for an IPv4-mapped peer requires a managed \
+         socket; use IPv4 endpoints or the managed tunnel API"
+    )]
+    UnmanagedUdpChecksum,
+
     /// Kernel returned an error code and message.
     #[error("kernel error {code}: {message}")]
     KernelError {

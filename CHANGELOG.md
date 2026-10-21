@@ -37,8 +37,15 @@
   kernel only checks whether the attribute is present.
 - Managed UDP sockets now apply `udp_csum`, `udp_zero_csum6_tx` and
   `udp_zero_csum6_rx` as socket options before the tunnel is registered.
+- Unmanaged tunnels reject disabling UDP checksums for IPv4-mapped peers,
+  instead of silently sending checksums. The CLI explains how to use IPv4
+  endpoints or the managed tunnel API for this setting.
 - Tunnel sockets are created with `SOCK_CLOEXEC`, so child processes no
   longer keep a tunnel alive.
+- Tunnel and session creation retains ownership through the kernel ACK when
+  the caller is cancelled. Unclaimed successful creations are cleaned up while
+  the Tokio runtime remains running; managed socket descriptors cannot be
+  reused before registration completes.
 - `create_session` deletes the session again when the follow-up lookup fails
   or is cancelled, instead of leaking it without a handle.
 - Netlink replies are tracked explicitly: a missing ACK, a truncated reply

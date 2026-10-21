@@ -122,6 +122,7 @@ struct TunnelCreateArgs {
     #[arg(long)]
     device: Option<String>,
 
+    /// Disable IPv4 UDP checksums; requires IPv4 endpoints (not mapped IPv6).
     #[arg(long)]
     no_udp_csum: bool,
 
@@ -535,6 +536,14 @@ async fn tunnel_create(
             {
                 continue;
             }
+            Err(l2tp::Error::UnmanagedUdpChecksum) => {
+                return Err(CliError::Usage(
+                    "--no-udp-csum is unsupported for IPv4-mapped peers on \
+                     persistent IPv6 tunnels; use IPv4 --local and --remote \
+                     endpoints or the library's managed tunnel API"
+                        .to_string(),
+                ));
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -712,6 +721,48 @@ mod tests {
             } else {
                 assert!(matches!(result, Err(CliError::Usage(_))));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_mapped_tunnel_rejects_disabled_udp_checksum() {
+        let handle = L2tpHandle::new().await.unwrap();
+        let out = Output::new(OutputFmt::Text);
+        for (local, remote) in [
+            (Some("[::]:1701"), "127.0.0.1:1702"),
+            (Some("[::]:1701"), "[::ffff:127.0.0.1]:1702"),
+            (Some("[::ffff:127.0.0.1]:1701"), "[::ffff:127.0.0.2]:1702"),
+            (None, "[::ffff:127.0.0.1]:1702"),
+        ] {
+            let mut argv = vec![
+                "l2tp",
+                "tunnel",
+                "create",
+                "--peer-tunnel-id",
+                "2",
+                "--remote",
+                remote,
+                "--no-udp-csum",
+            ];
+            if let Some(local) = local {
+                argv.extend(["--local", local]);
+            }
+            let Cli {
+                cmd:
+                    Cmd::Tunnel(TunnelArgs {
+                        cmd: TunnelCmd::Create(args),
+                    }),
+                ..
+            } = Cli::try_parse_from(argv).unwrap()
+            else {
+                panic!("expected tunnel create");
+            };
+            // The unsupported setting must fail before any netlink request,
+            // without requiring L2TP support or CAP_NET_ADMIN.
+            let err = tunnel_create(args, &handle, &out).await.unwrap_err();
+            assert!(matches!(err, CliError::Usage(_)));
+            assert!(err.to_string().contains("--no-udp-csum"));
+            assert!(err.to_string().contains("IPv4-mapped"));
         }
     }
 
