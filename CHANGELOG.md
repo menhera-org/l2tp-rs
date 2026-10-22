@@ -10,7 +10,8 @@
   Names are byte strings and need not be UTF-8, including in the netlink
   attributes. `IfName::new(s)` becomes `L2tpIfName::from_name(s)`, which
   reports a rejected name as `Error::InvalidIfName`, and `as_str()` becomes
-  `to_str()` (fallible) or `to_string_lossy()`.
+  `to_str()` (fallible) or `to_string_lossy()`. The error of the upstream
+  constructors is re-exported as `l2tp::DecodeError`.
 - `TunnelInfo::proto_version` is `TunnelInfo::version`, an `L2tpVersion`.
 - `TunnelSocket::ip` takes the peer tunnel identifier, so the kernel records
   the peer connection ID.

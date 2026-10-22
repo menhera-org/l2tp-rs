@@ -27,6 +27,12 @@ mod types;
 pub use error::{Error, Result};
 pub use event::{Events, L2tpEvent};
 pub use handle::L2tpHandle;
+/// The error of [`L2tpIfName`]'s own constructors (`new`, `parse` and the
+/// `TryFrom` conversions), re-exported so it can be named without
+/// depending on `netlink-packet-core`; it converts into
+/// [`Error::Netlink`]. [`L2tpIfNameExt::from_name`] reports the same
+/// failures as [`Error::InvalidIfName`].
+pub use netlink_packet_core::DecodeError;
 pub use netns::NetNs;
 pub use ppp::{PppChannel, PppSocket, PppUnit};
 pub use session::{SessionConfig, SessionHandle, SessionInfo, SessionModify};

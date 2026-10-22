@@ -357,9 +357,9 @@ extension trait: `from_name` validates a string or bytes and reports a
 rejected name as `Error::InvalidIfName`, `index` and `from_index`
 map names to the kernel's interface indexes, and `as_os_str` yields an
 `OsStr`. Names are byte strings and need not be UTF-8. The upstream
-constructors return `netlink_packet_core::DecodeError`, which converts into
-`Error::Netlink`. The CLI validates `--ifname` and `--device` while parsing
-and accepts non-UTF-8 arguments.
+constructors return `DecodeError`, re-exported here as `l2tp::DecodeError`,
+which converts into `Error::Netlink`. The CLI validates `--ifname` and
+`--device` while parsing and accepts non-UTF-8 arguments.
 
 A session's name is the one its interface had when the session was created;
 the kernel does not follow renames. `SessionHandle::ifindex` identifies the
