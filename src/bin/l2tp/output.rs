@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 use l2tp::{
-    Encapsulation, IpEndpoint, L2SpecType, L2tpEvent, PseudowireType,
-    SessionInfo, SessionStats, TunnelInfo, TunnelStats, UdpEndpoint,
+    Encapsulation, IpEndpoint, L2SpecType, L2tpEvent, L2tpIfName,
+    PseudowireType, SessionInfo, SessionStats, TunnelInfo, TunnelStats,
+    UdpEndpoint,
 };
 use serde::Serialize;
 
@@ -324,7 +325,7 @@ fn print_session_text(info: &SessionInfo) {
         println!("  recv_timeout_ms: none");
     }
     if let Some(ifname) = &info.ifname {
-        println!("  ifname: {ifname}");
+        println!("  ifname: {}", fmt_ifname_text(ifname));
     } else {
         println!("  ifname: none");
     }
@@ -394,6 +395,25 @@ fn fmt_cookie(cookie: &l2tp::Cookie) -> String {
     }
 }
 
+fn fmt_ifname_text(ifname: &L2tpIfName) -> String {
+    let mut text = String::new();
+    // Kernel-valid names may contain terminal controls or invalid UTF-8.
+    // Keep printable Unicode readable while making those bytes harmless.
+    for chunk in ifname.as_bytes().utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            if ch.is_control() {
+                text.extend(ch.escape_default());
+            } else {
+                text.push(ch);
+            }
+        }
+        for byte in chunk.invalid() {
+            text.extend(std::ascii::escape_default(*byte).map(char::from));
+        }
+    }
+    text
+}
+
 fn fmt_udp(ep: &UdpEndpoint) -> String {
     match ep {
         UdpEndpoint::V4(addr) => format!("{}:{}", addr.ip(), addr.port()),
@@ -431,5 +451,43 @@ fn fmt_l2spec(v: L2SpecType) -> String {
         L2SpecType::Default => "default".to_string(),
         L2SpecType::Other(raw) => raw.to_string(),
         other => format!("{other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_interface_names_escape_terminal_controls() {
+        for (raw, expected) in [
+            (&b"\x1b[2Jeth0"[..], "\\u{1b}[2Jeth0"),
+            (&b"\x1b]52;;YQ==\x07"[..], "\\u{1b}]52;;YQ==\\u{7}"),
+            ("eth\u{9b}0".as_bytes(), "eth\\u{9b}0"),
+            (&b"eth\x7f0"[..], "eth\\u{7f}0"),
+        ] {
+            let ifname = L2tpIfName::new(raw).unwrap();
+            assert_eq!(fmt_ifname_text(&ifname), expected);
+        }
+    }
+
+    #[test]
+    fn text_interface_names_escape_invalid_utf8_bytes() {
+        for (raw, expected) in [
+            (&b"eth\x9b0"[..], "eth\\x9b0"),
+            (&b"eth\xff0"[..], "eth\\xff0"),
+            (&b"eth\xc2"[..], "eth\\xc2"),
+        ] {
+            let ifname = L2tpIfName::new(raw).unwrap();
+            assert_eq!(fmt_ifname_text(&ifname), expected);
+        }
+    }
+
+    #[test]
+    fn text_interface_names_preserve_printable_unicode() {
+        for name in ["l2tpeth0", "éth東京", "eth🦀"] {
+            let ifname = L2tpIfName::new(name).unwrap();
+            assert_eq!(fmt_ifname_text(&ifname), name);
+        }
     }
 }

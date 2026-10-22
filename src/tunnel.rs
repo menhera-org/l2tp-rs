@@ -66,7 +66,9 @@ impl TunnelConfig {
 
     /// Sets the L2TP protocol version.
     ///
-    /// L2TPv2 tunnels carry PPP sessions only and use 16-bit identifiers.
+    /// L2TPv2 tunnels carry PPP sessions only, use UDP encapsulation and have
+    /// 16-bit identifiers. Creating an L2TPv2 tunnel with IP encapsulation
+    /// returns [`Error::V2IpEncapsulation`](crate::Error::V2IpEncapsulation).
     pub fn with_version(mut self, version: L2tpVersion) -> Self {
         self.version = version;
         self

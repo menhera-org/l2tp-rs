@@ -15,6 +15,12 @@ use crate::{SessionInfo, TunnelInfo, netlink};
 
 /// A change the kernel announced on the `l2tp` multicast group.
 ///
+/// The originating network namespace is not encoded in these notifications.
+/// On kernels that broadcast L2TP events across namespaces (including Linux
+/// 6.8), an event can describe an object outside the receiving handle's
+/// namespace. Use it as a hint to query current local state; matching IDs
+/// alone do not establish that it describes a local object.
+///
 /// Deletion events carry the state the object had before it was removed.
 /// The kernel sends tunnel modification events for `TUNNEL_MODIFY` requests
 /// although it changes nothing.
@@ -39,7 +45,9 @@ pub enum L2tpEvent {
 /// Stream of [`L2tpEvent`]s from the kernel, created by
 /// [`L2tpHandle::events`](crate::L2tpHandle::events).
 ///
-/// Dropping the stream leaves the multicast group. Messages that are not
+/// Notifications are advisory and may describe another network namespace;
+/// see [`L2tpEvent`]. Dropping the stream leaves the multicast group.
+/// Messages that are not
 /// L2TP notifications are skipped; a notification that fails to decode is
 /// reported as an error and the stream continues.
 #[derive(Debug)]

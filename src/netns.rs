@@ -3,7 +3,10 @@
 use std::{
     fs::File,
     io,
-    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+        unix::fs::MetadataExt,
+    },
     path::Path,
 };
 
@@ -34,6 +37,27 @@ impl NetNs {
     /// Duplicates the namespace descriptor.
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self(self.0.try_clone()?))
+    }
+
+    /// Compares open namespace descriptors, keeping their identities alive.
+    pub(crate) fn same_as(&self, other: &Self) -> io::Result<bool> {
+        let left = File::from(self.0.try_clone()?).metadata()?;
+        let right = File::from(other.0.try_clone()?).metadata()?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+
+    /// Executes inline in the owning namespace; otherwise enters it on a
+    /// temporary thread. The inline path needs no setns capability.
+    pub(crate) fn run_if_needed<T, F>(&self, f: F) -> io::Result<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        if self.same_as(&Self::current()?)? {
+            Ok(f())
+        } else {
+            self.run(f)
+        }
     }
 
     /// Runs `f` on a new thread inside this namespace and returns its result.
@@ -108,6 +132,24 @@ mod tests {
             }
         }
         assert!(netns.try_clone().is_ok());
+    }
+
+    #[test]
+    fn namespace_identity_matches_fresh_and_duplicated_descriptors() {
+        let netns = NetNs::current().unwrap();
+        assert!(netns.same_as(&netns.try_clone().unwrap()).unwrap());
+        assert!(netns.same_as(&NetNs::current().unwrap()).unwrap());
+        let other = NetNs::from(File::open("/dev/null").unwrap());
+        assert!(!netns.same_as(&other).unwrap());
+    }
+
+    #[test]
+    fn current_namespace_executes_inline_without_setns() {
+        let netns = NetNs::current().unwrap();
+        let caller = std::thread::current().id();
+        let actual =
+            netns.run_if_needed(|| std::thread::current().id()).unwrap();
+        assert_eq!(actual, caller);
     }
 
     #[test]

@@ -60,6 +60,14 @@ pub enum Error {
     #[error("identifier {0} does not fit the 16 bits of an L2TPv2 identifier")]
     V2IdTooLarge(u32),
 
+    /// L2TPv2 cannot receive data over IP encapsulation; use UDP.
+    #[error("L2TPv2 does not support IP encapsulation; use UDP")]
+    V2IpEncapsulation,
+
+    /// The supplied PPP unit and socket belong to different network namespaces.
+    #[error("the PPP unit and socket belong to different network namespaces")]
+    NamespaceMismatch,
+
     /// Local and remote endpoint address families do not match.
     #[error(
         "address family mismatch: local and remote must be the same IP version"

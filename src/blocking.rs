@@ -400,7 +400,9 @@ impl L2tpHandle {
     ///
     /// The returned iterator blocks in `next` until an event arrives and
     /// ends when the subscription's connection closes. It keeps the worker
-    /// alive while it exists.
+    /// alive while it exists. On kernels that multicast across namespaces,
+    /// events may describe objects outside this handle's namespace; use them
+    /// as hints to query local state, as described by [`crate::L2tpEvent`].
     pub fn events(&self) -> crate::Result<EventIter> {
         // A std channel carries the events, so `next` blocks without
         // touching any Tokio context; the oneshot tells the forwarder that

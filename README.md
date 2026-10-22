@@ -133,8 +133,10 @@ async fn main() -> l2tp::Result<()> {
 
 The kernel refuses to bind or connect a link-local address without an
 interface. Scope the endpoint with an interface name; it is resolved to the
-interface index each time the socket binds, connects or reconnects, so the
-tunnel keeps working with an interface that was re-created under a new index.
+interface index each time the socket binds, connects or reconnects.
+If the interface is re-created under a new index, call `disconnect()` before
+`reconnect_ip()` to clear the kernel's old interface binding. Reapply
+`bind_to_device()` first if that binding is needed, since disconnect clears it.
 The scopes of both endpoints and the `device` must name the same interface.
 
 ```rust,no_run
@@ -184,16 +186,18 @@ the socket is created.
 Unmanaged tunnels cannot use link-local endpoints, because the kernel creates
 their socket without an interface scope; `create_unmanaged_tunnel` returns
 `Error::UnmanagedLinkLocal` before contacting the kernel. Re-creating a tunnel
-after its interface disappears is left to the application; subscribe to
-[events](#events) to notice it.
+after its interface disappears is left to the application. L2TP notifications
+do not report interface removal; detect link changes separately.
 
 ## Protocol Versions
 
 `TunnelConfig::new` creates L2TPv3 tunnels. `with_version(L2tpVersion::V2)`
 creates an L2TPv2 tunnel, whose sessions are PPP pseudowires with 16-bit
-identifiers; the kernel ignores cookies and the L2-specific sublayer for
-them. Ethernet pseudowires need version 3. `TunnelInfo::version` reports the
-version of an existing tunnel.
+identifiers and UDP encapsulation. V2 with IP encapsulation is rejected with
+`Error::V2IpEncapsulation`: the kernel accepts creation but its IP receive
+path cannot find V2 sessions. The kernel ignores cookies and the L2-specific
+sublayer for V2 sessions. Ethernet pseudowires need version 3.
+`TunnelInfo::version` reports the version of an existing tunnel.
 
 ## PPP Pseudowires
 
@@ -204,6 +208,12 @@ space, for example in `pppd` with its `pppol2tp <fd>` option. `PppUnit`
 creates a `pppN` interface and `PppUnit::connect_channel` connects the
 channel to it for applications that implement PPP themselves; dropping the
 returned `PppChannel` disconnects the channel again.
+
+The unit and socket retain their creating network namespaces, including
+container namespaces. Connecting objects from different namespaces returns
+`Error::NamespaceMismatch`. Attaching from another thread namespace runs in
+the owning namespace and requires permission to enter it; ordinary attachment
+within the same namespace does not need `setns` privileges.
 
 The kernel deletes the session when the last descriptor of its `PPPoL2TP`
 socket is closed, without a netlink event, so the socket's lifetime is the
@@ -244,19 +254,29 @@ the sessions removed with a deleted tunnel, or a PPP session whose
 `list_all_sessions` to catch those. `L2tpHandle::events` returns a `Stream`
 of `L2tpEvent`; the blocking handle returns an iterator.
 
+Some kernels, including Linux 6.8, broadcast these events into every network
+namespace, including containers, without an origin-namespace identifier.
+The crate cannot reliably distinguish those events: tunnel and session IDs
+can be reused in different namespaces. Treat notifications as hints to
+reconcile through `list_tunnels`, `list_all_sessions`, or other queries on
+your handle. Do not apply a notification as a mutation of a local object.
+This limitation also applies to plain `L2tpHandle::new()` inside a container;
+no explicit namespace argument or netns ID is needed to encounter it.
+
 ```rust,no_run
 use futures::StreamExt;
-use l2tp::{L2tpEvent, L2tpHandle};
+use l2tp::L2tpHandle;
 
 #[tokio::main]
 async fn main() -> l2tp::Result<()> {
     let handle = L2tpHandle::new().await?;
     let mut events = handle.events().await?;
     while let Some(event) = events.next().await {
-        match event? {
-            L2tpEvent::TunnelDeleted(info) => println!("tunnel {} is gone", info.tunnel_id),
-            other => println!("{other:?}"),
-        }
+        event?;
+        // Query this handle's namespace, regardless of the event's origin.
+        let tunnels = handle.list_tunnels().await?;
+        let sessions = handle.list_all_sessions().await?;
+        println!("local tunnels: {tunnels:?}; local sessions: {sessions:?}");
     }
     Ok(())
 }
@@ -290,6 +310,15 @@ Sockets belong to the network namespace of the thread that creates them.
 executes a closure on a thread inside it, and `L2tpHandle::new_in` controls
 the L2TP subsystem of that namespace. Entering a namespace needs
 `CAP_SYS_ADMIN`.
+
+`L2tpHandle::new()` retains the calling thread's actual namespace, including
+an inherited container namespace, for future event connections. Opening an
+event connection from a different namespace enters that original namespace;
+opening it from the same namespace needs no additional privileges.
+Handle and PPP object creation retain descriptors opened through
+`/proc/thread-self/ns/net`, so that path must be accessible.
+The kernel's cross-namespace multicast behavior described under
+[Events](#events) still applies.
 
 ```rust,no_run
 use l2tp::{L2tpHandle, NetNs, TunnelConfig, TunnelSocket};

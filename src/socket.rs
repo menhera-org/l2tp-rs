@@ -250,8 +250,10 @@ impl TunnelSocket {
     /// ([`IpEndpoint::v6_scoped`]). The scopes of `local` and `remote` and
     /// the `device` must name the same interface. That name is resolved to
     /// the interface index here and again on every
-    /// [`reconnect_ip`](Self::reconnect_ip), so a re-created interface is
-    /// picked up. The lookup happens in the socket's own network namespace,
+    /// [`reconnect_ip`](Self::reconnect_ip). If the interface is re-created,
+    /// first [`disconnect`](Self::disconnect) to clear the old binding;
+    /// reapply [`bind_to_device`](Self::bind_to_device) if needed, then
+    /// reconnect. The lookup happens in the socket's own network namespace,
     /// even when the socket was created through
     /// [`NetNs::run`](crate::NetNs::run) and is reconnected from a thread
     /// in another namespace. Unlike `device`, a scope does not need
@@ -673,6 +675,11 @@ impl TunnelSocket {
     /// `new_remote` has none, and the two must agree otherwise. The name is
     /// resolved to the interface index on every call, in the socket's own
     /// network namespace.
+    ///
+    /// If the interface was re-created, call [`disconnect`](Self::disconnect)
+    /// first to clear the old interface index. Reapply
+    /// [`bind_to_device`](Self::bind_to_device) if needed, then reconnect;
+    /// resolving the new index alone does not replace the kernel's binding.
     ///
     /// An IPv4 L2TP/IP socket adopted with [`from_fd`](Self::from_fd) has no
     /// known peer connection ID and returns
@@ -1159,8 +1166,8 @@ fn v4_bits(endpoint: &IpEndpoint) -> u32 {
     }
 }
 
-/// Resolves the scope to the interface index at the time of use, so a
-/// re-created interface keeps working.
+/// Resolves the scope to the current interface index. An old socket binding
+/// must be cleared by disconnecting before using a re-created interface.
 fn resolve_scope(fd: RawFd, scope: Option<&L2tpIfName>) -> crate::Result<u32> {
     match scope {
         Some(name) => interface_index(fd, name),

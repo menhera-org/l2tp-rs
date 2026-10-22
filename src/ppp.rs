@@ -20,7 +20,7 @@ use std::{
     },
 };
 
-use crate::{L2tpIfName, L2tpVersion, SessionId, TunnelId};
+use crate::{L2tpIfName, L2tpVersion, NetNs, SessionId, TunnelId};
 
 const PX_PROTO_OL2TP: libc::c_int = 1;
 
@@ -97,6 +97,7 @@ const SOCKADDR_PPPOL2TPV3_LEN: usize = 46;
 #[derive(Debug)]
 pub struct PppSocket {
     fd: OwnedFd,
+    netns: NetNs,
 }
 
 impl PppSocket {
@@ -127,6 +128,7 @@ impl PppSocket {
             session_id,
             peer_session_id,
         )?;
+        let netns = NetNs::current()?;
         // SAFETY: plain socket creation; the descriptor is owned exactly once.
         let raw = unsafe {
             libc::socket(
@@ -153,7 +155,7 @@ impl PppSocket {
         if rc == -1 {
             return Err(io::Error::last_os_error().into());
         }
-        Ok(Self { fd })
+        Ok(Self { fd, netns })
     }
 
     /// Returns the PPP channel index (`PPPIOCGCHAN`), as `pppd` and
@@ -198,6 +200,7 @@ impl AsRawFd for PppSocket {
 #[derive(Debug)]
 pub struct PppUnit {
     fd: OwnedFd,
+    netns: NetNs,
     index: i32,
     ifname: L2tpIfName,
 }
@@ -215,6 +218,7 @@ impl PppUnit {
     }
 
     fn create(requested: i32) -> crate::Result<Self> {
+        let netns = NetNs::current()?;
         let fd: OwnedFd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -229,7 +233,12 @@ impl PppUnit {
             return Err(io::Error::last_os_error().into());
         }
         let ifname = L2tpIfName::new(format!("ppp{index}"))?;
-        Ok(Self { fd, index, ifname })
+        Ok(Self {
+            fd,
+            netns,
+            index,
+            ifname,
+        })
     }
 
     /// Returns the unit index, `N` of `pppN`.
@@ -247,31 +256,48 @@ impl PppUnit {
     ///
     /// The returned [`PppChannel`] must stay alive for as long as the channel
     /// should remain connected to the unit.
+    ///
+    /// The unit and socket must belong to the same network namespace;
+    /// otherwise this returns
+    /// [`Error::NamespaceMismatch`](crate::Error::NamespaceMismatch).
+    /// Attachment runs in that namespace. Calling this from another
+    /// namespace requires `CAP_SYS_ADMIN` to enter the owning namespace on
+    /// a temporary thread; the calling thread is never moved.
     pub fn connect_channel(
         &self,
         socket: &PppSocket,
     ) -> crate::Result<PppChannel> {
+        if !self.netns.same_as(&socket.netns)? {
+            return Err(crate::Error::NamespaceMismatch);
+        }
         let mut channel: libc::c_int = socket.channel_index()?;
-        let fd: OwnedFd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_CLOEXEC)
-            .open("/dev/ppp")?
-            .into();
-        // SAFETY: both ioctls read one `c_int` through the pointer.
-        let rc =
-            unsafe { libc::ioctl(fd.as_raw_fd(), PPPIOCATTCHAN, &mut channel) };
-        if rc == -1 {
-            return Err(io::Error::last_os_error().into());
-        }
         let mut unit: libc::c_int = self.index;
-        // SAFETY: as above.
-        let rc =
-            unsafe { libc::ioctl(fd.as_raw_fd(), PPPIOCCONNECT, &mut unit) };
-        if rc == -1 {
-            return Err(io::Error::last_os_error().into());
-        }
-        Ok(PppChannel { fd })
+        // PPPIOCATTCHAN looks up the channel in the calling thread's
+        // namespace; PPPIOCCONNECT then looks up the unit in the channel's
+        // namespace. Keep both lookups with the objects that own these IDs.
+        self.netns.run_if_needed(move || {
+            let fd: OwnedFd = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC)
+                .open("/dev/ppp")?
+                .into();
+            // SAFETY: both ioctls read one `c_int` through the pointer.
+            let rc = unsafe {
+                libc::ioctl(fd.as_raw_fd(), PPPIOCATTCHAN, &mut channel)
+            };
+            if rc == -1 {
+                return Err(io::Error::last_os_error().into());
+            }
+            // SAFETY: as above.
+            let rc = unsafe {
+                libc::ioctl(fd.as_raw_fd(), PPPIOCCONNECT, &mut unit)
+            };
+            if rc == -1 {
+                return Err(io::Error::last_os_error().into());
+            }
+            Ok(PppChannel { fd })
+        })?
     }
 }
 
@@ -370,6 +396,52 @@ fn sockaddr_pppol2tp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_ppp_objects(
+        unit_netns: NetNs,
+        socket_netns: NetNs,
+    ) -> (PppUnit, PppSocket) {
+        (
+            PppUnit {
+                fd: std::fs::File::open("/dev/null").unwrap().into(),
+                netns: unit_netns,
+                index: 0,
+                ifname: L2tpIfName::new("ppp0").unwrap(),
+            },
+            PppSocket {
+                fd: std::fs::File::open("/dev/null").unwrap().into(),
+                netns: socket_netns,
+            },
+        )
+    }
+
+    #[test]
+    fn channel_attachment_rejects_namespace_mismatch_before_ioctl() {
+        // A different file supplies distinct identity metadata without
+        // creating a namespace or invoking the PPP subsystem. The data
+        // descriptors would fail PPPIOCGCHAN with ENOTTY if reached.
+        let different = NetNs::from(std::fs::File::open("/dev/null").unwrap());
+        let (unit, socket) =
+            fake_ppp_objects(NetNs::current().unwrap(), different);
+        assert!(matches!(
+            unit.connect_channel(&socket),
+            Err(crate::Error::NamespaceMismatch)
+        ));
+    }
+
+    #[test]
+    fn channel_attachment_accepts_matching_namespace_identity() {
+        // Independently opened descriptors for one namespace must compare
+        // equal, allowing the channel ioctl to report the fake data fd.
+        let (unit, socket) = fake_ppp_objects(
+            NetNs::current().unwrap(),
+            NetNs::current().unwrap(),
+        );
+        assert_eq!(
+            unit.connect_channel(&socket).unwrap_err().raw_os_error(),
+            Some(libc::ENOTTY)
+        );
+    }
 
     #[test]
     fn ioctl_requests_match_the_kernel_headers() {

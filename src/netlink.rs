@@ -45,8 +45,13 @@ pub(crate) fn encode_tunnel_create(
     config: &TunnelConfig,
     fd: Option<RawFd>,
 ) -> crate::Result<L2tpMessage> {
-    // L2TPv2 identifiers are 16-bit on the wire.
     if config.version == L2tpVersion::V2 {
+        // The kernel accepts V2/IP tunnels, but IP receive only looks up V3
+        // sessions, so such a tunnel cannot receive session data.
+        if matches!(&config.encapsulation, Encapsulation::Ip { .. }) {
+            return Err(crate::Error::V2IpEncapsulation);
+        }
+        // L2TPv2 identifiers are 16-bit on the wire.
         for id in [config.tunnel_id, config.peer_tunnel_id] {
             if u16::try_from(id.0).is_err() {
                 return Err(crate::Error::V2IdTooLarge(id.0));
@@ -664,19 +669,50 @@ mod tests {
 
     #[test]
     fn tunnel_create_carries_the_protocol_version() {
-        let cfg = udp_v4_config(true);
-        let message = encode_tunnel_create(&cfg, None).unwrap();
-        assert!(has_attr(&message.attributes, |a| matches!(
-            a,
-            L2tpAttribute::ProtoVersion(3)
-        )));
-        let v2 = encode_tunnel_create(&cfg.with_version(L2tpVersion::V2), None)
+        for version in [L2tpVersion::V2, L2tpVersion::V3] {
+            let cfg = udp_v4_config(true).with_version(version);
+            for fd in [None, Some(7)] {
+                let message = encode_tunnel_create(&cfg, fd).unwrap();
+                assert!(
+                    message.attributes.contains(&L2tpAttribute::ProtoVersion(
+                        version.number()
+                    ))
+                );
+                assert_wire_round_trip(message);
+            }
+        }
+    }
+
+    #[test]
+    fn ip_tunnel_create_requires_v3() {
+        for endpoint in [
+            IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+            IpEndpoint::v6(Ipv6Addr::LOCALHOST),
+        ] {
+            let cfg = TunnelConfig::new(
+                TunnelId(1),
+                TunnelId(2),
+                Encapsulation::Ip {
+                    local: endpoint.clone(),
+                    remote: endpoint,
+                },
+            )
             .unwrap();
-        assert!(has_attr(&v2.attributes, |a| matches!(
-            a,
-            L2tpAttribute::ProtoVersion(2)
-        )));
-        assert_wire_round_trip(v2);
+            let v2 = cfg.clone().with_version(L2tpVersion::V2);
+            for fd in [None, Some(7)] {
+                assert!(matches!(
+                    encode_tunnel_create(&v2, fd),
+                    Err(crate::Error::V2IpEncapsulation)
+                ));
+                let message = encode_tunnel_create(&cfg, fd).unwrap();
+                assert!(
+                    message
+                        .attributes
+                        .contains(&L2tpAttribute::EncapType(L2tpEncapType::Ip))
+                );
+                assert_wire_round_trip(message);
+            }
+        }
     }
 
     #[test]

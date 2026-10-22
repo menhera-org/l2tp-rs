@@ -39,7 +39,7 @@ struct L2tpInner {
     genl: GenetlinkHandle,
     family: tokio::sync::OnceCell<FamilyInfo>,
     /// Namespace the connection was opened in, for further connections.
-    netns: Option<NetNs>,
+    netns: NetNs,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,9 +57,9 @@ impl fmt::Debug for L2tpHandle {
     }
 }
 
-/// Opens a generic-netlink connection, in `netns` when given.
+/// Opens a generic-netlink connection in its owning namespace.
 fn open_connection(
-    netns: Option<&NetNs>,
+    netns: &NetNs,
 ) -> crate::Result<(Connection<RawGenlMessage>, GenetlinkHandle, Unsolicited)> {
     fn open()
     -> io::Result<(Connection<RawGenlMessage>, GenetlinkHandle, Unsolicited)>
@@ -74,22 +74,23 @@ fn open_connection(
         })?
     }
 
-    match netns {
-        None => Ok(open()?),
-        Some(netns) => {
-            // The socket is created on the namespace thread but registered
-            // with this runtime's I/O driver.
-            let runtime = tokio::runtime::Handle::current();
-            Ok(netns.run(move || {
-                let _guard = runtime.enter();
-                open()
-            })??)
-        }
-    }
+    // Avoid setns when already in the owning namespace, including inside
+    // a container. Otherwise create the socket on a temporary namespace
+    // thread and register it with this runtime's I/O driver.
+    let runtime = tokio::runtime::Handle::current();
+    Ok(netns.run_if_needed(move || {
+        let _guard = runtime.enter();
+        open()
+    })??)
 }
 
 impl L2tpHandle {
     /// Create a new L2TP Generic Netlink handle.
+    ///
+    /// The calling thread's network namespace is retained, including when
+    /// inherited from a container. Further event connections use that same
+    /// namespace; opening them from another namespace requires the
+    /// privileges needed by `setns(2)`.
     ///
     /// This must be awaited while running inside a Tokio runtime with I/O
     /// enabled, because the internal Generic Netlink connection task is
@@ -111,9 +112,9 @@ impl L2tpHandle {
     /// Like [`new`](Self::new), but controls the L2TP subsystem of the
     /// network namespace `netns`.
     ///
-    /// Entering the namespace needs `CAP_SYS_ADMIN`; see [`NetNs`]. Tunnel
-    /// sockets for managed tunnels must be created in the same namespace,
-    /// for example inside [`NetNs::run`].
+    /// Entering a different namespace needs `CAP_SYS_ADMIN`; see [`NetNs`].
+    /// Tunnel sockets for managed tunnels must be created in the same
+    /// namespace, for example inside [`NetNs::run`].
     pub async fn new_in(netns: &NetNs) -> crate::Result<Self> {
         Self::connect(Some(netns.try_clone()?)).await
     }
@@ -122,8 +123,11 @@ impl L2tpHandle {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             io::Error::other("tokio runtime is required for L2tpHandle")
         })?;
-        let (mut connection, genl, _unsolicited) =
-            open_connection(netns.as_ref())?;
+        let netns = match netns {
+            Some(netns) => netns,
+            None => NetNs::current()?,
+        };
+        let (mut connection, genl, _unsolicited) = open_connection(&netns)?;
         connection.set_forward_ack(true);
         connection.set_forward_done(true);
         runtime.spawn(connection);
@@ -583,9 +587,18 @@ impl L2tpHandle {
 
     /// Subscribes to the kernel's L2TP notifications.
     ///
-    /// The stream reports tunnels and sessions created, modified or deleted
-    /// through netlink commands by any process in the handle's network
-    /// namespace. The kernel announces nothing for the teardown it performs
+    /// The stream reports kernel multicast notifications about tunnels and
+    /// sessions created, modified or deleted through netlink commands.
+    /// Its socket belongs to the handle's original network namespace.
+    ///
+    /// Some kernels, including Linux 6.8, multicast L2TP events into every
+    /// network namespace, including containers, without identifying the
+    /// originating namespace. Such events cannot be reliably filtered by
+    /// tunnel/session IDs, which can collide across namespaces. Treat events
+    /// as hints to reconcile state through this handle's query methods,
+    /// rather than instructions to mutate the named objects.
+    ///
+    /// The kernel announces nothing for the teardown it performs
     /// on its own: a tunnel whose managed socket was closed, the sessions
     /// removed together with a deleted tunnel, or a PPP session whose
     /// `PPPoL2TP` socket was released. Reconcile with
@@ -594,6 +607,8 @@ impl L2tpHandle {
     ///
     /// The stream uses its own netlink connection on the current runtime;
     /// dropping it leaves the multicast group. Joining needs no privilege.
+    /// Opening the socket from another namespace requires permission to
+    /// enter the handle's original namespace.
     pub async fn events(&self) -> crate::Result<Events> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             io::Error::other("tokio runtime is required for events")
@@ -605,7 +620,7 @@ impl L2tpHandle {
             ))
         })?;
         let (mut connection, genl, receiver) =
-            open_connection(self.inner.netns.as_ref())?;
+            open_connection(&self.inner.netns)?;
         // The kernel sends these notifications without a sender port and
         // skips every socket whose own port is 0, so the socket must be
         // bound before it can receive them; it never sends, so nothing else
@@ -878,7 +893,7 @@ mod tests {
                     id: 1234,
                     events_group: None,
                 })),
-                netns: None,
+                netns: NetNs::current().unwrap(),
             }),
         }
     }
@@ -1137,22 +1152,15 @@ mod tests {
     }
 
     #[test]
-    fn new_in_a_namespace_needs_cap_sys_admin() {
+    fn new_in_the_current_namespace_needs_no_setns_privileges() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
             let netns = NetNs::current().unwrap();
-            match L2tpHandle::new_in(&netns).await {
-                // Root can enter its own namespace; the handle then works
-                // like a plain one.
-                Ok(handle) => drop(handle),
-                Err(crate::Error::Io(e)) => {
-                    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}")
-                }
-                Err(e) => panic!("unexpected error: {e:?}"),
-            }
+            let handle = L2tpHandle::new_in(&netns).await.unwrap();
+            assert!(handle.inner.netns.same_as(&netns).unwrap());
         });
     }
 }
