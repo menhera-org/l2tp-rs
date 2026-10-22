@@ -2,19 +2,32 @@
 
 use std::{fmt, io, os::fd::AsRawFd, sync::Arc};
 
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, channel::mpsc::UnboundedReceiver};
+use genetlink::{GenetlinkHandle, message::RawGenlMessage};
 use netlink_packet_core::{
     NLM_F_ACK, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_MULTIPART, NLM_F_REQUEST,
     NetlinkMessage, NetlinkPayload,
 };
 use netlink_packet_generic::GenlMessage;
 use netlink_packet_l2tp::{L2tpAttribute, L2tpMessage};
+use netlink_proto::{
+    Connection,
+    sys::{AsyncSocket, SocketAddr},
+};
 
 use crate::{
-    SessionConfig, SessionHandle, SessionId, SessionInfo, SessionModify,
-    SessionStats, TunnelConfig, TunnelHandle, TunnelId, TunnelInfo,
-    TunnelSocket, TunnelStats, netlink,
+    Events, L2tpIfName, NetNs, SessionConfig, SessionHandle, SessionId,
+    SessionInfo, SessionModify, SessionStats, TunnelConfig, TunnelHandle,
+    TunnelId, TunnelInfo, TunnelSocket, TunnelStats,
+    netlink::{self, SessionRef},
 };
+
+/// Name of the generic-netlink multicast group the kernel announces L2TP
+/// changes on (`L2TP_GENL_MCGROUP`).
+const EVENTS_GROUP: &str = "l2tp";
+
+type Unsolicited =
+    UnboundedReceiver<(NetlinkMessage<RawGenlMessage>, SocketAddr)>;
 
 /// Shared async handle for L2TP generic-netlink operations.
 #[derive(Clone)]
@@ -23,15 +36,55 @@ pub struct L2tpHandle {
 }
 
 struct L2tpInner {
-    genl: genetlink::GenetlinkHandle,
-    family_id: tokio::sync::OnceCell<u16>,
+    genl: GenetlinkHandle,
+    family: tokio::sync::OnceCell<FamilyInfo>,
+    /// Namespace the connection was opened in, for further connections.
+    netns: Option<NetNs>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FamilyInfo {
+    id: u16,
+    events_group: Option<u32>,
 }
 
 impl fmt::Debug for L2tpHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("L2tpHandle")
-            .field("family_id", &self.inner.family_id.get())
+            .field("family", &self.inner.family.get())
+            .field("netns", &self.inner.netns)
             .finish_non_exhaustive()
+    }
+}
+
+/// Opens a generic-netlink connection, in `netns` when given.
+fn open_connection(
+    netns: Option<&NetNs>,
+) -> crate::Result<(Connection<RawGenlMessage>, GenetlinkHandle, Unsolicited)> {
+    fn open()
+    -> io::Result<(Connection<RawGenlMessage>, GenetlinkHandle, Unsolicited)>
+    {
+        // netlink-sys registers its socket with Tokio's I/O driver through
+        // `AsyncFd`, which panics instead of failing when the runtime has no
+        // I/O driver. Tokio offers no way to check for the driver first.
+        std::panic::catch_unwind(genetlink::new_connection).map_err(|_| {
+            io::Error::other(
+                "tokio runtime with I/O enabled is required for L2tpHandle",
+            )
+        })?
+    }
+
+    match netns {
+        None => Ok(open()?),
+        Some(netns) => {
+            // The socket is created on the namespace thread but registered
+            // with this runtime's I/O driver.
+            let runtime = tokio::runtime::Handle::current();
+            Ok(netns.run(move || {
+                let _guard = runtime.enter();
+                open()
+            })??)
+        }
     }
 }
 
@@ -49,23 +102,28 @@ impl L2tpHandle {
     ///
     /// Requests that refer to a tunnel or session the kernel does not know
     /// fail with [`Error::KernelError`](crate::Error::KernelError) carrying
-    /// `ENODEV`.
+    /// `ENODEV`. Every L2TP command needs `CAP_NET_ADMIN`; without it the
+    /// kernel replies `EPERM`.
     pub async fn new() -> crate::Result<Self> {
+        Self::connect(None).await
+    }
+
+    /// Like [`new`](Self::new), but controls the L2TP subsystem of the
+    /// network namespace `netns`.
+    ///
+    /// Entering the namespace needs `CAP_SYS_ADMIN`; see [`NetNs`]. Tunnel
+    /// sockets for managed tunnels must be created in the same namespace,
+    /// for example inside [`NetNs::run`].
+    pub async fn new_in(netns: &NetNs) -> crate::Result<Self> {
+        Self::connect(Some(netns.try_clone()?)).await
+    }
+
+    async fn connect(netns: Option<NetNs>) -> crate::Result<Self> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
-            io::Error::other("tokio runtime is required for L2tpHandle::new()")
+            io::Error::other("tokio runtime is required for L2tpHandle")
         })?;
-        // netlink-sys registers its socket with Tokio's I/O driver through
-        // `AsyncFd`, which panics instead of failing when the runtime has no
-        // I/O driver. Tokio offers no way to check for the driver first.
-        let (mut connection, genl, _unsolicited) = std::panic::catch_unwind(
-            genetlink::new_connection,
-        )
-        .map_err(|_| {
-            io::Error::other(
-                "tokio runtime with I/O enabled is required for \
-                 L2tpHandle::new()",
-            )
-        })??;
+        let (mut connection, genl, _unsolicited) =
+            open_connection(netns.as_ref())?;
         connection.set_forward_ack(true);
         connection.set_forward_done(true);
         runtime.spawn(connection);
@@ -73,7 +131,8 @@ impl L2tpHandle {
         Ok(Self {
             inner: Arc::new(L2tpInner {
                 genl,
-                family_id: tokio::sync::OnceCell::new(),
+                family: tokio::sync::OnceCell::new(),
+                netns,
             }),
         })
     }
@@ -87,6 +146,8 @@ impl L2tpHandle {
     ///
     /// For IP encapsulation, `socket` must have been created by
     /// [`TunnelSocket::ip`] with the same tunnel ID as `config`.
+    /// [`TunnelSocket::for_config`] creates a matching socket, and
+    /// [`TunnelConfig::for_socket`] describes an existing one.
     ///
     /// Once started inside a Tokio runtime, creation continues through the
     /// kernel's acknowledgement even if the caller cancels this future. The
@@ -121,8 +182,10 @@ impl L2tpHandle {
     /// when the returned handle is dropped (unless auto-delete is disabled),
     /// by [`TunnelHandle::delete`], or by [`L2tpHandle::delete_tunnel`].
     /// Disabling UDP checksums for an IPv4-mapped peer returns
-    /// [`Error::UnmanagedUdpChecksum`](crate::Error::UnmanagedUdpChecksum);
-    /// use IPv4 endpoints or a managed socket for this setting.
+    /// [`Error::UnmanagedUdpChecksum`](crate::Error::UnmanagedUdpChecksum),
+    /// and link-local endpoints
+    /// [`Error::UnmanagedLinkLocal`](crate::Error::UnmanagedLinkLocal); use a
+    /// managed socket for these.
     ///
     /// Once started inside a Tokio runtime, creation continues through the
     /// kernel's acknowledgement even if the caller cancels this future. An
@@ -144,6 +207,25 @@ impl L2tpHandle {
             })
         })
         .await
+    }
+
+    /// Returns a handle for an existing tunnel after checking that the
+    /// kernel knows it.
+    ///
+    /// The handle has auto-delete disabled and no socket, so dropping it
+    /// leaves the tunnel alone; enable auto-delete or call
+    /// [`TunnelHandle::delete`] to take ownership.
+    pub async fn open_tunnel(
+        &self,
+        tunnel_id: TunnelId,
+    ) -> crate::Result<TunnelHandle> {
+        self.get_tunnel(tunnel_id).await?;
+        Ok(TunnelHandle {
+            tunnel_id,
+            socket: None,
+            auto_delete: false,
+            handle: self.clone(),
+        })
     }
 
     /// Creates a session in an existing tunnel.
@@ -190,6 +272,39 @@ impl L2tpHandle {
         }
     }
 
+    /// Returns a handle for an existing session after checking that the
+    /// kernel knows it; auto-delete is disabled.
+    pub async fn open_session(
+        &self,
+        tunnel_id: TunnelId,
+        session_id: SessionId,
+    ) -> crate::Result<SessionHandle> {
+        let info = self.get_session(tunnel_id, session_id).await?;
+        Ok(SessionHandle {
+            tunnel_id,
+            session_id,
+            ifname: info.ifname,
+            auto_delete: false,
+            handle: self.clone(),
+        })
+    }
+
+    /// Returns a handle for the existing Ethernet pseudowire session whose
+    /// interface is `ifname`; auto-delete is disabled.
+    pub async fn open_session_by_ifname(
+        &self,
+        ifname: &L2tpIfName,
+    ) -> crate::Result<SessionHandle> {
+        let info = self.get_session_by_ifname(ifname).await?;
+        Ok(SessionHandle {
+            tunnel_id: info.tunnel_id,
+            session_id: info.session_id,
+            ifname: info.ifname,
+            auto_delete: false,
+            handle: self.clone(),
+        })
+    }
+
     /// Returns information for a single tunnel.
     pub async fn get_tunnel(
         &self,
@@ -211,9 +326,26 @@ impl L2tpHandle {
         tunnel_id: TunnelId,
         session_id: SessionId,
     ) -> crate::Result<SessionInfo> {
+        self.get_session_ref(SessionRef::Ids(tunnel_id, session_id))
+            .await
+    }
+
+    /// Returns information for the Ethernet pseudowire session whose
+    /// interface is `ifname`.
+    pub async fn get_session_by_ifname(
+        &self,
+        ifname: &L2tpIfName,
+    ) -> crate::Result<SessionInfo> {
+        self.get_session_ref(SessionRef::IfName(*ifname)).await
+    }
+
+    async fn get_session_ref(
+        &self,
+        session: SessionRef,
+    ) -> crate::Result<SessionInfo> {
         let replies = self
             .send_and_collect(
-                netlink::encode_session_get(tunnel_id, session_id),
+                netlink::encode_session_get(session),
                 NLM_F_REQUEST,
             )
             .await?;
@@ -285,8 +417,21 @@ impl L2tpHandle {
         tunnel_id: TunnelId,
         session_id: SessionId,
     ) -> crate::Result<()> {
-        self.send_ack(netlink::encode_session_delete(tunnel_id, session_id))
-            .await
+        self.send_ack(netlink::encode_session_delete(SessionRef::Ids(
+            tunnel_id, session_id,
+        )))
+        .await
+    }
+
+    /// Deletes the Ethernet pseudowire session whose interface is `ifname`.
+    pub async fn delete_session_by_ifname(
+        &self,
+        ifname: &L2tpIfName,
+    ) -> crate::Result<()> {
+        self.send_ack(netlink::encode_session_delete(SessionRef::IfName(
+            *ifname,
+        )))
+        .await
     }
 
     /// Returns tunnel statistics.
@@ -310,9 +455,26 @@ impl L2tpHandle {
         tunnel_id: TunnelId,
         session_id: SessionId,
     ) -> crate::Result<SessionStats> {
+        self.session_stats_ref(SessionRef::Ids(tunnel_id, session_id))
+            .await
+    }
+
+    /// Returns the statistics of the Ethernet pseudowire session whose
+    /// interface is `ifname`.
+    pub async fn session_stats_by_ifname(
+        &self,
+        ifname: &L2tpIfName,
+    ) -> crate::Result<SessionStats> {
+        self.session_stats_ref(SessionRef::IfName(*ifname)).await
+    }
+
+    async fn session_stats_ref(
+        &self,
+        session: SessionRef,
+    ) -> crate::Result<SessionStats> {
         let replies = self
             .send_and_collect(
-                netlink::encode_session_get(tunnel_id, session_id),
+                netlink::encode_session_get(session),
                 NLM_F_REQUEST,
             )
             .await?;
@@ -328,25 +490,74 @@ impl L2tpHandle {
         params: SessionModify,
     ) -> crate::Result<()> {
         self.send_ack(netlink::encode_session_modify(
-            tunnel_id, session_id, &params,
+            SessionRef::Ids(tunnel_id, session_id),
+            &params,
         ))
         .await
     }
 
-    async fn resolve_family_id(&self) -> crate::Result<u16> {
-        let id = self
-            .inner
-            .family_id
+    /// Applies mutable session parameters to the Ethernet pseudowire session
+    /// whose interface is `ifname`.
+    pub async fn modify_session_by_ifname(
+        &self,
+        ifname: &L2tpIfName,
+        params: SessionModify,
+    ) -> crate::Result<()> {
+        self.send_ack(netlink::encode_session_modify(
+            SessionRef::IfName(*ifname),
+            &params,
+        ))
+        .await
+    }
+
+    /// Subscribes to the kernel's L2TP notifications.
+    ///
+    /// The stream reports tunnels and sessions created, modified or deleted
+    /// by any process in the handle's network namespace, including tunnels
+    /// the kernel tears down when a managed socket closes. It uses its own
+    /// netlink connection on the current runtime; dropping it leaves the
+    /// multicast group. Joining needs no privilege.
+    pub async fn events(&self) -> crate::Result<Events> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            io::Error::other("tokio runtime is required for events")
+        })?;
+        let family = self.resolve_family().await?;
+        let group = family.events_group.ok_or_else(|| {
+            crate::Error::FamilyResolution(format!(
+                "the l2tp family has no `{EVENTS_GROUP}` multicast group"
+            ))
+        })?;
+        let (mut connection, genl, receiver) =
+            open_connection(self.inner.netns.as_ref())?;
+        connection.socket_mut().socket_ref().add_membership(group)?;
+        // Requests are never sent on this connection; it only listens.
+        drop(genl);
+        let task = runtime.spawn(connection);
+        Ok(Events::new(receiver, task))
+    }
+
+    async fn resolve_family(&self) -> crate::Result<FamilyInfo> {
+        self.inner
+            .family
             .get_or_try_init(|| async {
-                self.inner
+                let family = self
+                    .inner
                     .genl
                     .resolve_family::<L2tpMessage>()
                     .await
-                    .map(|family| family.id)
-                    .map_err(|e| crate::Error::FamilyResolution(e.to_string()))
+                    .map_err(|e| {
+                        crate::Error::FamilyResolution(e.to_string())
+                    })?;
+                Ok(FamilyInfo {
+                    id: family.id,
+                    events_group: family
+                        .multicast_groups
+                        .get(EVENTS_GROUP)
+                        .copied(),
+                })
             })
-            .await?;
-        Ok(*id)
+            .await
+            .copied()
     }
 
     async fn send_ack(&self, payload: L2tpMessage) -> crate::Result<()> {
@@ -361,7 +572,9 @@ impl L2tpHandle {
         payload: L2tpMessage,
         flags: u16,
     ) -> crate::Result<Vec<GenlMessage<L2tpMessage>>> {
-        let family_id = self.resolve_family_id().await?;
+        let cmd = payload.cmd;
+        log::debug!("l2tp: sending {cmd:?} with flags {flags:#06x}");
+        let family_id = self.resolve_family().await?.id;
         let mut genl = GenlMessage::from_payload(payload);
         genl.set_resolved_family_id(family_id);
 
@@ -372,7 +585,16 @@ impl L2tpHandle {
         let mut handle = self.inner.genl.clone();
         let mut stream = handle.send_request(request).map_err(to_io_error)?;
 
-        collect_responses(&mut stream, flags).await
+        match collect_responses(&mut stream, flags).await {
+            Ok(replies) => {
+                log::trace!("l2tp: {cmd:?} returned {} replies", replies.len());
+                Ok(replies)
+            }
+            Err(err) => {
+                log::debug!("l2tp: {cmd:?} failed: {err}");
+                Err(err)
+            }
+        }
     }
 }
 
@@ -393,7 +615,7 @@ where
     let mut expect_done = flags & NLM_F_DUMP == NLM_F_DUMP;
     let mut responses = Vec::new();
     while let Some(item) = stream.next().await {
-        let message = item.map_err(crate::Error::netlink)?;
+        let message = item?;
         if message.header.flags & NLM_F_DUMP_INTR != 0 {
             // The kernel changed its tables mid-dump; a retry usually works.
             return Err(io::Error::new(
@@ -489,10 +711,9 @@ where
         })
         .await
         .map_err(|err| io::Error::other(err.to_string()))?;
-    result
-        .value
-        .take()
-        .expect("creation task returned a result")
+    result.value.take().unwrap_or_else(|| {
+        Err(crate::Error::other("creation task lost its result"))
+    })
 }
 
 // Keep the owning handle in a separate task: cancelling the caller must not
@@ -564,6 +785,19 @@ mod tests {
             futures::stream::iter(messages.into_iter().map(Ok)),
             flags,
         ))
+    }
+
+    pub(super) fn test_handle(genl: GenetlinkHandle) -> L2tpHandle {
+        L2tpHandle {
+            inner: Arc::new(L2tpInner {
+                genl,
+                family: tokio::sync::OnceCell::new_with(Some(FamilyInfo {
+                    id: 1234,
+                    events_group: None,
+                })),
+                netns: None,
+            }),
+        }
     }
 
     #[test]
@@ -709,12 +943,7 @@ mod tests {
                     }
                     Err(err) => panic!("{err}"),
                 };
-            let handle = L2tpHandle {
-                inner: Arc::new(L2tpInner {
-                    genl,
-                    family_id: tokio::sync::OnceCell::new_with(Some(1234)),
-                }),
-            };
+            let handle = test_handle(genl);
             let mut request = Box::pin(handle.delete_tunnel(TunnelId(123)));
             assert!(futures::poll!(request.as_mut()).is_pending());
             // No connection task ran, so the request never reached the kernel.
@@ -743,12 +972,7 @@ mod tests {
                     }
                     Err(err) => panic!("{err}"),
                 };
-            let handle = L2tpHandle {
-                inner: Arc::new(L2tpInner {
-                    genl,
-                    family_id: tokio::sync::OnceCell::new_with(Some(1234)),
-                }),
-            };
+            let handle = test_handle(genl);
             // This is the post-ACK phase; the idle connection leaves GET
             // pending.
             let mut lookup = Box::pin(handle.get_created_session(
@@ -806,6 +1030,47 @@ mod tests {
             }
             Err(e) => panic!("unexpected error type: {e:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn events_subscription_joins_the_multicast_group() {
+        let handle = L2tpHandle::new().await.unwrap();
+        match handle.events().await {
+            Ok(events) => drop(events),
+            // Without the l2tp module the family cannot be resolved.
+            Err(crate::Error::FamilyResolution(_)) => {}
+            Err(err) => panic!("unexpected error: {err:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_unknown_objects_fails_without_a_handle() {
+        let handle = L2tpHandle::new().await.unwrap();
+        let err = handle.open_tunnel(TunnelId(u32::MAX)).await.unwrap_err();
+        assert!(err.kind().is_some(), "{err:?}");
+        let name = L2tpIfName::new("l2tp-no-such0").unwrap();
+        let err = handle.open_session_by_ifname(&name).await.unwrap_err();
+        assert!(err.kind().is_some(), "{err:?}");
+    }
+
+    #[test]
+    fn new_in_a_namespace_needs_cap_sys_admin() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let netns = NetNs::current().unwrap();
+            match L2tpHandle::new_in(&netns).await {
+                // Root can enter its own namespace; the handle then works
+                // like a plain one.
+                Ok(handle) => drop(handle),
+                Err(crate::Error::Io(e)) => {
+                    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}")
+                }
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        });
     }
 }
 

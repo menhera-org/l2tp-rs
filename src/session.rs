@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: MIT
 
 use crate::{
-    Cookie, IfName, L2SpecType, PseudowireType, SessionId, SessionStats,
+    Cookie, L2SpecType, L2tpIfName, PseudowireType, SessionId, SessionStats,
     TunnelId,
 };
 
 /// Parameters for creating an L2TP session.
-#[derive(Debug, Clone)]
+///
+/// With the `serde` feature every field except the identifiers and the
+/// pseudowire type has a default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct SessionConfig {
     /// Parent tunnel identifier.
     pub tunnel_id: TunnelId,
@@ -15,26 +19,41 @@ pub struct SessionConfig {
     /// Peer session identifier.
     pub peer_session_id: SessionId,
     /// Session pseudowire type.
+    ///
+    /// Ethernet pseudowires need an L2TPv3 tunnel and the `l2tp_eth` module.
+    /// PPP pseudowires need the `l2tp_ppp` module and a
+    /// [`PppSocket`](crate::PppSocket) for their data plane.
     pub pseudowire_type: PseudowireType,
-    /// Session L2-specific header type.
+    /// Session L2-specific header type. Ignored by the kernel for L2TPv2.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub l2spec_type: L2SpecType,
-    /// Local session cookie.
+    /// Local session cookie. Ignored by the kernel for L2TPv2.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub cookie: Cookie,
-    /// Peer session cookie.
+    /// Peer session cookie. Ignored by the kernel for L2TPv2.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub peer_cookie: Cookie,
     /// Enable receive sequence checking.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub recv_seq: bool,
     /// Enable transmit sequence numbers.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub send_seq: bool,
     /// Enable LNS mode.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub lns_mode: bool,
     /// Receive timeout in milliseconds.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub recv_timeout_ms: Option<u64>,
     /// Optional interface name for `SESSION_CREATE`.
     ///
     /// For Ethernet pseudowires, this names the `l2tpeth*` netdevice created
     /// by the kernel. Tunnel objects do not have an `ifname`.
-    pub ifname: Option<IfName>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, with = "crate::types::ifname_serde")
+    )]
+    pub ifname: Option<L2tpIfName>,
 }
 
 impl SessionConfig {
@@ -44,11 +63,42 @@ impl SessionConfig {
         session_id: SessionId,
         peer_session_id: SessionId,
     ) -> Self {
+        Self::with_pseudowire(
+            tunnel_id,
+            session_id,
+            peer_session_id,
+            PseudowireType::Eth,
+        )
+    }
+
+    /// Creates a basic PPP pseudowire session configuration.
+    ///
+    /// Attach a [`PppSocket`](crate::PppSocket) to the created session for
+    /// its data plane.
+    pub fn ppp(
+        tunnel_id: TunnelId,
+        session_id: SessionId,
+        peer_session_id: SessionId,
+    ) -> Self {
+        Self::with_pseudowire(
+            tunnel_id,
+            session_id,
+            peer_session_id,
+            PseudowireType::Ppp,
+        )
+    }
+
+    fn with_pseudowire(
+        tunnel_id: TunnelId,
+        session_id: SessionId,
+        peer_session_id: SessionId,
+        pseudowire_type: PseudowireType,
+    ) -> Self {
         Self {
             tunnel_id,
             session_id,
             peer_session_id,
-            pseudowire_type: PseudowireType::Eth,
+            pseudowire_type,
             l2spec_type: L2SpecType::None,
             cookie: Cookie::none(),
             peer_cookie: Cookie::none(),
@@ -63,10 +113,13 @@ impl SessionConfig {
 
 /// Runtime information returned by the kernel for a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[non_exhaustive]
 pub struct SessionInfo {
     /// Parent tunnel identifier.
     pub tunnel_id: TunnelId,
+    /// Peer tunnel identifier of the parent tunnel.
+    pub peer_tunnel_id: TunnelId,
     /// Local session identifier.
     pub session_id: SessionId,
     /// Peer session identifier.
@@ -75,6 +128,10 @@ pub struct SessionInfo {
     pub pseudowire_type: PseudowireType,
     /// Session L2-specific header type.
     pub l2spec_type: L2SpecType,
+    /// Local session cookie; empty when none is set.
+    pub cookie: Cookie,
+    /// Peer session cookie; empty when none is set.
+    pub peer_cookie: Cookie,
     /// Receive sequence checking state.
     pub recv_seq: bool,
     /// Transmit sequence number state.
@@ -84,13 +141,19 @@ pub struct SessionInfo {
     /// Receive timeout in milliseconds.
     pub recv_timeout_ms: Option<u64>,
     /// Kernel-assigned or requested session interface name.
-    pub ifname: Option<IfName>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, with = "crate::types::ifname_serde")
+    )]
+    pub ifname: Option<L2tpIfName>,
     /// Whether IPsec offload/protection is in use.
     pub using_ipsec: bool,
 }
 
 /// Mutable session parameters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct SessionModify {
     /// Optional receive sequence toggle.
     pub recv_seq: Option<bool>,
@@ -114,7 +177,7 @@ impl SessionModify {
 pub struct SessionHandle {
     pub(crate) tunnel_id: TunnelId,
     pub(crate) session_id: SessionId,
-    pub(crate) ifname: Option<IfName>,
+    pub(crate) ifname: Option<L2tpIfName>,
     pub(crate) auto_delete: bool,
     pub(crate) handle: crate::handle::L2tpHandle,
 }
@@ -131,8 +194,13 @@ impl SessionHandle {
     }
 
     /// Returns the interface name, if one was assigned.
-    pub fn ifname(&self) -> Option<&IfName> {
+    pub fn ifname(&self) -> Option<&L2tpIfName> {
         self.ifname.as_ref()
+    }
+
+    /// Returns whether the session is deleted when the handle is dropped.
+    pub fn auto_delete(&self) -> bool {
+        self.auto_delete
     }
 
     /// Enables or disables best-effort session deletion on drop.
@@ -222,6 +290,9 @@ mod tests {
         assert!(!config.lns_mode);
         assert_eq!(config.recv_timeout_ms, None);
         assert_eq!(config.ifname, None);
+
+        let ppp = SessionConfig::ppp(TunnelId(1), SessionId(2), SessionId(3));
+        assert_eq!(ppp.pseudowire_type, PseudowireType::Ppp);
     }
 
     #[test]
@@ -234,5 +305,23 @@ mod tests {
             }
             .is_empty()
         );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn session_config_deserializes_with_defaults() {
+        let config: SessionConfig = serde_json::from_str(
+            r#"{"tunnel_id": 1, "session_id": 2, "peer_session_id": 3,
+                "pseudowire_type": "Eth", "cookie": "deadbeef",
+                "ifname": "l2tpeth0"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.cookie.to_string(), "deadbeef");
+        assert_eq!(config.ifname.unwrap().to_str().unwrap(), "l2tpeth0");
+        assert!(!config.recv_seq);
+        let modify: SessionModify =
+            serde_json::from_str(r#"{"send_seq": true}"#).unwrap();
+        assert_eq!(modify.send_seq, Some(true));
+        assert_eq!(modify.recv_seq, None);
     }
 }

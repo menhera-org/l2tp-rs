@@ -2,13 +2,20 @@
 
 use std::{io, net::Ipv6Addr};
 
-use crate::{IfName, IfNameError};
+use netlink_packet_core::DecodeError;
+
+use crate::L2tpIfName;
 
 /// Errors returned by this crate.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// Failed to decode a netlink message.
+    /// A netlink message or attribute value is invalid.
+    ///
+    /// This covers kernel replies that fail to decode and attribute values
+    /// rejected by `netlink-packet-l2tp`, such as interface names that break
+    /// the kernel's rules; `netlink_packet_core::DecodeError` converts into
+    /// this variant.
     #[error("netlink error: {0}")]
     Netlink(String),
 
@@ -20,17 +27,29 @@ pub enum Error {
     #[error("genetlink family resolution failed: {0}")]
     FamilyResolution(String),
 
-    /// I/O failure returned by a socket or netlink operation.
+    /// I/O failure returned by a socket, thread or netlink operation.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-
-    /// Interface name validation failed.
-    #[error("invalid interface name: {0}")]
-    InvalidIfName(#[from] IfNameError),
 
     /// Cookie validation failed because the byte length is invalid.
     #[error("invalid cookie length {0}: must be 0, 4, or 8")]
     InvalidCookieLength(usize),
+
+    /// A cookie string is not an even number of hexadecimal digits.
+    #[error("invalid cookie: expected 0, 8 or 16 hexadecimal digits")]
+    InvalidCookieHex,
+
+    /// An endpoint string could not be parsed.
+    #[error("invalid endpoint {0}")]
+    InvalidEndpoint(String),
+
+    /// The kernel supports only L2TP protocol versions 2 and 3.
+    #[error("unsupported L2TP protocol version {0}")]
+    UnsupportedVersion(u8),
+
+    /// L2TPv2 tunnel and session identifiers are 16-bit.
+    #[error("identifier {0} does not fit the 16 bits of an L2TPv2 identifier")]
+    V2IdTooLarge(u32),
 
     /// Local and remote endpoint address families do not match.
     #[error(
@@ -53,9 +72,9 @@ pub enum Error {
     #[error("interface scope mismatch: {expected} and {found}")]
     ScopeMismatch {
         /// The interface named first.
-        expected: IfName,
+        expected: L2tpIfName,
         /// The conflicting interface.
-        found: IfName,
+        found: L2tpIfName,
     },
 
     /// Unmanaged tunnels cannot use link-local IPv6 endpoints, because the
@@ -113,7 +132,13 @@ impl Error {
         }
     }
 
-    pub(crate) fn netlink(err: netlink_packet_core::DecodeError) -> Self {
+    pub(crate) fn other(message: impl Into<String>) -> Self {
+        Self::Io(io::Error::other(message.into()))
+    }
+}
+
+impl From<DecodeError> for Error {
+    fn from(err: DecodeError) -> Self {
         Self::Netlink(err.to_string())
     }
 }
@@ -125,7 +150,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 mod tests {
     use std::io;
 
-    use super::{Error, IfName, Ipv6Addr};
+    use super::{Error, Ipv6Addr, L2tpIfName};
 
     #[test]
     fn kernel_error_exposes_os_code_and_kind() {
@@ -142,8 +167,8 @@ mod tests {
     #[test]
     fn scope_errors_name_the_interfaces() {
         let err = Error::ScopeMismatch {
-            expected: IfName::new("eth0").unwrap(),
-            found: IfName::new("eth1").unwrap(),
+            expected: L2tpIfName::new("eth0").unwrap(),
+            found: L2tpIfName::new("eth1").unwrap(),
         };
         assert_eq!(err.to_string(), "interface scope mismatch: eth0 and eth1");
         let err =
@@ -154,7 +179,7 @@ mod tests {
     #[test]
     fn netlink_decode_error_keeps_message() {
         let err =
-            Error::netlink(netlink_packet_core::DecodeError::from("truncated"));
+            Error::from(netlink_packet_core::DecodeError::from("truncated"));
         assert_eq!(err.to_string(), "netlink error: truncated");
     }
 }

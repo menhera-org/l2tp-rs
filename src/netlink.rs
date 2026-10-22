@@ -8,33 +8,37 @@ use netlink_packet_l2tp::{
 };
 
 use crate::{
-    Encapsulation, IfName, IpEndpoint, L2SpecType, PseudowireType,
-    SessionConfig, SessionId, SessionInfo, SessionModify, SessionStats,
-    TunnelConfig, TunnelId, TunnelInfo, TunnelStats, UdpEndpoint,
+    Cookie, Encapsulation, IpEndpoint, L2SpecType, L2tpIfName, L2tpVersion,
+    PseudowireType, SessionConfig, SessionId, SessionInfo, SessionModify,
+    SessionStats, TunnelConfig, TunnelId, TunnelInfo, TunnelStats, UdpEndpoint,
 };
+
+/// How a session is addressed in `SESSION_GET`, `SESSION_DELETE` and
+/// `SESSION_MODIFY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionRef {
+    /// By tunnel and session identifier.
+    Ids(TunnelId, SessionId),
+    /// By the interface name of an Ethernet pseudowire.
+    IfName(L2tpIfName),
+}
+
+impl SessionRef {
+    fn attributes(self) -> Vec<L2tpAttribute> {
+        match self {
+            Self::Ids(tunnel_id, session_id) => vec![
+                L2tpAttribute::ConnId(tunnel_id.0),
+                L2tpAttribute::SessionId(session_id.0),
+            ],
+            Self::IfName(name) => vec![L2tpAttribute::IfName(name)],
+        }
+    }
+}
 
 // Only fixed-size attributes or checked variable-length attributes are passed
 // here.
 fn message(cmd: L2tpCmd, attributes: Vec<L2tpAttribute>) -> L2tpMessage {
     L2tpMessage { cmd, attributes }
-}
-
-// netlink-packet-l2tp 0.3 carries `L2TP_ATTR_IFNAME` as a `String`. Its next
-// release carries the kernel's `[u8; IFNAMSIZ]` instead; then these two
-// helpers become `L2tpAttribute::IfName(*name.as_array())` and
-// `IfName::try_from(*array)`, and non-UTF-8 names work end to end.
-fn ifname_attribute(name: &IfName) -> crate::Result<L2tpAttribute> {
-    let utf8 = name.to_str().ok_or_else(|| {
-        crate::Error::Netlink(format!(
-            "netlink-packet-l2tp 0.3 cannot carry the non-UTF-8 interface \
-             name {name:?}"
-        ))
-    })?;
-    L2tpAttribute::if_name(utf8).map_err(crate::Error::netlink)
-}
-
-fn ifname_from_attribute(name: &str) -> crate::Result<IfName> {
-    IfName::new(name)
 }
 
 pub(crate) fn encode_tunnel_create(
@@ -44,7 +48,7 @@ pub(crate) fn encode_tunnel_create(
     let mut attrs = vec![
         L2tpAttribute::ConnId(config.tunnel_id.0),
         L2tpAttribute::PeerConnId(config.peer_tunnel_id.0),
-        L2tpAttribute::ProtoVersion(3),
+        L2tpAttribute::ProtoVersion(config.version.number()),
     ];
 
     // Kernel-created sockets get no interface scope, so they can neither bind
@@ -152,10 +156,8 @@ pub(crate) fn encode_session_create(
         L2tpAttribute::PeerSessionId(config.peer_session_id.0),
         L2tpAttribute::PwType(to_l2tp_pw(config.pseudowire_type)),
         L2tpAttribute::L2SpecType(to_l2tp_l2spec(config.l2spec_type)),
-        L2tpAttribute::cookie(config.cookie.as_bytes().to_vec())
-            .map_err(crate::Error::netlink)?,
-        L2tpAttribute::peer_cookie(config.peer_cookie.as_bytes().to_vec())
-            .map_err(crate::Error::netlink)?,
+        L2tpAttribute::cookie(config.cookie.as_bytes().to_vec())?,
+        L2tpAttribute::peer_cookie(config.peer_cookie.as_bytes().to_vec())?,
     ];
 
     if config.recv_seq {
@@ -170,35 +172,22 @@ pub(crate) fn encode_session_create(
     if let Some(timeout) = config.recv_timeout_ms {
         attrs.push(L2tpAttribute::RecvTimeout(timeout));
     }
-    if let Some(ifname) = &config.ifname {
-        attrs.push(ifname_attribute(ifname)?);
+    if let Some(ifname) = config.ifname {
+        attrs.push(L2tpAttribute::IfName(ifname));
     }
 
     Ok(message(L2tpCmd::SessionCreate, attrs))
 }
 
-pub(crate) fn encode_session_delete(
-    tunnel_id: TunnelId,
-    session_id: SessionId,
-) -> L2tpMessage {
-    message(
-        L2tpCmd::SessionDelete,
-        vec![
-            L2tpAttribute::ConnId(tunnel_id.0),
-            L2tpAttribute::SessionId(session_id.0),
-        ],
-    )
+pub(crate) fn encode_session_delete(session: SessionRef) -> L2tpMessage {
+    message(L2tpCmd::SessionDelete, session.attributes())
 }
 
 pub(crate) fn encode_session_modify(
-    tunnel_id: TunnelId,
-    session_id: SessionId,
+    session: SessionRef,
     params: &SessionModify,
 ) -> L2tpMessage {
-    let mut attrs = vec![
-        L2tpAttribute::ConnId(tunnel_id.0),
-        L2tpAttribute::SessionId(session_id.0),
-    ];
+    let mut attrs = session.attributes();
 
     if let Some(v) = params.recv_seq {
         attrs.push(L2tpAttribute::RecvSeq(u8::from(v)));
@@ -216,17 +205,8 @@ pub(crate) fn encode_session_modify(
     message(L2tpCmd::SessionModify, attrs)
 }
 
-pub(crate) fn encode_session_get(
-    tunnel_id: TunnelId,
-    session_id: SessionId,
-) -> L2tpMessage {
-    message(
-        L2tpCmd::SessionGet,
-        vec![
-            L2tpAttribute::ConnId(tunnel_id.0),
-            L2tpAttribute::SessionId(session_id.0),
-        ],
-    )
+pub(crate) fn encode_session_get(session: SessionRef) -> L2tpMessage {
+    message(L2tpCmd::SessionGet, session.attributes())
 }
 
 pub(crate) fn encode_session_get_dump() -> L2tpMessage {
@@ -275,6 +255,11 @@ pub(crate) fn decode_tunnel_info(
     let tunnel_id = required(tunnel_id, "L2TP_ATTR_CONN_ID")?;
     let peer_tunnel_id = required(peer_tunnel_id, "L2TP_ATTR_PEER_CONN_ID")?;
     let proto_version = required(proto_version, "L2TP_ATTR_PROTO_VERSION")?;
+    let version = L2tpVersion::try_from(proto_version).map_err(|_| {
+        crate::Error::UnexpectedReply(format!(
+            "unsupported protocol version {proto_version}"
+        ))
+    })?;
     let encap_type = required(encap_type, "L2TP_ATTR_ENCAP_TYPE")?;
 
     let encapsulation = match encap_type {
@@ -348,7 +333,7 @@ pub(crate) fn decode_tunnel_info(
     Ok(TunnelInfo {
         tunnel_id,
         peer_tunnel_id,
-        proto_version,
+        version,
         encapsulation,
         using_ipsec,
     })
@@ -358,10 +343,13 @@ pub(crate) fn decode_session_info(
     attrs: &[L2tpAttribute],
 ) -> crate::Result<SessionInfo> {
     let mut tunnel_id = None;
+    let mut peer_tunnel_id = None;
     let mut session_id = None;
     let mut peer_session_id = None;
     let mut pseudowire_type = None;
     let mut l2spec_type = None;
+    let mut cookie = Cookie::none();
+    let mut peer_cookie = Cookie::none();
     let mut recv_seq = false;
     let mut send_seq = false;
     let mut lns_mode = false;
@@ -372,6 +360,7 @@ pub(crate) fn decode_session_info(
     for attr in attrs {
         match attr {
             L2tpAttribute::ConnId(v) => tunnel_id = Some(TunnelId(*v)),
+            L2tpAttribute::PeerConnId(v) => peer_tunnel_id = Some(TunnelId(*v)),
             L2tpAttribute::SessionId(v) => session_id = Some(SessionId(*v)),
             L2tpAttribute::PeerSessionId(v) => {
                 peer_session_id = Some(SessionId(*v))
@@ -382,13 +371,17 @@ pub(crate) fn decode_session_info(
             L2tpAttribute::L2SpecType(v) => {
                 l2spec_type = Some(from_l2tp_l2spec(*v))
             }
+            L2tpAttribute::Cookie(v) => {
+                cookie = Cookie::try_from(v.as_slice())?
+            }
+            L2tpAttribute::PeerCookie(v) => {
+                peer_cookie = Cookie::try_from(v.as_slice())?
+            }
             L2tpAttribute::RecvSeq(v) => recv_seq = *v != 0,
             L2tpAttribute::SendSeq(v) => send_seq = *v != 0,
             L2tpAttribute::LnsMode(v) => lns_mode = *v != 0,
             L2tpAttribute::RecvTimeout(v) => recv_timeout_ms = Some(*v),
-            L2tpAttribute::IfName(v) => {
-                ifname = Some(ifname_from_attribute(v)?)
-            }
+            L2tpAttribute::IfName(v) => ifname = Some(*v),
             L2tpAttribute::UsingIpsec(v) => using_ipsec = *v != 0,
             _ => {}
         }
@@ -396,6 +389,7 @@ pub(crate) fn decode_session_info(
 
     Ok(SessionInfo {
         tunnel_id: required(tunnel_id, "L2TP_ATTR_CONN_ID")?,
+        peer_tunnel_id: required(peer_tunnel_id, "L2TP_ATTR_PEER_CONN_ID")?,
         session_id: required(session_id, "L2TP_ATTR_SESSION_ID")?,
         peer_session_id: required(
             peer_session_id,
@@ -403,6 +397,8 @@ pub(crate) fn decode_session_info(
         )?,
         pseudowire_type: required(pseudowire_type, "L2TP_ATTR_PW_TYPE")?,
         l2spec_type: l2spec_type.unwrap_or_default(),
+        cookie,
+        peer_cookie,
         recv_seq,
         send_seq,
         lns_mode,
@@ -550,54 +546,8 @@ mod tests {
         assert_eq!(parsed, message);
     }
 
-    #[test]
-    fn session_create_checked_attributes_serialize_at_valid_boundaries() {
-        for len in [0, 4, 8] {
-            for l2spec_type in [L2SpecType::None, L2SpecType::Default] {
-                let mut cfg =
-                    SessionConfig::eth(TunnelId(1), SessionId(2), SessionId(3));
-                cfg.cookie =
-                    crate::Cookie::try_from_bytes(vec![0xff; len]).unwrap();
-                cfg.peer_cookie = cfg.cookie.clone();
-                // The limit is bytes, including for UTF-8 names.
-                cfg.ifname = Some(IfName::new("éééééééa").unwrap());
-                cfg.l2spec_type = l2spec_type;
-                cfg.recv_seq = true;
-                cfg.send_seq = true;
-                cfg.lns_mode = true;
-                cfg.recv_timeout_ms = Some(u64::MAX);
-                assert_wire_round_trip(encode_session_create(&cfg).unwrap());
-            }
-        }
-    }
-
-    #[test]
-    fn request_commands_and_optional_updates_serialize() {
-        for message in [
-            encode_tunnel_delete(TunnelId(1)),
-            encode_tunnel_get(TunnelId(1)),
-            encode_tunnel_get_dump(),
-            encode_session_delete(TunnelId(1), SessionId(2)),
-            encode_session_get(TunnelId(1), SessionId(2)),
-            encode_session_get_dump(),
-            encode_session_modify(
-                TunnelId(1),
-                SessionId(2),
-                &SessionModify {
-                    recv_seq: Some(false),
-                    send_seq: Some(true),
-                    lns_mode: Some(false),
-                    recv_timeout_ms: Some(1234),
-                },
-            ),
-        ] {
-            assert_wire_round_trip(message);
-        }
-    }
-
-    #[test]
-    fn tunnel_create_omits_disabled_udp_checksum_attribute() {
-        let cfg = TunnelConfig::new(
+    fn udp_v4_config(udp_csum: bool) -> TunnelConfig {
+        TunnelConfig::new(
             TunnelId(1),
             TunnelId(2),
             Encapsulation::Udp {
@@ -609,13 +559,122 @@ mod tests {
                     Ipv4Addr::LOCALHOST,
                     1001,
                 )),
-                udp_csum: false,
+                udp_csum,
                 udp_zero_csum6_tx: false,
                 udp_zero_csum6_rx: false,
             },
         )
+        .unwrap()
+    }
+
+    #[test]
+    fn session_create_checked_attributes_serialize_at_valid_boundaries() {
+        for len in [0, 4, 8] {
+            for l2spec_type in [L2SpecType::None, L2SpecType::Default] {
+                let mut cfg =
+                    SessionConfig::eth(TunnelId(1), SessionId(2), SessionId(3));
+                cfg.cookie = Cookie::try_from(vec![0xff; len]).unwrap();
+                cfg.peer_cookie = cfg.cookie;
+                // The limit is bytes, including for UTF-8 names.
+                cfg.ifname = Some(L2tpIfName::new("éééééééa").unwrap());
+                cfg.l2spec_type = l2spec_type;
+                cfg.recv_seq = true;
+                cfg.send_seq = true;
+                cfg.lns_mode = true;
+                cfg.recv_timeout_ms = Some(u64::MAX);
+                assert_wire_round_trip(encode_session_create(&cfg).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn non_utf8_ifnames_round_trip_through_the_attribute_layer() {
+        let mut cfg =
+            SessionConfig::eth(TunnelId(1), SessionId(2), SessionId(3));
+        let raw = L2tpIfName::new(b"eth\xff0").unwrap();
+        cfg.ifname = Some(raw);
+        let message = encode_session_create(&cfg).unwrap();
+        assert!(has_attr(&message.attributes, |a| matches!(
+            a,
+            L2tpAttribute::IfName(name) if *name == raw
+        )));
+        assert_wire_round_trip(message);
+        let info = decode_session_info(&[
+            L2tpAttribute::ConnId(1),
+            L2tpAttribute::PeerConnId(2),
+            L2tpAttribute::SessionId(3),
+            L2tpAttribute::PeerSessionId(4),
+            L2tpAttribute::PwType(L2tpPwType::Eth),
+            L2tpAttribute::IfName(raw),
+        ])
         .unwrap();
+        assert_eq!(info.ifname, Some(raw));
+    }
+
+    #[test]
+    fn request_commands_and_optional_updates_serialize() {
+        let ids = SessionRef::Ids(TunnelId(1), SessionId(2));
+        let name = SessionRef::IfName(L2tpIfName::new("l2tpeth0").unwrap());
+        for message in [
+            encode_tunnel_delete(TunnelId(1)),
+            encode_tunnel_get(TunnelId(1)),
+            encode_tunnel_get_dump(),
+            encode_session_delete(ids),
+            encode_session_delete(name),
+            encode_session_get(ids),
+            encode_session_get(name),
+            encode_session_get_dump(),
+            encode_session_modify(
+                ids,
+                &SessionModify {
+                    recv_seq: Some(false),
+                    send_seq: Some(true),
+                    lns_mode: Some(false),
+                    recv_timeout_ms: Some(1234),
+                },
+            ),
+            encode_session_modify(
+                name,
+                &SessionModify {
+                    lns_mode: Some(true),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert_wire_round_trip(message);
+        }
+        let by_name = encode_session_get(name);
+        assert!(has_attr(&by_name.attributes, |a| matches!(
+            a,
+            L2tpAttribute::IfName(n) if n.as_bytes() == b"l2tpeth0"
+        )));
+        assert!(!has_attr(&by_name.attributes, |a| matches!(
+            a,
+            L2tpAttribute::ConnId(_)
+        )));
+    }
+
+    #[test]
+    fn tunnel_create_carries_the_protocol_version() {
+        let cfg = udp_v4_config(true);
         let message = encode_tunnel_create(&cfg, None).unwrap();
+        assert!(has_attr(&message.attributes, |a| matches!(
+            a,
+            L2tpAttribute::ProtoVersion(3)
+        )));
+        let v2 = encode_tunnel_create(&cfg.with_version(L2tpVersion::V2), None)
+            .unwrap();
+        assert!(has_attr(&v2.attributes, |a| matches!(
+            a,
+            L2tpAttribute::ProtoVersion(2)
+        )));
+        assert_wire_round_trip(v2);
+    }
+
+    #[test]
+    fn tunnel_create_omits_disabled_udp_checksum_attribute() {
+        let message =
+            encode_tunnel_create(&udp_v4_config(false), None).unwrap();
         assert!(!has_attr(&message.attributes, |a| matches!(
             a,
             L2tpAttribute::UdpCsum(_)
@@ -667,122 +726,9 @@ mod tests {
     }
 
     #[test]
-    fn session_info_treats_nonzero_flag_bytes_as_true() {
-        let info = decode_session_info(&[
-            L2tpAttribute::ConnId(1),
-            L2tpAttribute::SessionId(2),
-            L2tpAttribute::PeerSessionId(3),
-            L2tpAttribute::PwType(L2tpPwType::Eth),
-            L2tpAttribute::RecvSeq(2),
-            L2tpAttribute::SendSeq(255),
-            L2tpAttribute::LnsMode(128),
-            L2tpAttribute::UsingIpsec(42),
-        ])
-        .unwrap();
-        assert!(
-            info.recv_seq && info.send_seq && info.lns_mode && info.using_ipsec
-        );
-    }
-
-    #[test]
-    fn encode_tunnel_create_udp_v4_includes_required_attributes() {
-        let cfg = TunnelConfig::new(
-            TunnelId(10),
-            TunnelId(20),
-            Encapsulation::Udp {
-                local: UdpEndpoint::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(10, 0, 0, 1),
-                    1111,
-                )),
-                remote: UdpEndpoint::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(10, 0, 0, 2),
-                    2222,
-                )),
-                udp_csum: true,
-                udp_zero_csum6_tx: true,
-                udp_zero_csum6_rx: true,
-            },
-        )
-        .unwrap();
-
-        let msg = encode_tunnel_create(&cfg, Some(7)).unwrap();
-        assert_wire_round_trip(msg.clone());
-        assert!(matches!(
-            msg.cmd,
-            netlink_packet_l2tp::L2tpCmd::TunnelCreate
-        ));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::ConnId(10)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::PeerConnId(20)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::ProtoVersion(3)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::EncapType(L2tpEncapType::Udp)
-        )));
-        assert!(has_attr(
-            &msg.attributes,
-            |a| matches!(a, L2tpAttribute::IpSaddr(ip) if *ip == Ipv4Addr::new(10, 0, 0, 1))
-        ));
-        assert!(has_attr(
-            &msg.attributes,
-            |a| matches!(a, L2tpAttribute::IpDaddr(ip) if *ip == Ipv4Addr::new(10, 0, 0, 2))
-        ));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::UdpSport(1111)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::UdpDport(2222)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::UdpCsum(1)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::UdpZeroCsum6Tx
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::UdpZeroCsum6Rx
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::Fd(7)
-        )));
-        assert!(!has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::IfName(_)
-        )));
-    }
-
-    #[test]
-    fn non_utf8_ifname_is_rejected_at_the_attribute_boundary() {
-        // netlink-packet-l2tp 0.3 carries names as `String`.
-        let mut cfg =
-            SessionConfig::eth(TunnelId(1), SessionId(2), SessionId(3));
-        cfg.ifname = Some(IfName::new(b"eth\xff0").unwrap());
-        assert!(matches!(
-            encode_session_create(&cfg),
-            Err(crate::Error::Netlink(message)) if message.contains("non-UTF-8")
-        ));
-        cfg.ifname = Some(IfName::new("eth0").unwrap());
-        assert_wire_round_trip(encode_session_create(&cfg).unwrap());
-    }
-
-    #[test]
     fn unmanaged_tunnels_reject_link_local_endpoints() {
         let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-        let eth0 = IfName::new("eth0").unwrap();
+        let eth0 = L2tpIfName::new("eth0").unwrap();
         let configs = [
             Encapsulation::Ip {
                 local: IpEndpoint::v6_scoped(link_local, eth0),
@@ -826,6 +772,71 @@ mod tests {
     }
 
     #[test]
+    fn session_info_treats_nonzero_flag_bytes_as_true() {
+        let info = decode_session_info(&[
+            L2tpAttribute::ConnId(1),
+            L2tpAttribute::PeerConnId(2),
+            L2tpAttribute::SessionId(2),
+            L2tpAttribute::PeerSessionId(3),
+            L2tpAttribute::PwType(L2tpPwType::Eth),
+            L2tpAttribute::RecvSeq(2),
+            L2tpAttribute::SendSeq(255),
+            L2tpAttribute::LnsMode(128),
+            L2tpAttribute::UsingIpsec(42),
+        ])
+        .unwrap();
+        assert!(
+            info.recv_seq && info.send_seq && info.lns_mode && info.using_ipsec
+        );
+    }
+
+    #[test]
+    fn encode_tunnel_create_udp_v4_includes_required_attributes() {
+        let cfg = TunnelConfig::new(
+            TunnelId(10),
+            TunnelId(20),
+            Encapsulation::Udp {
+                local: UdpEndpoint::V4(SocketAddrV4::new(
+                    Ipv4Addr::new(10, 0, 0, 1),
+                    1111,
+                )),
+                remote: UdpEndpoint::V4(SocketAddrV4::new(
+                    Ipv4Addr::new(10, 0, 0, 2),
+                    2222,
+                )),
+                udp_csum: true,
+                udp_zero_csum6_tx: true,
+                udp_zero_csum6_rx: true,
+            },
+        )
+        .unwrap();
+
+        let msg = encode_tunnel_create(&cfg, Some(7)).unwrap();
+        assert_wire_round_trip(msg.clone());
+        assert!(matches!(msg.cmd, L2tpCmd::TunnelCreate));
+        for expected in [
+            L2tpAttribute::ConnId(10),
+            L2tpAttribute::PeerConnId(20),
+            L2tpAttribute::ProtoVersion(3),
+            L2tpAttribute::EncapType(L2tpEncapType::Udp),
+            L2tpAttribute::IpSaddr(Ipv4Addr::new(10, 0, 0, 1)),
+            L2tpAttribute::IpDaddr(Ipv4Addr::new(10, 0, 0, 2)),
+            L2tpAttribute::UdpSport(1111),
+            L2tpAttribute::UdpDport(2222),
+            L2tpAttribute::UdpCsum(1),
+            L2tpAttribute::UdpZeroCsum6Tx,
+            L2tpAttribute::UdpZeroCsum6Rx,
+            L2tpAttribute::Fd(7),
+        ] {
+            assert!(msg.attributes.contains(&expected), "{expected:?}");
+        }
+        assert!(!has_attr(&msg.attributes, |a| matches!(
+            a,
+            L2tpAttribute::IfName(_)
+        )));
+    }
+
+    #[test]
     fn encode_tunnel_create_ip_v6_includes_ip_fields() {
         let cfg = TunnelConfig::new(
             TunnelId(30),
@@ -860,8 +871,8 @@ mod tests {
     }
 
     #[test]
-    fn encode_tunnel_create_rejects_udp_family_mismatch() {
-        let cfg = TunnelConfig {
+    fn encode_tunnel_create_rejects_family_mismatches() {
+        let udp = TunnelConfig {
             tunnel_id: TunnelId(1),
             peer_tunnel_id: TunnelId(2),
             encapsulation: Encapsulation::Udp {
@@ -879,27 +890,24 @@ mod tests {
                 udp_zero_csum6_tx: false,
                 udp_zero_csum6_rx: false,
             },
+            version: L2tpVersion::V3,
         };
-
         assert!(matches!(
-            encode_tunnel_create(&cfg, None),
+            encode_tunnel_create(&udp, None),
             Err(crate::Error::AddressFamilyMismatch)
         ));
-    }
 
-    #[test]
-    fn encode_tunnel_create_rejects_ip_family_mismatch() {
-        let cfg = TunnelConfig {
+        let ip = TunnelConfig {
             tunnel_id: TunnelId(11),
             peer_tunnel_id: TunnelId(12),
             encapsulation: Encapsulation::Ip {
                 local: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
                 remote: IpEndpoint::v6(Ipv6Addr::LOCALHOST),
             },
+            version: L2tpVersion::V3,
         };
-
         assert!(matches!(
-            encode_tunnel_create(&cfg, None),
+            encode_tunnel_create(&ip, None),
             Err(crate::Error::AddressFamilyMismatch)
         ));
     }
@@ -912,64 +920,32 @@ mod tests {
             peer_session_id: SessionId(3),
             pseudowire_type: PseudowireType::Eth,
             l2spec_type: L2SpecType::Default,
-            cookie: crate::Cookie::try_from_bytes(vec![1, 2, 3, 4]).unwrap(),
-            peer_cookie: crate::Cookie::none(),
+            cookie: Cookie::from([1, 2, 3, 4]),
+            peer_cookie: Cookie::none(),
             recv_seq: true,
             send_seq: true,
             lns_mode: true,
             recv_timeout_ms: Some(999),
-            ifname: Some(IfName::new("l2tpeth0").unwrap()),
+            ifname: Some(L2tpIfName::new("l2tpeth0").unwrap()),
         };
 
         let msg = encode_session_create(&cfg).unwrap();
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::ConnId(1)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::SessionId(2)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::PeerSessionId(3)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::PwType(L2tpPwType::Eth)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::L2SpecType(1)
-        )));
-        assert!(has_attr(
-            &msg.attributes,
-            |a| matches!(a, L2tpAttribute::Cookie(v) if v.as_slice() == [1, 2, 3, 4])
-        ));
-        assert!(has_attr(
-            &msg.attributes,
-            |a| matches!(a, L2tpAttribute::PeerCookie(v) if v.is_empty())
-        ));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::RecvSeq(1)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::SendSeq(1)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::LnsMode(1)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::RecvTimeout(999)
-        )));
-        assert!(has_attr(&msg.attributes, |a| matches!(
-            a,
-            L2tpAttribute::IfName(name) if name == "l2tpeth0"
-        )));
+        for expected in [
+            L2tpAttribute::ConnId(1),
+            L2tpAttribute::SessionId(2),
+            L2tpAttribute::PeerSessionId(3),
+            L2tpAttribute::PwType(L2tpPwType::Eth),
+            L2tpAttribute::L2SpecType(1),
+            L2tpAttribute::Cookie(vec![1, 2, 3, 4]),
+            L2tpAttribute::PeerCookie(vec![]),
+            L2tpAttribute::RecvSeq(1),
+            L2tpAttribute::SendSeq(1),
+            L2tpAttribute::LnsMode(1),
+            L2tpAttribute::RecvTimeout(999),
+            L2tpAttribute::IfName(L2tpIfName::new("l2tpeth0").unwrap()),
+        ] {
+            assert!(msg.attributes.contains(&expected), "{expected:?}");
+        }
     }
 
     #[test]
@@ -993,24 +969,25 @@ mod tests {
             L2tpAttribute::UdpCsum(1),
             L2tpAttribute::UdpZeroCsum6Tx,
             L2tpAttribute::UsingIpsec(1),
-            L2tpAttribute::IfName("ignored-on-tunnel".into()),
+            L2tpAttribute::IfName(L2tpIfName::new("ignored").unwrap()),
         ];
 
         let info = decode_tunnel_info(&attrs).unwrap();
         assert_eq!(info.tunnel_id, TunnelId(100));
         assert_eq!(info.peer_tunnel_id, TunnelId(200));
-        assert_eq!(info.proto_version, 3);
+        assert_eq!(info.version, L2tpVersion::V3);
         assert!(info.using_ipsec);
 
         let ip_attrs = vec![
             L2tpAttribute::ConnId(1),
             L2tpAttribute::PeerConnId(2),
-            L2tpAttribute::ProtoVersion(3),
+            L2tpAttribute::ProtoVersion(2),
             L2tpAttribute::EncapType(L2tpEncapType::Ip),
             L2tpAttribute::Ip6Saddr(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
             L2tpAttribute::Ip6Daddr(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2)),
         ];
         let ip_info = decode_tunnel_info(&ip_attrs).unwrap();
+        assert_eq!(ip_info.version, L2tpVersion::V2);
         let Encapsulation::Ip { local, remote } = ip_info.encapsulation else {
             panic!("expected IP encapsulation");
         };
@@ -1037,10 +1014,21 @@ mod tests {
     }
 
     #[test]
-    fn decode_tunnel_info_missing_mandatory_attribute_fails() {
+    fn decode_tunnel_info_rejects_missing_or_unknown_values() {
         let attrs = vec![
             L2tpAttribute::PeerConnId(2),
             L2tpAttribute::ProtoVersion(3),
+            L2tpAttribute::EncapType(L2tpEncapType::Ip),
+            L2tpAttribute::IpSaddr(Ipv4Addr::LOCALHOST),
+            L2tpAttribute::IpDaddr(Ipv4Addr::LOCALHOST),
+        ];
+        let err = decode_tunnel_info(&attrs).unwrap_err();
+        assert!(matches!(err, crate::Error::UnexpectedReply(_)));
+
+        let attrs = vec![
+            L2tpAttribute::ConnId(1),
+            L2tpAttribute::PeerConnId(2),
+            L2tpAttribute::ProtoVersion(9),
             L2tpAttribute::EncapType(L2tpEncapType::Ip),
             L2tpAttribute::IpSaddr(Ipv4Addr::LOCALHOST),
             L2tpAttribute::IpDaddr(Ipv4Addr::LOCALHOST),
@@ -1053,53 +1041,64 @@ mod tests {
     fn decode_session_info_round_trip() {
         let attrs = vec![
             L2tpAttribute::ConnId(7),
+            L2tpAttribute::PeerConnId(70),
             L2tpAttribute::SessionId(8),
             L2tpAttribute::PeerSessionId(9),
             L2tpAttribute::PwType(L2tpPwType::Ppp),
             L2tpAttribute::L2SpecType(0),
+            L2tpAttribute::Cookie(vec![1, 2, 3, 4]),
+            L2tpAttribute::PeerCookie(vec![5, 6, 7, 8, 9, 10, 11, 12]),
             L2tpAttribute::RecvSeq(1),
             L2tpAttribute::SendSeq(0),
             L2tpAttribute::LnsMode(1),
             L2tpAttribute::RecvTimeout(3000),
-            L2tpAttribute::IfName("sess0".into()),
+            L2tpAttribute::IfName(L2tpIfName::new("sess0").unwrap()),
             L2tpAttribute::UsingIpsec(1),
         ];
 
         let info = decode_session_info(&attrs).unwrap();
         assert_eq!(info.tunnel_id, TunnelId(7));
+        assert_eq!(info.peer_tunnel_id, TunnelId(70));
         assert_eq!(info.session_id, SessionId(8));
         assert_eq!(info.peer_session_id, SessionId(9));
         assert_eq!(info.pseudowire_type, PseudowireType::Ppp);
         assert_eq!(info.l2spec_type, L2SpecType::None);
+        assert_eq!(info.cookie, Cookie::from([1, 2, 3, 4]));
+        assert_eq!(info.peer_cookie, Cookie::from([5, 6, 7, 8, 9, 10, 11, 12]));
         assert!(info.recv_seq);
         assert!(!info.send_seq);
         assert!(info.lns_mode);
         assert_eq!(info.recv_timeout_ms, Some(3000));
-        assert_eq!(info.ifname.unwrap().to_str(), Some("sess0"));
+        assert_eq!(info.ifname.unwrap().to_str().unwrap(), "sess0");
         assert!(info.using_ipsec);
     }
 
     #[test]
-    fn decode_session_info_missing_l2spec_defaults_to_none() {
+    fn decode_session_info_defaults_optional_attributes() {
         let attrs = vec![
             L2tpAttribute::ConnId(7),
+            L2tpAttribute::PeerConnId(70),
             L2tpAttribute::SessionId(8),
             L2tpAttribute::PeerSessionId(9),
             L2tpAttribute::PwType(L2tpPwType::Eth),
         ];
 
         let info = decode_session_info(&attrs).unwrap();
-        assert_eq!(info.tunnel_id, TunnelId(7));
-        assert_eq!(info.session_id, SessionId(8));
-        assert_eq!(info.peer_session_id, SessionId(9));
-        assert_eq!(info.pseudowire_type, PseudowireType::Eth);
         assert_eq!(info.l2spec_type, L2SpecType::None);
+        assert!(info.cookie.is_empty());
+        assert!(info.peer_cookie.is_empty());
+        assert_eq!(info.ifname, None);
+
+        // The peer tunnel identifier is always reported by the kernel.
+        let err = decode_session_info(&attrs[1..]).unwrap_err();
+        assert!(matches!(err, crate::Error::UnexpectedReply(_)));
     }
 
     #[test]
     fn decode_session_info_keeps_unknown_pw_and_l2spec() {
         let attrs = vec![
             L2tpAttribute::ConnId(1),
+            L2tpAttribute::PeerConnId(2),
             L2tpAttribute::SessionId(2),
             L2tpAttribute::PeerSessionId(3),
             L2tpAttribute::PwType(L2tpPwType::Other(777)),

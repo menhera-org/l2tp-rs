@@ -227,16 +227,18 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "l2tp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "clap",
  "futures",
  "genetlink",
  "libc",
+ "log",
  "netlink-packet-core",
  "netlink-packet-generic",
  "netlink-packet-l2tp",
+ "netlink-proto",
  "netlink-sys",
  "serde",
  "serde_json",
@@ -291,9 +293,9 @@ dependencies = [
 
 [[package]]
 name = "netlink-packet-l2tp"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f47306c4e6cab454ef703b6e00048dd87025871b91f9a919ec0180c6fb410d3a"
+checksum = "076932838e16e2d2af8adbbec2dd46c12bddfdcb8b85da847bef1d1b5d97d2f9"
 dependencies = [
  "netlink-packet-core",
  "netlink-packet-generic",

@@ -114,12 +114,7 @@ impl Harness {
         connection.set_forward_done(true);
         let wire = connection.socket_mut().0.clone();
         Self {
-            handle: L2tpHandle {
-                inner: Arc::new(L2tpInner {
-                    genl,
-                    family_id: tokio::sync::OnceCell::new_with(Some(1234)),
-                }),
-            },
+            handle: super::tests::test_handle(genl),
             connection: Box::pin(connection),
             wire,
         }
@@ -173,6 +168,7 @@ impl Harness {
             let mut message = L2tpMessage::new(L2tpCmd::SessionGet);
             message.attributes = vec![
                 L2tpAttribute::ConnId(101),
+                L2tpAttribute::PeerConnId(102),
                 L2tpAttribute::SessionId(201),
                 L2tpAttribute::PeerSessionId(202),
                 L2tpAttribute::PwType(L2tpPwType::Eth),

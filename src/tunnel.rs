@@ -1,19 +1,27 @@
 // SPDX-License-Identifier: MIT
 
 use crate::{
-    Encapsulation, IpEndpoint, TunnelId, TunnelSocket, TunnelStats, UdpEndpoint,
+    Encapsulation, IpEndpoint, L2tpVersion, TunnelId, TunnelSocket,
+    TunnelStats, UdpEndpoint,
 };
 
 /// Parameters for creating an L2TP tunnel.
-#[derive(Debug, Clone)]
+///
+/// With the `serde` feature the configuration deserializes through
+/// [`TunnelConfig::new`], so the endpoint validation applies; `version`
+/// defaults to [`L2tpVersion::V3`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TunnelConfig {
     pub(crate) tunnel_id: TunnelId,
     pub(crate) peer_tunnel_id: TunnelId,
     pub(crate) encapsulation: Encapsulation,
+    pub(crate) version: L2tpVersion,
 }
 
 impl TunnelConfig {
-    /// Creates a tunnel configuration and validates endpoint address families.
+    /// Creates an L2TPv3 tunnel configuration and validates endpoint address
+    /// families.
     pub fn new(
         tunnel_id: TunnelId,
         peer_tunnel_id: TunnelId,
@@ -36,7 +44,32 @@ impl TunnelConfig {
             tunnel_id,
             peer_tunnel_id,
             encapsulation,
+            version: L2tpVersion::V3,
         })
+    }
+
+    /// Derives the configuration of a managed tunnel from its socket.
+    ///
+    /// The addresses come from the socket's local and peer addresses and the
+    /// UDP checksum settings from its current socket options, so a socket
+    /// prepared elsewhere, for example through
+    /// [`TunnelSocket::from_fd`], needs no repeated description. The version
+    /// is [`L2tpVersion::V3`]; change it with
+    /// [`with_version`](Self::with_version).
+    pub fn for_socket(
+        tunnel_id: TunnelId,
+        peer_tunnel_id: TunnelId,
+        socket: &TunnelSocket,
+    ) -> crate::Result<Self> {
+        Self::new(tunnel_id, peer_tunnel_id, socket.encapsulation()?)
+    }
+
+    /// Sets the L2TP protocol version.
+    ///
+    /// L2TPv2 tunnels carry PPP sessions only and use 16-bit identifiers.
+    pub fn with_version(mut self, version: L2tpVersion) -> Self {
+        self.version = version;
+        self
     }
 
     /// Returns the local tunnel identifier.
@@ -53,6 +86,32 @@ impl TunnelConfig {
     pub fn encapsulation(&self) -> &Encapsulation {
         &self.encapsulation
     }
+
+    /// Returns the L2TP protocol version.
+    pub fn version(&self) -> L2tpVersion {
+        self.version
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for TunnelConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            tunnel_id: TunnelId,
+            peer_tunnel_id: TunnelId,
+            encapsulation: Encapsulation,
+            #[serde(default)]
+            version: L2tpVersion,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        TunnelConfig::new(raw.tunnel_id, raw.peer_tunnel_id, raw.encapsulation)
+            .map(|config| config.with_version(raw.version))
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Runtime information returned by the kernel for a tunnel.
@@ -62,6 +121,7 @@ impl TunnelConfig {
 /// The kernel reports the IPv4 UDP checksum setting only for IPv4 sockets, so
 /// `udp_csum` is `false` for every IPv6 tunnel.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[non_exhaustive]
 pub struct TunnelInfo {
     /// Local tunnel identifier.
@@ -69,7 +129,7 @@ pub struct TunnelInfo {
     /// Peer tunnel identifier.
     pub peer_tunnel_id: TunnelId,
     /// L2TP protocol version.
-    pub proto_version: u8,
+    pub version: L2tpVersion,
     /// Active encapsulation settings.
     pub encapsulation: Encapsulation,
     /// Whether IPsec offload/protection is in use.
@@ -99,6 +159,11 @@ impl TunnelHandle {
     /// Returns a mutable managed socket reference, if present.
     pub fn socket_mut(&mut self) -> Option<&mut TunnelSocket> {
         self.socket.as_mut()
+    }
+
+    /// Returns whether the tunnel is deleted when the handle is dropped.
+    pub fn auto_delete(&self) -> bool {
+        self.auto_delete
     }
 
     /// Enables or disables best-effort netlink `TUNNEL_DELETE` on drop.
@@ -201,6 +266,11 @@ mod tests {
 
         assert_eq!(config.tunnel_id, TunnelId(10));
         assert_eq!(config.peer_tunnel_id, TunnelId(20));
+        assert_eq!(config.version(), L2tpVersion::V3);
+        assert_eq!(
+            config.clone().with_version(L2tpVersion::V2).version(),
+            L2tpVersion::V2
+        );
     }
 
     #[test]
@@ -246,5 +316,33 @@ mod tests {
         };
 
         assert!(matches!(err, crate::Error::AddressFamilyMismatch));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn tunnel_config_deserializes_through_validation() {
+        let json = r#"{
+            "tunnel_id": 1,
+            "peer_tunnel_id": 2,
+            "encapsulation": {"Ip": {"local": "192.0.2.1",
+                                     "remote": "192.0.2.2"}},
+            "version": "V2"
+        }"#;
+        let config: TunnelConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.version(), L2tpVersion::V2);
+        assert_eq!(config.tunnel_id(), TunnelId(1));
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TunnelConfig>(&json).unwrap(),
+            config
+        );
+
+        let mismatch = r#"{
+            "tunnel_id": 1,
+            "peer_tunnel_id": 2,
+            "encapsulation": {"Ip": {"local": "192.0.2.1",
+                                     "remote": "fe80::1%eth0"}}
+        }"#;
+        assert!(serde_json::from_str::<TunnelConfig>(mismatch).is_err());
     }
 }

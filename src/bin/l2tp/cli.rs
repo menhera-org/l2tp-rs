@@ -4,17 +4,19 @@ use std::{
     ffi::OsString,
     fmt, io,
     net::{IpAddr, SocketAddr, SocketAddrV6},
+    os::unix::ffi::OsStrExt,
     process::ExitCode,
 };
 
 use clap::{
-    Parser, Subcommand, ValueEnum,
-    builder::{OsStringValueParser, TypedValueParser},
+    Args, Parser, Subcommand, ValueEnum,
+    builder::{OsStringValueParser, TryMapValueParser, TypedValueParser},
 };
+use futures::StreamExt;
 use l2tp::{
-    Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, L2tpHandle,
-    PseudowireType, SessionConfig, SessionId, SessionInfo, SessionModify,
-    TunnelConfig, TunnelId, UdpEndpoint,
+    Cookie, Encapsulation, IpEndpoint, L2SpecType, L2tpHandle, L2tpIfName,
+    L2tpVersion, PseudowireType, SessionConfig, SessionId, SessionInfo,
+    SessionModify, TunnelConfig, TunnelId, UdpEndpoint,
 };
 
 use crate::output::Output;
@@ -58,6 +60,14 @@ enum EncapArg {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum VersionArg {
+    #[value(name = "2")]
+    V2,
+    #[value(name = "3")]
+    V3,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum PwTypeArg {
     Eth,
     EthVlan,
@@ -71,6 +81,20 @@ enum PwTypeArg {
 enum L2SpecArg {
     None,
     Default,
+}
+
+type IfNameParser = TryMapValueParser<
+    OsStringValueParser,
+    fn(OsString) -> Result<L2tpIfName, l2tp::Error>,
+>;
+
+// Interface names are byte strings, so parse them from the raw argument.
+fn parse_ifname(arg: OsString) -> Result<L2tpIfName, l2tp::Error> {
+    Ok(L2tpIfName::new(arg.as_bytes())?)
+}
+
+fn ifname_parser() -> IfNameParser {
+    OsStringValueParser::new().try_map(parse_ifname)
 }
 
 #[derive(Parser)]
@@ -87,6 +111,8 @@ struct Cli {
 enum Cmd {
     Tunnel(TunnelArgs),
     Session(SessionArgs),
+    /// Print kernel L2TP notifications as they happen.
+    Monitor(MonitorArgs),
 }
 
 #[derive(Parser)]
@@ -115,14 +141,18 @@ struct TunnelCreateArgs {
     #[arg(long, value_enum, default_value_t = EncapArg::Udp)]
     encap: EncapArg,
 
+    /// L2TP protocol version; Ethernet sessions need version 3.
+    #[arg(long, value_enum, default_value_t = VersionArg::V3)]
+    proto_version: VersionArg,
+
     #[arg(long)]
     local: Option<String>,
 
     #[arg(long)]
     remote: String,
 
-    #[arg(long, value_parser = OsStringValueParser::new().try_map(parse_ifname))]
-    device: Option<IfName>,
+    #[arg(long, value_parser = ifname_parser())]
+    device: Option<L2tpIfName>,
 
     /// Disable IPv4 UDP checksums; requires IPv4 endpoints (not mapped IPv6).
     #[arg(long)]
@@ -192,11 +222,13 @@ struct SessionCreateArgs {
     #[arg(long, value_enum, default_value_t = L2SpecArg::None)]
     l2spec: L2SpecArg,
 
-    #[arg(long)]
-    cookie: Option<String>,
+    /// Local cookie as 8 or 16 hexadecimal digits.
+    #[arg(long, default_value_t = Cookie::none())]
+    cookie: Cookie,
 
-    #[arg(long)]
-    peer_cookie: Option<String>,
+    /// Peer cookie as 8 or 16 hexadecimal digits.
+    #[arg(long, default_value_t = Cookie::none())]
+    peer_cookie: Cookie,
 
     #[arg(long)]
     recv_seq: bool,
@@ -211,31 +243,63 @@ struct SessionCreateArgs {
     recv_timeout_ms: Option<u64>,
 
     /// Interface name, validated with the kernel's rules while parsing.
-    #[arg(long, value_parser = OsStringValueParser::new().try_map(parse_ifname))]
-    ifname: Option<IfName>,
+    #[arg(long, value_parser = ifname_parser())]
+    ifname: Option<L2tpIfName>,
 }
 
-// Interface names are byte strings, so parse them from the raw argument.
-fn parse_ifname(arg: OsString) -> Result<IfName, l2tp::Error> {
-    IfName::try_from(arg.as_os_str())
+/// Selects a session by its identifiers or by its interface name.
+#[derive(Args)]
+struct SessionRefArgs {
+    /// Tunnel of the session; use with --session-id.
+    #[arg(long, requires = "session_id", conflicts_with = "ifname")]
+    tunnel_id: Option<u32>,
+
+    /// Session identifier; use with --tunnel-id.
+    #[arg(long, requires = "tunnel_id", conflicts_with = "ifname")]
+    session_id: Option<u32>,
+
+    /// Interface name of an Ethernet pseudowire session, instead of the
+    /// identifiers.
+    #[arg(
+        long,
+        value_parser = ifname_parser(),
+        conflicts_with_all = ["tunnel_id", "session_id"]
+    )]
+    ifname: Option<L2tpIfName>,
+}
+
+#[derive(Clone, Copy)]
+enum SessionRef {
+    Ids(TunnelId, SessionId),
+    IfName(L2tpIfName),
+}
+
+impl SessionRefArgs {
+    fn resolve(&self) -> CliResult<SessionRef> {
+        match (self.tunnel_id, self.session_id, self.ifname) {
+            (Some(tunnel_id), Some(session_id), None) => {
+                Ok(SessionRef::Ids(TunnelId(tunnel_id), SessionId(session_id)))
+            }
+            (None, None, Some(ifname)) => Ok(SessionRef::IfName(ifname)),
+            _ => Err(CliError::Usage(
+                "select the session with --tunnel-id and --session-id, or \
+                 with --ifname"
+                    .to_string(),
+            )),
+        }
+    }
 }
 
 #[derive(Parser)]
 struct SessionDeleteArgs {
-    #[arg(long)]
-    tunnel_id: u32,
-
-    #[arg(long)]
-    session_id: u32,
+    #[command(flatten)]
+    session: SessionRefArgs,
 }
 
 #[derive(Parser)]
 struct SessionChangeArgs {
-    #[arg(long)]
-    tunnel_id: u32,
-
-    #[arg(long)]
-    session_id: u32,
+    #[command(flatten)]
+    session: SessionRefArgs,
 
     #[arg(long, conflicts_with = "no_recv_seq")]
     recv_seq: bool,
@@ -261,11 +325,8 @@ struct SessionChangeArgs {
 
 #[derive(Parser)]
 struct SessionShowArgs {
-    #[arg(long)]
-    tunnel_id: u32,
-
-    #[arg(long)]
-    session_id: u32,
+    #[command(flatten)]
+    session: SessionRefArgs,
 }
 
 #[derive(Parser)]
@@ -279,12 +340,12 @@ struct SessionListArgs {
 
 #[derive(Parser)]
 struct SessionStatsArgs {
-    #[arg(long)]
-    tunnel_id: u32,
-
-    #[arg(long)]
-    session_id: u32,
+    #[command(flatten)]
+    session: SessionRefArgs,
 }
+
+#[derive(Parser)]
+struct MonitorArgs {}
 
 // Persistent CLI tunnels use a kernel-created socket, which has no interface
 // scope, so `%ifname` zone suffixes cannot be honoured.
@@ -303,10 +364,7 @@ fn reject_scoped_addr(s: &str) -> Result<(), String> {
 fn parse_udp_addr(s: &str) -> Result<UdpEndpoint, String> {
     reject_scoped_addr(s)?;
     if let Ok(sa) = s.parse::<SocketAddr>() {
-        return Ok(match sa {
-            SocketAddr::V4(v4) => UdpEndpoint::V4(v4),
-            SocketAddr::V6(v6) => UdpEndpoint::V6(v6),
-        });
+        return Ok(UdpEndpoint::from(sa));
     }
 
     if let Ok(ip) = s.parse::<IpAddr>() {
@@ -358,38 +416,9 @@ fn resolve_udp_endpoints(
 
 fn parse_ip_addr(s: &str) -> Result<IpEndpoint, String> {
     reject_scoped_addr(s)?;
-    match s.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => Ok(IpEndpoint::V4(v4)),
-        Ok(IpAddr::V6(v6)) => Ok(IpEndpoint::v6(v6)),
-        Err(_) => Err(format!("invalid address '{s}'")),
-    }
-}
-
-fn parse_hex_cookie(s: &str, field: &str) -> CliResult<Cookie> {
-    if s.is_empty() {
-        return Ok(Cookie::none());
-    }
-    if !s.len().is_multiple_of(2) {
-        return Err(CliError::Usage(format!(
-            "invalid {field}: odd-length hex string"
-        )));
-    }
-
-    // Work on bytes: slicing the `str` would panic on multi-byte characters.
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for pair in s.as_bytes().chunks(2) {
-        if !pair.iter().all(u8::is_ascii_hexdigit) {
-            return Err(CliError::Usage(format!(
-                "invalid {field}: non-hex value"
-            )));
-        }
-        let hex = std::str::from_utf8(pair).unwrap_or_default();
-        let v = u8::from_str_radix(hex, 16).map_err(|_| {
-            CliError::Usage(format!("invalid {field}: non-hex value"))
-        })?;
-        out.push(v);
-    }
-    Ok(Cookie::try_from_bytes(out)?)
+    s.parse::<IpAddr>()
+        .map(IpEndpoint::from)
+        .map_err(|_| format!("invalid address '{s}'"))
 }
 
 fn flag_pair(on: bool, off: bool) -> Option<bool> {
@@ -432,6 +461,20 @@ async fn run_tunnel(
     }
 }
 
+async fn get_session(
+    handle: &L2tpHandle,
+    session: SessionRef,
+) -> CliResult<SessionInfo> {
+    Ok(match session {
+        SessionRef::Ids(tunnel_id, session_id) => {
+            handle.get_session(tunnel_id, session_id).await?
+        }
+        SessionRef::IfName(ifname) => {
+            handle.get_session_by_ifname(&ifname).await?
+        }
+    })
+}
+
 async fn run_session(
     cmd: SessionCmd,
     handle: &L2tpHandle,
@@ -440,26 +483,19 @@ async fn run_session(
     match cmd {
         SessionCmd::Create(args) => session_create(args, handle, out).await,
         SessionCmd::Delete(args) => {
+            let info = get_session(handle, args.session.resolve()?).await?;
             handle
-                .delete_session(
-                    TunnelId(args.tunnel_id),
-                    SessionId(args.session_id),
-                )
+                .delete_session(info.tunnel_id, info.session_id)
                 .await?;
             out.success(&format!(
                 "deleted session {} in tunnel {}",
-                args.session_id, args.tunnel_id
+                info.session_id, info.tunnel_id
             ));
             Ok(())
         }
         SessionCmd::Change(args) => session_change(args, handle, out).await,
         SessionCmd::Show(args) => {
-            let info = handle
-                .get_session(
-                    TunnelId(args.tunnel_id),
-                    SessionId(args.session_id),
-                )
-                .await?;
+            let info = get_session(handle, args.session.resolve()?).await?;
             out.session_info(&info);
             Ok(())
         }
@@ -474,16 +510,25 @@ async fn run_session(
             Ok(())
         }
         SessionCmd::Stats(args) => {
+            let info = get_session(handle, args.session.resolve()?).await?;
             let stats = handle
-                .session_stats(
-                    TunnelId(args.tunnel_id),
-                    SessionId(args.session_id),
-                )
+                .session_stats(info.tunnel_id, info.session_id)
                 .await?;
-            out.session_stats(args.tunnel_id, args.session_id, &stats);
+            out.session_stats(&info, &stats);
             Ok(())
         }
     }
+}
+
+async fn run_monitor(handle: &L2tpHandle, out: &Output) -> CliResult<()> {
+    let mut events = handle.events().await?;
+    while let Some(event) = events.next().await {
+        match event {
+            Ok(event) => out.event(&event),
+            Err(err) => out.error(&format!("cannot decode event: {err}")),
+        }
+    }
+    Ok(())
 }
 
 fn validate_persistent_tunnel_options(
@@ -534,6 +579,10 @@ async fn tunnel_create(
             Encapsulation::Ip { local, remote }
         }
     };
+    let version = match args.proto_version {
+        VersionArg::V2 => L2tpVersion::V2,
+        VersionArg::V3 => L2tpVersion::V3,
+    };
 
     let attempts = if args.tunnel_id.is_some() { 1 } else { 32 };
     for _ in 0..attempts {
@@ -554,12 +603,13 @@ async fn tunnel_create(
             tunnel_id,
             peer_tunnel_id,
             encapsulation.clone(),
-        )?;
+        )?
+        .with_version(version);
 
         match handle.create_unmanaged_tunnel(config).await {
             Ok(mut tunnel) => {
                 tunnel.set_auto_delete(false);
-                out.success(&format!("created tunnel {}", tunnel_id.0));
+                out.success(&format!("created tunnel {tunnel_id}"));
                 return Ok(());
             }
             Err(e)
@@ -598,21 +648,14 @@ async fn session_create(
     handle: &L2tpHandle,
     out: &Output,
 ) -> CliResult<()> {
-    let cookie =
-        parse_hex_cookie(args.cookie.as_deref().unwrap_or(""), "cookie")?;
-    let peer_cookie = parse_hex_cookie(
-        args.peer_cookie.as_deref().unwrap_or(""),
-        "peer-cookie",
-    )?;
-
     let config = SessionConfig {
         tunnel_id: TunnelId(args.tunnel_id),
         session_id: SessionId(args.session_id),
         peer_session_id: SessionId(args.peer_session_id),
         pseudowire_type: map_pw(args.pw_type),
         l2spec_type: map_l2spec(args.l2spec),
-        cookie,
-        peer_cookie,
+        cookie: args.cookie,
+        peer_cookie: args.peer_cookie,
         recv_seq: args.recv_seq,
         send_seq: args.send_seq,
         lns_mode: args.lns_mode,
@@ -634,6 +677,7 @@ async fn session_change(
     handle: &L2tpHandle,
     out: &Output,
 ) -> CliResult<()> {
+    let session = args.session.resolve()?;
     let modify = SessionModify {
         recv_seq: flag_pair(args.recv_seq, args.no_recv_seq),
         send_seq: flag_pair(args.send_seq, args.no_send_seq),
@@ -646,16 +690,13 @@ async fn session_change(
         return Ok(());
     }
 
+    let info = get_session(handle, session).await?;
     handle
-        .modify_session(
-            TunnelId(args.tunnel_id),
-            SessionId(args.session_id),
-            modify,
-        )
+        .modify_session(info.tunnel_id, info.session_id, modify)
         .await?;
     out.success(&format!(
         "updated session {} in tunnel {}",
-        args.session_id, args.tunnel_id
+        info.session_id, info.tunnel_id
     ));
     Ok(())
 }
@@ -725,6 +766,7 @@ pub(crate) async fn main() -> ExitCode {
     let result = match cli.cmd {
         Cmd::Tunnel(args) => run_tunnel(args.cmd, &handle, &out).await,
         Cmd::Session(args) => run_session(args.cmd, &handle, &out).await,
+        Cmd::Monitor(_) => run_monitor(&handle, &out).await,
     };
 
     match result {
@@ -740,6 +782,38 @@ pub(crate) async fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    fn parse_tunnel_create(argv: &[&str]) -> TunnelCreateArgs {
+        let Cli {
+            cmd:
+                Cmd::Tunnel(TunnelArgs {
+                    cmd: TunnelCmd::Create(args),
+                }),
+            ..
+        } = Cli::try_parse_from(argv).unwrap()
+        else {
+            panic!("expected tunnel create");
+        };
+        args
+    }
+
+    fn parse_session_create<I, T>(argv: I) -> SessionCreateArgs
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let Cli {
+            cmd:
+                Cmd::Session(SessionArgs {
+                    cmd: SessionCmd::Create(args),
+                }),
+            ..
+        } = Cli::try_parse_from(argv).unwrap()
+        else {
+            panic!("expected session create");
+        };
+        args
+    }
+
     #[test]
     fn persistent_tunnel_options_reject_socket_only_flags() {
         for extra in [vec![], vec!["--device", "lo"], vec!["--ipv6-dontfrag"]] {
@@ -753,16 +827,7 @@ mod tests {
                 "127.0.0.1:1701",
             ];
             argv.extend(&extra);
-            let Cli {
-                cmd:
-                    Cmd::Tunnel(TunnelArgs {
-                        cmd: TunnelCmd::Create(args),
-                    }),
-                ..
-            } = Cli::try_parse_from(argv).unwrap()
-            else {
-                panic!("expected tunnel create");
-            };
+            let args = parse_tunnel_create(&argv);
             let result = validate_persistent_tunnel_options(&args);
             if extra.is_empty() {
                 assert!(result.is_ok());
@@ -770,6 +835,46 @@ mod tests {
                 assert!(matches!(result, Err(CliError::Usage(_))));
             }
         }
+    }
+
+    #[test]
+    fn protocol_version_defaults_to_three() {
+        let args = parse_tunnel_create(&[
+            "l2tp",
+            "tunnel",
+            "create",
+            "--peer-tunnel-id",
+            "2",
+            "--remote",
+            "127.0.0.1:1701",
+        ]);
+        assert!(matches!(args.proto_version, VersionArg::V3));
+        let args = parse_tunnel_create(&[
+            "l2tp",
+            "tunnel",
+            "create",
+            "--peer-tunnel-id",
+            "2",
+            "--remote",
+            "127.0.0.1:1701",
+            "--proto-version",
+            "2",
+        ]);
+        assert!(matches!(args.proto_version, VersionArg::V2));
+        assert!(
+            Cli::try_parse_from([
+                "l2tp",
+                "tunnel",
+                "create",
+                "--peer-tunnel-id",
+                "2",
+                "--remote",
+                "127.0.0.1:1701",
+                "--proto-version",
+                "4",
+            ])
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -795,22 +900,49 @@ mod tests {
             if let Some(local) = local {
                 argv.extend(["--local", local]);
             }
-            let Cli {
-                cmd:
-                    Cmd::Tunnel(TunnelArgs {
-                        cmd: TunnelCmd::Create(args),
-                    }),
-                ..
-            } = Cli::try_parse_from(argv).unwrap()
-            else {
-                panic!("expected tunnel create");
-            };
+            let args = parse_tunnel_create(&argv);
             // The unsupported setting must fail before any netlink request,
             // without requiring L2TP support or CAP_NET_ADMIN.
             let err = tunnel_create(args, &handle, &out).await.unwrap_err();
             assert!(matches!(err, CliError::Usage(_)));
             assert!(err.to_string().contains("--no-udp-csum"));
             assert!(err.to_string().contains("IPv4-mapped"));
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_tunnels_reject_link_local_addresses() {
+        let handle = L2tpHandle::new().await.unwrap();
+        let out = Output::new(OutputFmt::Text);
+        for (encap, local, remote, expected) in [
+            // Zone suffixes are rejected while parsing.
+            ("ip", "fe80::1%eth0", "fe80::2", "interface-scoped"),
+            (
+                "udp",
+                "[::]:1701",
+                "[fe80::2%eth0]:1701",
+                "interface-scoped",
+            ),
+            // Plain link-local addresses fail before any netlink request.
+            ("ip", "fe80::1", "fe80::2", "link-local"),
+            ("udp", "[::]:1701", "[fe80::2]:1701", "link-local"),
+        ] {
+            let args = parse_tunnel_create(&[
+                "l2tp",
+                "tunnel",
+                "create",
+                "--peer-tunnel-id",
+                "2",
+                "--encap",
+                encap,
+                "--local",
+                local,
+                "--remote",
+                remote,
+            ]);
+            let err = tunnel_create(args, &handle, &out).await.unwrap_err();
+            assert!(matches!(err, CliError::Usage(_)), "{err}");
+            assert!(err.to_string().contains(expected), "{err}");
         }
     }
 
@@ -832,18 +964,8 @@ mod tests {
             .err()
             .expect("an invalid name must be rejected");
         assert!(err.to_string().contains("invalid interface name"), "{err}");
-        let Cli {
-            cmd:
-                Cmd::Session(SessionArgs {
-                    cmd: SessionCmd::Create(args),
-                }),
-            ..
-        } = Cli::try_parse_from(base.iter().chain(["l2tpeth0"].iter()))
-            .unwrap()
-        else {
-            panic!("expected session create");
-        };
-        assert_eq!(args.ifname.unwrap().to_str(), Some("l2tpeth0"));
+        let args = parse_session_create(base.iter().chain(["l2tpeth0"].iter()));
+        assert_eq!(args.ifname.unwrap().to_str().unwrap(), "l2tpeth0");
 
         // Names are byte strings, so arguments need not be UTF-8.
         let raw =
@@ -853,16 +975,7 @@ mod tests {
             .map(OsString::from)
             .chain(std::iter::once(raw))
             .collect();
-        let Cli {
-            cmd:
-                Cmd::Session(SessionArgs {
-                    cmd: SessionCmd::Create(args),
-                }),
-            ..
-        } = Cli::try_parse_from(argv).unwrap()
-        else {
-            panic!("expected session create");
-        };
+        let args = parse_session_create(argv);
         assert_eq!(args.ifname.unwrap().as_bytes(), b"eth\xff0");
 
         let err = Cli::try_parse_from([
@@ -882,31 +995,89 @@ mod tests {
     }
 
     #[test]
-    fn hex_cookie_parsing_rejects_bad_input_without_panicking() {
-        assert_eq!(
-            parse_hex_cookie("deadbeef", "cookie").unwrap().as_bytes(),
-            &[0xde, 0xad, 0xbe, 0xef]
+    fn cookies_are_parsed_as_hex_while_parsing() {
+        let base = [
+            "l2tp",
+            "session",
+            "create",
+            "--tunnel-id",
+            "1",
+            "--session-id",
+            "2",
+            "--peer-session-id",
+            "3",
+        ];
+        let args = parse_session_create(base);
+        assert!(args.cookie.is_empty());
+        let args = parse_session_create(base.iter().copied().chain([
+            "--cookie",
+            "deadbeef",
+            "--peer-cookie",
+            "",
+        ]));
+        assert_eq!(args.cookie.as_bytes(), &[0xde, 0xad, 0xbe, 0xef]);
+        assert!(args.peer_cookie.is_empty());
+        // Multi-byte characters, sign characters and odd lengths are errors.
+        for bad in ["aéb", "éé", "+1+2+3+4", "abc", "zzzzzzzz", "abcdef"] {
+            let err = Cli::try_parse_from(
+                base.iter().copied().chain(["--cookie", bad]),
+            )
+            .err()
+            .expect("an invalid cookie must be rejected");
+            assert!(err.to_string().contains("cookie"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn session_selectors_need_ids_or_an_interface_name() {
+        let parse = |argv: &[&str]| -> CliResult<SessionRef> {
+            let Cli {
+                cmd:
+                    Cmd::Session(SessionArgs {
+                        cmd: SessionCmd::Show(args),
+                    }),
+                ..
+            } = Cli::try_parse_from(argv)
+                .map_err(|e| CliError::Usage(e.to_string()))?
+            else {
+                panic!("expected session show");
+            };
+            args.session.resolve()
+        };
+        assert!(matches!(
+            parse(&[
+                "l2tp",
+                "session",
+                "show",
+                "--tunnel-id",
+                "1",
+                "--session-id",
+                "2"
+            ]),
+            Ok(SessionRef::Ids(TunnelId(1), SessionId(2)))
+        ));
+        assert!(matches!(
+            parse(&["l2tp", "session", "show", "--ifname", "l2tpeth0"]),
+            Ok(SessionRef::IfName(name)) if name.as_bytes() == b"l2tpeth0"
+        ));
+        assert!(parse(&["l2tp", "session", "show"]).is_err());
+        assert!(
+            parse(&["l2tp", "session", "show", "--tunnel-id", "1"]).is_err()
         );
         assert!(
-            parse_hex_cookie("", "cookie")
-                .unwrap()
-                .as_bytes()
-                .is_empty()
+            parse(&[
+                "l2tp",
+                "session",
+                "show",
+                "--tunnel-id",
+                "1",
+                "--session-id",
+                "2",
+                "--ifname",
+                "l2tpeth0"
+            ])
+            .is_err()
         );
-        // Multi-byte characters, sign characters and odd lengths are errors.
-        for bad in ["aéb", "éé", "+1+2+3+4", "abc", "zzzzzzzz"] {
-            assert!(
-                matches!(
-                    parse_hex_cookie(bad, "cookie"),
-                    Err(CliError::Usage(_))
-                ),
-                "{bad:?} should be rejected"
-            );
-        }
-        assert!(matches!(
-            parse_hex_cookie("abcdef", "cookie"),
-            Err(CliError::L2tp(l2tp::Error::InvalidCookieLength(3)))
-        ));
     }
 
     #[test]
@@ -915,51 +1086,5 @@ mod tests {
             (0..32).map(|_| random_tunnel_id().unwrap()).collect();
         assert!(ids.iter().all(|&id| id >= 1_000_000));
         assert!(ids.windows(2).any(|w| w[0] != w[1]));
-    }
-
-    #[tokio::test]
-    async fn persistent_tunnels_reject_link_local_addresses() {
-        let handle = L2tpHandle::new().await.unwrap();
-        let out = Output::new(OutputFmt::Text);
-        for (encap, local, remote, expected) in [
-            // Zone suffixes are rejected while parsing.
-            ("ip", "fe80::1%eth0", "fe80::2", "interface-scoped"),
-            (
-                "udp",
-                "[::]:1701",
-                "[fe80::2%eth0]:1701",
-                "interface-scoped",
-            ),
-            // Plain link-local addresses fail before any netlink request.
-            ("ip", "fe80::1", "fe80::2", "link-local"),
-            ("udp", "[::]:1701", "[fe80::2]:1701", "link-local"),
-        ] {
-            let argv = [
-                "l2tp",
-                "tunnel",
-                "create",
-                "--peer-tunnel-id",
-                "2",
-                "--encap",
-                encap,
-                "--local",
-                local,
-                "--remote",
-                remote,
-            ];
-            let Cli {
-                cmd:
-                    Cmd::Tunnel(TunnelArgs {
-                        cmd: TunnelCmd::Create(args),
-                    }),
-                ..
-            } = Cli::try_parse_from(argv).unwrap()
-            else {
-                panic!("expected tunnel create");
-            };
-            let err = tunnel_create(args, &handle, &out).await.unwrap_err();
-            assert!(matches!(err, CliError::Usage(_)), "{err}");
-            assert!(err.to_string().contains(expected), "{err}");
-        }
     }
 }

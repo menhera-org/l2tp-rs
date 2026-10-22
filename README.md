@@ -1,32 +1,42 @@
 # l2tp-rs
 
-High-level async L2TPv3 control API for Linux Generic Netlink.
+High-level async control API for the Linux kernel's L2TP subsystem, with a
+blocking counterpart, over Generic Netlink.
 
-This crate focuses on L2TP tunnel/session lifecycle and query operations only.
-It does **not** configure interfaces/bridges/routes (`rtnetlink` tasks belong in a separate crate).
+This crate covers the tunnel and session lifecycle, lookups, statistics and
+notifications of the kernel's `l2tp` family, the managed tunnel sockets behind
+tunnels, and the `PPPoL2TP` sockets behind PPP pseudowires. It does **not**
+configure interfaces, bridges or routes; `rtnetlink` tasks belong in a
+separate crate.
 
 ## Requirements
 
 - Linux. On other platforms the crate compiles but exposes no API, and the `l2tp`
   binary only reports that the platform is unsupported.
 - Rust 1.89 or newer (required by the netlink dependencies).
-- Linux kernel with L2TP Generic Netlink support (`l2tp` family).
-- Tokio runtime with its I/O driver enabled. `L2tpHandle::new` returns an
-  error without one.
+- Linux kernel with L2TP Generic Netlink support (`l2tp` family). Ethernet
+  pseudowires need `l2tp_eth`, PPP pseudowires `l2tp_ppp`, and IP
+  encapsulation `l2tp_ip` or `l2tp_ip6`.
+- Tokio runtime with its I/O driver enabled, or the `blocking` module, which
+  brings its own.
 - `CAP_NET_ADMIN` (or root) for every L2TP netlink command, including `get`
-  and `list`; the kernel marks them all `GENL_UNS_ADMIN_PERM`.
+  and `list`; the kernel marks them all `GENL_UNS_ADMIN_PERM`. Subscribing to
+  notifications needs no privilege.
 
 ## Installation
 
 ```toml
 [dependencies]
-l2tp = "0.3"
+l2tp = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 ### Cargo features
 
-- `serde`: derives `Serialize`/`Deserialize` for `TunnelStats` and `SessionStats`.
+- `serde`: `Serialize`/`Deserialize` for the configuration, information,
+  event, identifier and statistics types. Endpoints are strings such as
+  `192.0.2.1:1701` or `fe80::1%eth0`, cookies are hexadecimal strings, and
+  interface names are strings, or byte arrays when they are not UTF-8.
 - `cli`: builds the `l2tp` command-line tool (implies `serde`).
 
 No features are enabled by default, so library users do not pull in the CLI's
@@ -34,14 +44,16 @@ dependencies.
 
 ## Command-Line Tool
 
-The `l2tp` binary is behind the `cli` feature since 0.3. If you previously
-installed it with `cargo install l2tp`, install it with:
+The `l2tp` binary is behind the `cli` feature. Install it with:
 
 ```bash
 cargo install --features cli l2tp
 ```
 
-From a checkout, use `cargo run --features cli -- <args>`.
+From a checkout, use `cargo run --features cli -- <args>`. Besides tunnel and
+session management, `l2tp monitor` prints kernel notifications as they
+happen, and sessions can be selected by `--ifname` instead of their
+identifiers.
 
 ## Quick Start
 
@@ -61,9 +73,6 @@ async fn main() -> l2tp::Result<()> {
     let local = UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1701));
     let remote = UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 1701));
 
-    // Managed socket: fd is passed via L2TP_ATTR_FD and owned by TunnelHandle.
-    let socket = TunnelSocket::udp(&local, &remote, None)?;
-
     let tunnel_cfg = TunnelConfig::new(
         TunnelId(1000),
         TunnelId(2000),
@@ -76,6 +85,8 @@ async fn main() -> l2tp::Result<()> {
         },
     )?;
 
+    // Managed socket: fd is passed via L2TP_ATTR_FD and owned by TunnelHandle.
+    let socket = TunnelSocket::for_config(&tunnel_cfg, None)?;
     let tunnel = handle.create_tunnel(tunnel_cfg, socket).await?;
 
     let session_cfg = SessionConfig::eth(tunnel.tunnel_id(), SessionId(3000), SessionId(4000));
@@ -101,7 +112,7 @@ async fn main() -> l2tp::Result<()> {
     let local = IpEndpoint::V4(Ipv4Addr::new(192, 0, 2, 1));
     let remote = IpEndpoint::V4(Ipv4Addr::new(192, 0, 2, 2));
 
-    let socket = TunnelSocket::ip(&local, &remote, None, TunnelId(5000))?;
+    let socket = TunnelSocket::ip(&local, &remote, None, TunnelId(5000), TunnelId(6000))?;
     let cfg = TunnelConfig::new(
         TunnelId(5000),
         TunnelId(6000),
@@ -123,7 +134,7 @@ The scopes of both endpoints and the `device` must name the same interface.
 
 ```rust,no_run
 use l2tp::{
-    Encapsulation, IfName, IpEndpoint, L2tpHandle, TunnelConfig, TunnelId,
+    Encapsulation, IpEndpoint, L2tpHandle, L2tpIfName, TunnelConfig, TunnelId,
     TunnelSocket,
 };
 use std::net::Ipv6Addr;
@@ -132,18 +143,18 @@ use std::net::Ipv6Addr;
 async fn main() -> l2tp::Result<()> {
     let handle = L2tpHandle::new().await?;
 
-    let eth0: IfName = "eth0".parse()?;
+    let eth0: L2tpIfName = "eth0".parse()?;
     let local =
         IpEndpoint::v6_scoped(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), eth0);
     // A link-local peer without a scope uses the local endpoint's interface.
     let remote = IpEndpoint::v6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2));
 
-    let socket = TunnelSocket::ip(&local, &remote, None, TunnelId(7000))?;
     let cfg = TunnelConfig::new(
         TunnelId(7000),
         TunnelId(8000),
         Encapsulation::Ip { local, remote },
     )?;
+    let socket = TunnelSocket::for_config(&cfg, None)?;
 
     let _tunnel = handle.create_tunnel(cfg, socket).await?;
     Ok(())
@@ -151,10 +162,12 @@ async fn main() -> l2tp::Result<()> {
 ```
 
 UDP endpoints carry the numeric scope ID of `SocketAddrV6`. Resolve the name
-with `IfName::index()` right before creating or reconnecting the socket:
+with `L2tpIfNameExt::index` right before creating or reconnecting the socket:
 
 ```rust,ignore
-let scope_id = IfName::new("eth0")?.index()?;
+use l2tp::L2tpIfNameExt;
+
+let scope_id = L2tpIfName::new("eth0")?.index()?;
 let local = UdpEndpoint::V6(SocketAddrV6::new(link_local, 1701, 0, scope_id));
 ```
 
@@ -166,50 +179,155 @@ the socket is created.
 Unmanaged tunnels cannot use link-local endpoints, because the kernel creates
 their socket without an interface scope; `create_unmanaged_tunnel` returns
 `Error::UnmanagedLinkLocal` before contacting the kernel. Re-creating a tunnel
-after its interface disappears is left to the application; this crate does
-not watch rtnetlink link events.
+after its interface disappears is left to the application; subscribe to
+[events](#events) to notice it.
+
+## Protocol Versions
+
+`TunnelConfig::new` creates L2TPv3 tunnels. `with_version(L2tpVersion::V2)`
+creates an L2TPv2 tunnel, whose sessions are PPP pseudowires with 16-bit
+identifiers; the kernel ignores cookies and the L2-specific sublayer for
+them. Ethernet pseudowires need version 3. `TunnelInfo::version` reports the
+version of an existing tunnel.
+
+## PPP Pseudowires
+
+A PPP session created through netlink becomes usable once a `PPPoL2TP`
+socket is connected to it. `PppSocket::connect` attaches to the session and
+yields the descriptor that carries PPP frames; PPP negotiation stays in user
+space, for example in `pppd` with its `pppol2tp <fd>` option. `PppUnit`
+creates a `pppN` interface and `PppUnit::connect_channel` connects the
+channel to it for applications that implement PPP themselves.
+
+```rust,no_run
+use l2tp::{L2tpHandle, L2tpVersion, PppSocket, SessionConfig, SessionId, TunnelId};
+
+#[tokio::main]
+async fn main() -> l2tp::Result<()> {
+    let handle = L2tpHandle::new().await?;
+    // The tunnel was created earlier, managed or unmanaged.
+    let tunnel = handle.open_tunnel(TunnelId(1000)).await?;
+    let session = handle
+        .create_session(SessionConfig::ppp(tunnel.tunnel_id(), SessionId(1), SessionId(2)))
+        .await?;
+    let ppp = PppSocket::connect(
+        L2tpVersion::V3,
+        tunnel.tunnel_id(),
+        TunnelId(2000),
+        session.session_id(),
+        SessionId(2),
+    )?;
+    let _channel = ppp.channel_index()?;
+    Ok(())
+}
+```
+
+## Events
+
+The kernel announces tunnel and session creation, modification and deletion
+on the `l2tp` multicast group, including tunnels it tears down when a managed
+socket closes. `L2tpHandle::events` returns a `Stream` of `L2tpEvent`; the
+blocking handle returns an iterator.
+
+```rust,no_run
+use futures::StreamExt;
+use l2tp::{L2tpEvent, L2tpHandle};
+
+#[tokio::main]
+async fn main() -> l2tp::Result<()> {
+    let handle = L2tpHandle::new().await?;
+    let mut events = handle.events().await?;
+    while let Some(event) = events.next().await {
+        match event? {
+            L2tpEvent::TunnelDeleted(info) => println!("tunnel {} is gone", info.tunnel_id),
+            other => println!("{other:?}"),
+        }
+    }
+    Ok(())
+}
+```
+
+## Blocking API
+
+`l2tp::blocking::L2tpHandle` mirrors the async handle with blocking methods.
+It runs a dedicated thread with its own Tokio runtime, so it works from plain
+threads, from `tokio::task::spawn_blocking`, and from code that already runs a
+runtime of its own. Its handles hand their async counterparts back to the
+worker thread on drop, so auto-delete keeps working.
+
+```rust,no_run
+use l2tp::{TunnelId, blocking::L2tpHandle};
+
+fn main() -> l2tp::Result<()> {
+    let handle = L2tpHandle::new()?;
+    for tunnel in handle.list_tunnels()? {
+        println!("{tunnel:?}");
+    }
+    let _stats = handle.tunnel_stats(TunnelId(1000))?;
+    Ok(())
+}
+```
+
+## Network Namespaces
+
+Sockets belong to the network namespace of the thread that creates them.
+`NetNs` opens a namespace file such as `/run/netns/<name>`, `NetNs::run`
+executes a closure on a thread inside it, and `L2tpHandle::new_in` controls
+the L2TP subsystem of that namespace. Entering a namespace needs
+`CAP_SYS_ADMIN`.
+
+```rust,no_run
+use l2tp::{L2tpHandle, NetNs, TunnelConfig, TunnelSocket};
+
+async fn in_namespace(cfg: TunnelConfig) -> l2tp::Result<()> {
+    let netns = NetNs::open("/run/netns/blue")?;
+    let handle = L2tpHandle::new_in(&netns).await?;
+    let socket_cfg = cfg.clone();
+    let socket = netns.run(move || TunnelSocket::for_config(&socket_cfg, None))??;
+    let _tunnel = handle.create_tunnel(cfg, socket).await?;
+    Ok(())
+}
+```
 
 ## Interface Names
 
-`IfName` is a checked, `Copy` value for Linux interface names, stored
-NUL-padded like the kernel's `char ifname[IFNAMSIZ]`. `IfName::new`,
-`str::parse` and the `TryFrom` conversions from `&str`, `String`, `&[u8]`,
-`Vec<u8>`, `&OsStr`, `&CStr` and `[u8; IFNAMSIZ]` validate the name with the
-kernel's `dev_valid_name()` rules: non-empty, at most `IFNAMSIZ - 1` bytes,
-not `.` or `..`, and no NUL, `/`, `:` or whitespace. A rejected name yields
-`Error::InvalidIfName` with an `IfNameError` that names the rule.
-
-Names are byte strings and need not be UTF-8. Read one back with `as_bytes`,
-`as_array`, `to_str` (`None` for a non-UTF-8 name), `to_string_lossy`,
-`as_os_str`, `as_c_str`, `Display` (lossy) or the `From<IfName>` conversions
-into `[u8; IFNAMSIZ]`, `Vec<u8>` and `OsString`. `IfName::index` and
-`IfName::from_index` convert between names and the kernel's interface
-indexes. Interface names appear in the public API only as `IfName`; the CLI
-validates `--ifname` and `--device` while parsing and accepts non-UTF-8
+Interface names are `L2tpIfName`, the checked, `Copy` type of
+`netlink-packet-l2tp` that this crate re-exports. It stores the kernel's
+NUL-padded `char ifname[IFNAMSIZ]` buffer and applies the kernel's
+`dev_valid_name()` rules: 1 to 15 bytes, not `.` or `..`, and no NUL, `/`,
+`:` or whitespace. Construct one with `L2tpIfName::new`, `str::parse` or
+`TryFrom`, read it back with `as_bytes`, `as_array`, `to_str`,
+`to_string_lossy` or `Display`, and convert it with the `L2tpIfNameExt`
+extension trait: `index` and `from_index` map names to the kernel's
+interface indexes, and `as_os_str` yields an `OsStr`. Names are byte strings
+and need not be UTF-8. A rejected name is reported as `Error::Netlink`; the
+CLI validates `--ifname` and `--device` while parsing and accepts non-UTF-8
 arguments.
 
-`netlink-packet-l2tp` 0.3 carries `L2TP_ATTR_IFNAME` as a `String`. Until a
-release that carries the raw bytes is adopted, creating a session with a
-non-UTF-8 interface name fails with `Error::Netlink`, and a session listing
-that contains such a name fails to decode.
+## Sockets
 
-## Binding Managed Sockets to an Interface
-
-Use `IfName` with managed sockets:
-
-- At creation:
-  - `TunnelSocket::udp(..., Some(&ifname))`
-  - `TunnelSocket::ip(..., Some(&ifname), ...)`
-- After creation:
-  - `tunnel.socket().unwrap().bind_to_device(&ifname)?`
-
-`SO_BINDTODEVICE` requires `CAP_NET_RAW`. A link-local scope only selects the
-interface of a link-local address and needs no extra capability.
+- `TunnelSocket::for_config` creates the socket a `TunnelConfig` describes;
+  `TunnelSocket::udp` and `TunnelSocket::ip` are the lower-level
+  constructors.
+- `TunnelSocket::from_fd` adopts a bound and connected datagram socket
+  prepared elsewhere, for example with `socket2` or through socket
+  activation, and `TunnelConfig::for_socket` describes such a socket. The
+  socket's addresses, bound device, link-local scope and peer connection ID
+  are read back from the kernel.
+- `set_tos`, `set_hop_limit`, `set_mark`, `set_pmtu_discovery` and
+  `set_ipv6_dontfrag` cover the common options of tunnel traffic;
+  `bind_to_device` applies `SO_BINDTODEVICE`, which needs `CAP_NET_RAW`.
+- `local_addr_udp`, `peer_addr_udp`, `local_addr_ip` and `peer_addr_ip`
+  report the current addresses.
+- The kernel delivers L2TP control messages on the tunnel socket.
+  `TunnelSocket` implements `AsFd`, and `try_clone_fd` duplicates the
+  descriptor so the control plane can wrap it in an async UDP socket.
 
 ## Kernel Semantics Notes
 
 - `L2TP_ATTR_IFNAME` applies to sessions (`SESSION_CREATE`/session lookups), not tunnels.
-  Tunnels do not create a netdevice.
+  Tunnels do not create a netdevice. Sessions can be looked up, modified and
+  deleted by interface name.
 - The kernel reports the IPv4 UDP checksum setting (`L2TP_ATTR_UDP_CSUM`) only
   for IPv4 sockets. `TunnelInfo` therefore shows `udp_csum: false` for every
   IPv6 tunnel, even when its IPv4-mapped peer receives checksums.
@@ -240,11 +358,17 @@ let sessions = handle.list_all_sessions().await?;
 
 let tstats = handle.tunnel_stats(TunnelId(1000)).await?;
 let sstats = handle.session_stats(TunnelId(1000), SessionId(3000)).await?;
+
+// Existing objects, for example created by another process.
+let tunnel = handle.open_tunnel(TunnelId(1000)).await?;
+let session = handle.open_session_by_ifname(&"l2tpeth0".parse()?).await?;
 ```
 
 ## Handle Lifetime
 
-- `TunnelHandle` and `SessionHandle` default to `auto_delete = true`.
+- `TunnelHandle` and `SessionHandle` returned by the `create_*` methods
+  default to `auto_delete = true`; those returned by the `open_*` methods
+  default to `false`.
 - Tunnel and session creation keeps ownership through the kernel acknowledgement
   even if the caller is cancelled. Successful creations that the caller no longer
   receives are cleaned up. Keep the Tokio runtime running until this work finishes.
@@ -267,33 +391,43 @@ match handle.create_unmanaged_tunnel(cfg).await {
 }
 ```
 
-`Error::raw_os_error()` returns the raw errno when one is available.
+`Error::raw_os_error()` returns the raw errno when one is available. No
+public function panics on its input; conditions such as a missing Tokio I/O
+driver, an invalid interface name or an unsupported protocol version are
+reported as errors.
+
+## Logging
+
+The crate logs netlink requests and failures through the `log` crate at
+`debug` and `trace` level.
 
 ## Upgrading from 0.2
+
+0.3.0 was never published; its changes ship in 0.4.0.
 
 - The `l2tp` binary now requires `--features cli` (see above).
 - `serde` derives on the statistics types now require the `serde` feature.
 - Modules are private; import everything from the crate root (e.g. `l2tp::L2tpHandle`).
 - `TunnelModify`, `TunnelHandle::modify` and `L2tpHandle::modify_tunnel` were removed:
   the kernel accepted these requests but did not apply their UDP checksum setting.
-- `TunnelSocket::ip` takes a `TunnelId` instead of a `u32`.
+- `TunnelSocket::ip` takes `TunnelId`s for the tunnel and its peer instead of a `u32`.
 - `IpEndpoint::V6` is a struct variant with an `addr` and an optional
   interface `scope`; use `IpEndpoint::v6(addr)` or
   `IpEndpoint::v6_scoped(addr, ifname)`. Link-local endpoints without a scope
   are rejected with `Error::ScopeRequired` by `TunnelSocket::ip` and
   `TunnelSocket::udp`, and unmanaged tunnels reject link-local endpoints
   with `Error::UnmanagedLinkLocal`.
+- Interface names are `L2tpIfName` from `netlink-packet-l2tp`; the crate's
+  own `IfName` is gone, and `L2tpIfNameExt` adds the OS conversions.
+- `TunnelInfo::proto_version` is `TunnelInfo::version`, an `L2tpVersion`.
+- `SessionInfo` gained `peer_tunnel_id`, `cookie` and `peer_cookie`.
+- `Cookie` is `Copy`, parses from hexadecimal, and is built with `TryFrom` or
+  `From<[u8; 4]>`/`From<[u8; 8]>` instead of `try_from_bytes`.
 - `L2tpHandle::new` returns `Error::Io` instead of panicking when the Tokio
   runtime has no I/O driver.
-- `IfName` is a `Copy` value holding the kernel's NUL-padded
-  `[u8; IFNAMSIZ]` buffer, and names need not be UTF-8. `as_str` is replaced
-  by `to_str`, `to_string_lossy` and `as_bytes`; `AsRef<str>` and
-  `From<IfName> for String` by `AsRef<[u8]>`, `AsRef<OsStr>`, `AsRef<CStr>`
-  and `From<IfName>` for `[u8; IFNAMSIZ]`, `Vec<u8>` and `OsString`.
-- `Error::InvalidIfName` carries an `IfNameError` reason instead of the
-  rejected string.
 - `Error` is `#[non_exhaustive]`. `Error::Netlink` holds a message instead of a
-  `netlink-packet-core` type. Malformed kernel replies are reported as
+  `netlink-packet-core` type and also reports invalid attribute values such as
+  interface names. Malformed kernel replies are reported as
   `Error::UnexpectedReply` instead of a synthetic `KernelError`, and socket
   encapsulation mismatches as `Error::EncapsulationMismatch` instead of
   `Error::UnmanagedSocket`. `TunnelSocket::set_ipv6_dontfrag` errors are `Error::Io`.

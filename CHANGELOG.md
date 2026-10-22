@@ -1,6 +1,68 @@
 # Changelog
 
-## 0.3.0
+## 0.4.0
+
+0.3.0 was never published; its changes, listed below, ship together with
+these.
+
+### Breaking changes
+
+- Interface names are `L2tpIfName` from `netlink-packet-l2tp` 0.4, which this
+  crate re-exports. The crate's own `IfName` and `IfNameError` are gone;
+  `L2tpIfNameExt` adds `index`, `from_index` and `as_os_str`. Names are byte
+  strings and need not be UTF-8, including in the netlink attributes. A
+  rejected name is reported as `Error::Netlink`, into which
+  `netlink_packet_core::DecodeError` converts.
+- `TunnelInfo::proto_version` is `TunnelInfo::version`, an `L2tpVersion`.
+- `TunnelSocket::ip` takes the peer tunnel identifier, so the kernel records
+  the peer connection ID.
+- `Cookie` is `Copy`; `try_from_bytes` is replaced by `TryFrom<&[u8]>`,
+  `TryFrom<Vec<u8>>`, `From<[u8; 4]>` and `From<[u8; 8]>`.
+- `PppUnit::new`, `PppUnit::with_index`, `PppUnit::connect_channel` and
+  `PppSocket::channel_index` return `l2tp::Result`.
+
+### Added
+
+- L2TPv2 tunnels: `TunnelConfig::with_version(L2tpVersion::V2)`.
+- PPP pseudowires: `SessionConfig::ppp`, `PppSocket` to attach a `PPPoL2TP`
+  socket to a session, and `PppUnit` and `PppChannel` to create a `pppN`
+  interface and connect the channel to it.
+- Kernel notifications: `L2tpHandle::events` streams `L2tpEvent`s from the
+  `l2tp` multicast group.
+- Session lookup, deletion, modification and statistics by interface name:
+  `get_session_by_ifname`, `delete_session_by_ifname`,
+  `modify_session_by_ifname`, `session_stats_by_ifname`.
+- `SessionInfo` reports `peer_tunnel_id`, `cookie` and `peer_cookie`.
+- Handles for existing objects: `open_tunnel`, `open_session` and
+  `open_session_by_ifname`, with auto-delete disabled.
+- Managed sockets: `TunnelSocket::for_config`, `TunnelSocket::from_fd` and
+  `TunnelConfig::for_socket` for sockets prepared elsewhere; `set_tos`,
+  `set_hop_limit`, `set_mark` and `set_pmtu_discovery`; `peer_addr_udp`,
+  `local_addr_ip` and `peer_addr_ip`; `AsFd`, `try_clone_fd` and `into_fd`.
+- Blocking API: `l2tp::blocking::L2tpHandle`, `TunnelHandle`,
+  `SessionHandle` and `EventIter`, backed by a dedicated thread and runtime
+  so they work from `tokio::task::spawn_blocking` and other runtimes.
+- Network namespaces: `NetNs`, `NetNs::run` and `L2tpHandle::new_in`.
+- `serde` derives for the configuration, information, event, identifier and
+  statistics types; `Cookie` serializes as hexadecimal and `L2tpIfName`
+  fields as strings or bytes.
+- `Display`, `Ord` and `From<u32>` for `TunnelId` and `SessionId`;
+  `Cookie` parses from hexadecimal and prints as such; `From<SocketAddr>`
+  for `UdpEndpoint` and `From<IpAddr>` for `IpEndpoint`.
+- `UdpEndpoint` and `IpEndpoint` display, parse and serialize as strings
+  such as `192.0.2.1:1701`, `[fe80::1%2]:1701` and `fe80::1%eth0`; a
+  malformed string is `Error::InvalidEndpoint`.
+- Netlink requests and failures are logged through `log`.
+- CLI: `--proto-version`, `--ifname` as a session selector, cookies and
+  peer tunnel identifiers in session output, and `l2tp monitor`.
+
+### Fixed
+
+- No public function panics on its input. `run_creation` no longer unwraps
+  the task result, the CLI output never unwraps JSON encoding, and the
+  blocking handles never unwrap their inner state.
+
+## 0.3.0 (unreleased)
 
 ### Breaking changes
 
@@ -17,15 +79,6 @@
 - `IpEndpoint::V6` is a struct variant with an `addr` and an optional
   interface `scope`. Construct it with `IpEndpoint::v6` or
   `IpEndpoint::v6_scoped`.
-- `IfName` is a `Copy` value holding the kernel's NUL-padded
-  `[u8; IFNAMSIZ]` buffer. Names are byte strings and need not be UTF-8, so
-  `as_str` is replaced by `to_str`, `to_string_lossy` and `as_bytes`, and
-  `AsRef<str>` and `From<IfName> for String` by `AsRef<[u8]>`,
-  `AsRef<OsStr>`, `AsRef<CStr>` and `From<IfName>` for `[u8; IFNAMSIZ]`,
-  `Vec<u8>` and `OsString`.
-- `Error::InvalidIfName` carries an `IfNameError` that says why the name was
-  rejected, instead of the rejected string. Interface names appear in the
-  public API only as `IfName`.
 - `Error` is `#[non_exhaustive]`. `Error::Netlink` holds a message instead of a
   `netlink-packet-core` type. Malformed kernel replies are
   `Error::UnexpectedReply`, operations on a socket of the wrong encapsulation
@@ -37,8 +90,8 @@
 - `TunnelInfo`, `SessionInfo`, `TunnelStats` and `SessionStats` are
   `#[non_exhaustive]`.
 - Minimum supported Rust version is 1.89, required by the updated netlink
-  dependencies (`netlink-packet-l2tp` 0.3, `netlink-packet-core` 0.9,
-  `netlink-packet-generic` 0.5, `genetlink` 0.3).
+  dependencies (`netlink-packet-core` 0.9, `netlink-packet-generic` 0.5,
+  `genetlink` 0.3).
 
 ### Fixed
 
@@ -65,7 +118,6 @@
   instead of returning partial results.
 - Mismatched local and remote address families return
   `Error::AddressFamilyMismatch` instead of panicking.
-- `IfName` validation matches the kernel's `dev_valid_name()`.
 - CLI: `tunnel create` creates an unmanaged tunnel that outlives the process.
   Previously the tunnel was torn down when the command exited and closed its
   socket.
@@ -76,31 +128,18 @@
   runtime was built without its I/O driver.
 - Link-local IPv6 endpoints are rejected early where the kernel cannot use
   them: `Error::ScopeRequired` for a managed socket without an interface
-  scope (an `IfName` for IP endpoints, a `SocketAddrV6` scope ID or `device`
-  for UDP endpoints), and `Error::UnmanagedLinkLocal` for unmanaged tunnels,
-  whose kernel-created socket has no scope. Previously the kernel returned a
-  bare `EINVAL`.
+  scope (an interface name for IP endpoints, a `SocketAddrV6` scope ID or
+  `device` for UDP endpoints), and `Error::UnmanagedLinkLocal` for unmanaged
+  tunnels, whose kernel-created socket has no scope. Previously the kernel
+  returned a bare `EINVAL`.
 
 ### Added
 
 - Interface scopes for link-local L2TP/IP endpoints: `IpEndpoint::v6_scoped`
-  takes an `IfName` that is resolved to the interface index each time the
-  socket binds, connects or reconnects, so a re-created interface keeps
+  takes an interface name that is resolved to the interface index each time
+  the socket binds, connects or reconnects, so a re-created interface keeps
   working. The scopes of both endpoints and the `device` must agree
-  (`Error::ScopeMismatch`). `IfName::index` and `IfName::from_index` convert
-  between names and indexes, for example to build `SocketAddrV6` scope IDs
-  for UDP endpoints.
-- `IfName` implements `FromStr`, `TryFrom` for `&str`, `String`, `&[u8]`,
-  `Vec<u8>`, `&OsStr`, `&CStr` and `[u8; IFNAMSIZ]`, `AsRef` for `[u8]`,
-  `OsStr` and `CStr`, `From<IfName>` for `[u8; IFNAMSIZ]`, `Vec<u8>` and
-  `OsString`, `Hash` and `Ord`, and has `as_bytes`, `as_array`, `to_str`,
-  `to_string_lossy`, `as_os_str`, `as_c_str` and `MAX_LEN`. The crate
-  exports `IFNAMSIZ`. The CLI accepts non-UTF-8 `--ifname` and `--device`
-  arguments.
-- Known limitation: `netlink-packet-l2tp` 0.3 carries `L2TP_ATTR_IFNAME` as
-  a `String`, so creating a session with a non-UTF-8 interface name fails
-  with `Error::Netlink` and a listing containing one fails to decode. The
-  next `netlink-packet-l2tp` release carries the raw bytes.
+  (`Error::ScopeMismatch`).
 - `IpEndpoint::v6`, `IpEndpoint::scope`, `IpEndpoint::is_link_local` and
   `UdpEndpoint::is_link_local`.
 - `TunnelHandle::delete` and `SessionHandle::delete`, which wait for the

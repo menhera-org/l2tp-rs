@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
+    io,
     mem::{size_of, zeroed},
-    net::{Ipv4Addr, Ipv6Addr},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use crate::{Encapsulation, IfName, IpEndpoint, TunnelId, UdpEndpoint};
+use crate::{
+    Encapsulation, IFNAMSIZ, IpEndpoint, L2tpIfName, L2tpIfNameExt,
+    TunnelConfig, TunnelId, UdpEndpoint,
+};
 
 const IPPROTO_L2TP: libc::c_int = 115;
+
+/// Path MTU discovery mode of a tunnel socket (`IP_MTU_DISCOVER` and
+/// `IPV6_MTU_DISCOVER`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[non_exhaustive]
+pub enum PmtuDiscovery {
+    /// Never set the don't-fragment flag; fragment locally.
+    Dont,
+    /// Follow the per-route setting, the kernel default.
+    Want,
+    /// Always set the don't-fragment flag and perform discovery.
+    Do,
+    /// Set the don't-fragment flag but ignore the discovered path MTU.
+    Probe,
+}
+
+impl PmtuDiscovery {
+    fn value(self) -> libc::c_int {
+        // The IPv6 constants have the same values.
+        match self {
+            Self::Dont => libc::IP_PMTUDISC_DONT,
+            Self::Want => libc::IP_PMTUDISC_WANT,
+            Self::Do => libc::IP_PMTUDISC_DO,
+            Self::Probe => libc::IP_PMTUDISC_PROBE,
+        }
+    }
+}
 
 /// Owned tunnel socket used by managed tunnels (`L2TP_ATTR_FD`).
 ///
@@ -18,27 +50,30 @@ const IPPROTO_L2TP: libc::c_int = 115;
 /// associated tunnel and sessions.
 ///
 /// The descriptor is created with `SOCK_CLOEXEC`, so child processes do not
-/// inherit it and keep the tunnel alive.
+/// inherit it and keep the tunnel alive. A socket prepared elsewhere is
+/// adopted with [`TunnelSocket::from_fd`].
 #[derive(Debug)]
 pub struct TunnelSocket {
     fd: OwnedFd,
     encap: SocketEncap,
     family: SocketFamily,
     /// Interface name that scopes an IP socket, resolved on every reconnect.
-    scope: Option<IfName>,
+    scope: Option<L2tpIfName>,
     /// Whether the kernel has pinned the socket to an interface, through a
     /// link-local scope or `SO_BINDTODEVICE`. A link-local peer without a
     /// scope of its own needs that.
     pinned: AtomicBool,
+    /// Peer tunnel identifier of an IP socket, repeated on reconnect.
+    peer_conn_id: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SocketEncap {
     Udp,
     Ip,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SocketFamily {
     V4,
     V6,
@@ -65,9 +100,17 @@ impl SocketFamily {
             Self::V6 => 6,
         }
     }
+
+    fn domain(self) -> libc::c_int {
+        match self {
+            Self::V4 => libc::AF_INET,
+            Self::V6 => libc::AF_INET6,
+        }
+    }
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct SockaddrL2tpIp {
     l2tp_family: libc::sa_family_t,
     l2tp_unused: u16,
@@ -77,6 +120,7 @@ struct SockaddrL2tpIp {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct SockaddrL2tpIp6 {
     l2tp_family: libc::sa_family_t,
     l2tp_unused: u16,
@@ -128,16 +172,16 @@ impl TunnelSocket {
     /// bind/connect.
     ///
     /// A link-local IPv6 endpoint needs an interface, which the kernel takes
-    /// from the [`SocketAddrV6`](std::net::SocketAddrV6) scope ID (see
-    /// [`IfName::index`]) or from `device`. A link-local `remote` may omit
-    /// its scope ID when `local` or `device` already pins the socket to an
-    /// interface. A missing scope is reported as
+    /// from the [`SocketAddrV6`] scope ID (see [`L2tpIfNameExt::index`]) or
+    /// from `device`. A link-local `remote` may omit its scope ID when
+    /// `local` or `device` already pins the socket to an interface. A
+    /// missing scope is reported as
     /// [`Error::ScopeRequired`](crate::Error::ScopeRequired) before the
     /// socket is created.
     pub fn udp(
         local: &UdpEndpoint,
         remote: &UdpEndpoint,
-        device: Option<&IfName>,
+        device: Option<&L2tpIfName>,
     ) -> crate::Result<Self> {
         if local.ip_version() != remote.ip_version() {
             return Err(crate::Error::AddressFamilyMismatch);
@@ -148,22 +192,15 @@ impl TunnelSocket {
             device.is_some() || has_link_local_scope(local),
         )?;
 
-        let family = match local {
-            UdpEndpoint::V4(_) => libc::AF_INET,
-            UdpEndpoint::V6(_) => libc::AF_INET6,
-        };
-
-        let fd = socket(family, libc::SOCK_DGRAM, libc::IPPROTO_UDP)?;
+        let family = SocketFamily::from_udp(local);
+        let fd = socket(family.domain(), libc::SOCK_DGRAM, libc::IPPROTO_UDP)?;
 
         if let Some(device) = device {
             set_bind_to_device(fd.as_raw_fd(), device)?;
         }
 
-        let local_addr = udp_sockaddr(local);
-        bind(fd.as_raw_fd(), &local_addr)?;
-
-        let remote_addr = udp_sockaddr(remote);
-        connect(fd.as_raw_fd(), &remote_addr)?;
+        bind(fd.as_raw_fd(), &udp_sockaddr(local))?;
+        connect(fd.as_raw_fd(), &udp_sockaddr(remote))?;
 
         // Validation above guarantees that a link-local endpoint came with a
         // scope or a device, each of which pins the socket.
@@ -172,17 +209,18 @@ impl TunnelSocket {
         Ok(Self {
             fd,
             encap: SocketEncap::Udp,
-            family: SocketFamily::from_udp(local),
+            family,
             scope: None,
             pinned: AtomicBool::new(pinned),
+            peer_conn_id: 0,
         })
     }
 
     /// Creates and connects an IP-encapsulated L2TP socket.
     ///
     /// The local bind uses `tunnel_id` as `l2tp_conn_id`, so it must match the
-    /// tunnel ID passed to [`L2tpHandle::create_tunnel`]; the remote connect
-    /// uses conn_id `0`.
+    /// tunnel ID of the [`TunnelConfig`] the socket is used with; the connect
+    /// records `peer_tunnel_id` as the peer connection ID.
     ///
     /// Link-local IPv6 endpoints need an interface scope
     /// ([`IpEndpoint::v6_scoped`]). The scopes of `local` and `remote` and
@@ -190,13 +228,12 @@ impl TunnelSocket {
     /// the interface index here and again on every
     /// [`reconnect_ip`](Self::reconnect_ip), so a re-created interface is
     /// picked up. Unlike `device`, a scope does not need `CAP_NET_RAW`.
-    ///
-    /// [`L2tpHandle::create_tunnel`]: crate::L2tpHandle::create_tunnel
     pub fn ip(
         local: &IpEndpoint,
         remote: &IpEndpoint,
-        device: Option<&IfName>,
+        device: Option<&L2tpIfName>,
         tunnel_id: TunnelId,
+        peer_tunnel_id: TunnelId,
     ) -> crate::Result<Self> {
         if local.ip_version() != remote.ip_version() {
             return Err(crate::Error::AddressFamilyMismatch);
@@ -207,22 +244,18 @@ impl TunnelSocket {
         require_scope(remote, scope.as_ref(), false)?;
         let scope_id = resolve_scope(scope.as_ref())?;
 
-        let family = match local {
-            IpEndpoint::V4(_) => libc::AF_INET,
-            IpEndpoint::V6 { .. } => libc::AF_INET6,
-        };
-
-        let fd = socket(family, libc::SOCK_DGRAM, IPPROTO_L2TP)?;
+        let family = SocketFamily::from_ip(local);
+        let fd = socket(family.domain(), libc::SOCK_DGRAM, IPPROTO_L2TP)?;
 
         if let Some(device) = device {
             set_bind_to_device(fd.as_raw_fd(), device)?;
         }
 
-        let local_addr = l2tp_sockaddr(local, tunnel_id.0, scope_id);
-        bind(fd.as_raw_fd(), &local_addr)?;
-
-        let remote_addr = l2tp_sockaddr(remote, 0, scope_id);
-        connect(fd.as_raw_fd(), &remote_addr)?;
+        bind(fd.as_raw_fd(), &l2tp_sockaddr(local, tunnel_id.0, scope_id))?;
+        connect(
+            fd.as_raw_fd(),
+            &l2tp_sockaddr(remote, peer_tunnel_id.0, scope_id),
+        )?;
 
         // The kernel only pins the socket for a device or a link-local scope.
         let pinned =
@@ -230,9 +263,93 @@ impl TunnelSocket {
         Ok(Self {
             fd,
             encap: SocketEncap::Ip,
-            family: SocketFamily::from_ip(local),
+            family,
             scope,
             pinned: AtomicBool::new(pinned),
+            peer_conn_id: peer_tunnel_id.0,
+        })
+    }
+
+    /// Creates the socket a [`TunnelConfig`] describes and applies its UDP
+    /// checksum settings, ready for
+    /// [`L2tpHandle::create_tunnel`](crate::L2tpHandle::create_tunnel).
+    pub fn for_config(
+        config: &TunnelConfig,
+        device: Option<&L2tpIfName>,
+    ) -> crate::Result<Self> {
+        let socket = match config.encapsulation() {
+            Encapsulation::Udp { local, remote, .. } => {
+                Self::udp(local, remote, device)?
+            }
+            Encapsulation::Ip { local, remote } => Self::ip(
+                local,
+                remote,
+                device,
+                config.tunnel_id(),
+                config.peer_tunnel_id(),
+            )?,
+        };
+        socket.configure(config.encapsulation())?;
+        Ok(socket)
+    }
+
+    /// Adopts a bound and connected datagram socket prepared elsewhere, for
+    /// example with `socket2` or through socket activation.
+    ///
+    /// The socket must be an `AF_INET` or `AF_INET6` `SOCK_DGRAM` socket of
+    /// protocol UDP or `IPPROTO_L2TP`; anything else fails with
+    /// `EAFNOSUPPORT`, `ESOCKTNOSUPPORT` or `EPROTONOSUPPORT`. The bound
+    /// device, link-local scope and peer connection ID are read back from
+    /// the kernel. Build the tunnel configuration from the adopted socket
+    /// with [`TunnelConfig::for_socket`].
+    pub fn from_fd(fd: OwnedFd) -> crate::Result<Self> {
+        let raw = fd.as_raw_fd();
+        let family =
+            match socket_option(raw, libc::SOL_SOCKET, libc::SO_DOMAIN)? {
+                libc::AF_INET => SocketFamily::V4,
+                libc::AF_INET6 => SocketFamily::V6,
+                _ => return Err(errno(libc::EAFNOSUPPORT)),
+            };
+        if socket_option(raw, libc::SOL_SOCKET, libc::SO_TYPE)?
+            != libc::SOCK_DGRAM
+        {
+            return Err(errno(libc::ESOCKTNOSUPPORT));
+        }
+        let encap =
+            match socket_option(raw, libc::SOL_SOCKET, libc::SO_PROTOCOL)? {
+                libc::IPPROTO_UDP => SocketEncap::Udp,
+                IPPROTO_L2TP => SocketEncap::Ip,
+                _ => return Err(errno(libc::EPROTONOSUPPORT)),
+            };
+        let device = bound_device(raw)?;
+        let (scoped, peer_conn_id) = match (encap, family) {
+            (SocketEncap::Udp, SocketFamily::V6) => {
+                let name = socket_name(raw, false)?;
+                let addr = sockaddr_in6(&name)?;
+                (addr.ip().is_unicast_link_local() && addr.scope_id() != 0, 0)
+            }
+            (SocketEncap::Udp, SocketFamily::V4) => (false, 0),
+            (SocketEncap::Ip, SocketFamily::V6) => {
+                let local = l2tp_sockaddr_in6(&socket_name(raw, false)?)?;
+                let scoped = Ipv6Addr::from(local.l2tp_addr.s6_addr)
+                    .is_unicast_link_local()
+                    && local.l2tp_scope_id != 0;
+                (scoped, peer_conn_id_in6(raw))
+            }
+            (SocketEncap::Ip, SocketFamily::V4) => {
+                let peer = socket_name(raw, true)
+                    .ok()
+                    .and_then(|name| l2tp_sockaddr_in(&name).ok());
+                (false, peer.map_or(0, |peer| peer.l2tp_conn_id))
+            }
+        };
+        Ok(Self {
+            fd,
+            encap,
+            family,
+            scope: device,
+            pinned: AtomicBool::new(device.is_some() || scoped),
+            peer_conn_id,
         })
     }
 
@@ -240,7 +357,7 @@ impl TunnelSocket {
         &self,
         encapsulation: &Encapsulation,
     ) -> crate::Result<()> {
-        match (encapsulation, &self.encap) {
+        match (encapsulation, self.encap) {
             (
                 Encapsulation::Udp {
                     local,
@@ -264,7 +381,7 @@ impl TunnelSocket {
                     libc::SO_NO_CHECK,
                     !udp_csum,
                 )?;
-                if matches!(self.family, SocketFamily::V6) {
+                if self.family == SocketFamily::V6 {
                     set_socket_bool(
                         self.as_raw_fd(),
                         libc::IPPROTO_UDP,
@@ -297,10 +414,49 @@ impl TunnelSocket {
         Ok(())
     }
 
+    /// Describes the socket's current addresses and UDP checksum options as
+    /// an [`Encapsulation`].
+    pub(crate) fn encapsulation(&self) -> crate::Result<Encapsulation> {
+        let raw = self.fd.as_raw_fd();
+        match self.encap {
+            SocketEncap::Udp => {
+                let udp_csum =
+                    socket_option(raw, libc::SOL_SOCKET, libc::SO_NO_CHECK)?
+                        == 0;
+                let (udp_zero_csum6_tx, udp_zero_csum6_rx) = match self.family {
+                    SocketFamily::V4 => (false, false),
+                    SocketFamily::V6 => (
+                        socket_option(
+                            raw,
+                            libc::IPPROTO_UDP,
+                            libc::UDP_NO_CHECK6_TX,
+                        )? != 0,
+                        socket_option(
+                            raw,
+                            libc::IPPROTO_UDP,
+                            libc::UDP_NO_CHECK6_RX,
+                        )? != 0,
+                    ),
+                };
+                Ok(Encapsulation::Udp {
+                    local: self.local_addr_udp()?,
+                    remote: self.peer_addr_udp()?,
+                    udp_csum,
+                    udp_zero_csum6_tx,
+                    udp_zero_csum6_rx,
+                })
+            }
+            SocketEncap::Ip => Ok(Encapsulation::Ip {
+                local: self.local_addr_ip()?,
+                remote: self.peer_addr_ip()?,
+            }),
+        }
+    }
+
     /// Applies `SO_BINDTODEVICE` on this socket; this requires `CAP_NET_RAW`.
     ///
     /// Afterwards a link-local remote may omit its scope on reconnect.
-    pub fn bind_to_device(&self, device: &IfName) -> crate::Result<()> {
+    pub fn bind_to_device(&self, device: &L2tpIfName) -> crate::Result<()> {
         set_bind_to_device(self.fd.as_raw_fd(), device)?;
         self.pinned.store(true, Ordering::Relaxed);
         Ok(())
@@ -308,24 +464,53 @@ impl TunnelSocket {
 
     /// Sets `IPV6_DONTFRAG` for this socket.
     pub fn set_ipv6_dontfrag(&self, dontfrag: bool) -> crate::Result<()> {
-        let value: libc::c_int = if dontfrag { 1 } else { 0 };
-        // SAFETY: `value` is a valid pointer to a `c_int`, and `self.fd` is an
-        // open socket descriptor owned by this struct.
-        let rc = unsafe {
-            libc::setsockopt(
-                self.fd.as_raw_fd(),
-                libc::IPPROTO_IPV6,
-                libc::IPV6_DONTFRAG,
-                (&value as *const libc::c_int).cast(),
-                size_of::<libc::c_int>() as libc::socklen_t,
-            )
+        set_socket_bool(
+            self.fd.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_DONTFRAG,
+            dontfrag,
+        )
+    }
+
+    /// Sets the IPv4 type of service or the IPv6 traffic class, including the
+    /// DSCP and ECN bits, of transmitted tunnel packets.
+    pub fn set_tos(&self, tos: u8) -> crate::Result<()> {
+        let (level, option) = match self.family {
+            SocketFamily::V4 => (libc::IPPROTO_IP, libc::IP_TOS),
+            SocketFamily::V6 => (libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
         };
+        set_socket_int(self.fd.as_raw_fd(), level, option, tos.into())
+    }
 
-        if rc == -1 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+    /// Sets the IPv4 time to live or the IPv6 hop limit of transmitted tunnel
+    /// packets.
+    pub fn set_hop_limit(&self, hops: u8) -> crate::Result<()> {
+        let (level, option) = match self.family {
+            SocketFamily::V4 => (libc::IPPROTO_IP, libc::IP_TTL),
+            SocketFamily::V6 => (libc::IPPROTO_IPV6, libc::IPV6_UNICAST_HOPS),
+        };
+        set_socket_int(self.fd.as_raw_fd(), level, option, hops.into())
+    }
 
-        Ok(())
+    /// Sets the packet mark (`SO_MARK`) used for routing and filtering, which
+    /// requires `CAP_NET_ADMIN`.
+    pub fn set_mark(&self, mark: u32) -> crate::Result<()> {
+        set_socket_int(
+            self.fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            mark as libc::c_int,
+        )
+    }
+
+    /// Sets the path MTU discovery mode (`IP_MTU_DISCOVER` or
+    /// `IPV6_MTU_DISCOVER`).
+    pub fn set_pmtu_discovery(&self, mode: PmtuDiscovery) -> crate::Result<()> {
+        let (level, option) = match self.family {
+            SocketFamily::V4 => (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER),
+            SocketFamily::V6 => (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER),
+        };
+        set_socket_int(self.fd.as_raw_fd(), level, option, mode.value())
     }
 
     /// Reconnects a managed UDP tunnel socket to a new remote endpoint.
@@ -335,7 +520,7 @@ impl TunnelSocket {
     /// [`bind_to_device`](Self::bind_to_device) or by an earlier scoped
     /// reconnect.
     pub fn reconnect_udp(&self, new_remote: &UdpEndpoint) -> crate::Result<()> {
-        if let SocketEncap::Ip = self.encap {
+        if self.encap != SocketEncap::Udp {
             return Err(crate::Error::EncapsulationMismatch);
         }
         if self.family.ip_version() != new_remote.ip_version() {
@@ -343,8 +528,7 @@ impl TunnelSocket {
         }
         require_udp_scope(new_remote, self.pinned.load(Ordering::Relaxed))?;
 
-        let remote_addr = udp_sockaddr(new_remote);
-        connect(self.fd.as_raw_fd(), &remote_addr)?;
+        connect(self.fd.as_raw_fd(), &udp_sockaddr(new_remote))?;
         if new_remote.is_link_local() {
             self.pinned.store(true, Ordering::Relaxed);
         }
@@ -358,7 +542,7 @@ impl TunnelSocket {
     /// `new_remote` has none, and the two must agree otherwise. The name is
     /// resolved to the interface index on every call.
     pub fn reconnect_ip(&self, new_remote: &IpEndpoint) -> crate::Result<()> {
-        if let SocketEncap::Udp = self.encap {
+        if self.encap != SocketEncap::Ip {
             return Err(crate::Error::EncapsulationMismatch);
         }
         if self.family.ip_version() != new_remote.ip_version() {
@@ -368,72 +552,104 @@ impl TunnelSocket {
         require_scope(new_remote, scope, self.pinned.load(Ordering::Relaxed))?;
         let scope_id = resolve_scope(scope)?;
 
-        let remote_addr = l2tp_sockaddr(new_remote, 0, scope_id);
-        connect(self.fd.as_raw_fd(), &remote_addr)?;
+        connect(
+            self.fd.as_raw_fd(),
+            &l2tp_sockaddr(new_remote, self.peer_conn_id, scope_id),
+        )?;
         if new_remote.is_link_local() {
             self.pinned.store(true, Ordering::Relaxed);
         }
         Ok(())
     }
 
-    /// Returns the current local UDP socket address.
-    ///
-    /// This is only valid for UDP-encapsulated sockets.
+    /// Returns the current local address of a UDP socket.
     pub fn local_addr_udp(&self) -> crate::Result<UdpEndpoint> {
-        if let SocketEncap::Ip = self.encap {
+        if self.encap != SocketEncap::Udp {
             return Err(crate::Error::EncapsulationMismatch);
         }
+        let name = socket_name(self.fd.as_raw_fd(), false)?;
+        self.udp_endpoint(&name)
+    }
 
-        // SAFETY: zero-initialization is valid for `sockaddr_storage`.
-        let mut storage: libc::sockaddr_storage = unsafe { zeroed() };
-        let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-
-        // SAFETY: storage points to valid writable memory with size `len`, and
-        // `self.fd` is an open socket descriptor.
-        let rc = unsafe {
-            libc::getsockname(
-                self.fd.as_raw_fd(),
-                (&mut storage as *mut libc::sockaddr_storage).cast(),
-                &mut len,
-            )
-        };
-        if rc == -1 {
-            return Err(std::io::Error::last_os_error().into());
+    /// Returns the current peer address of a UDP socket.
+    pub fn peer_addr_udp(&self) -> crate::Result<UdpEndpoint> {
+        if self.encap != SocketEncap::Udp {
+            return Err(crate::Error::EncapsulationMismatch);
         }
+        let name = socket_name(self.fd.as_raw_fd(), true)?;
+        self.udp_endpoint(&name)
+    }
 
-        match i32::from(storage.ss_family) {
-            libc::AF_INET => {
-                // SAFETY: kernel reported AF_INET, so interpreting as
-                // `sockaddr_in` is valid.
-                let sa = unsafe {
-                    *(&storage as *const libc::sockaddr_storage
-                        as *const libc::sockaddr_in)
-                };
-                let ip = Ipv4Addr::from(sa.sin_addr.s_addr.to_ne_bytes());
-                let port = u16::from_be(sa.sin_port);
-                Ok(UdpEndpoint::V4(std::net::SocketAddrV4::new(ip, port)))
-            }
-            libc::AF_INET6 => {
-                // SAFETY: kernel reported AF_INET6, so interpreting as
-                // `sockaddr_in6` is valid.
-                let sa = unsafe {
-                    *(&storage as *const libc::sockaddr_storage
-                        as *const libc::sockaddr_in6)
-                };
-                let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
-                let port = u16::from_be(sa.sin6_port);
-                Ok(UdpEndpoint::V6(std::net::SocketAddrV6::new(
-                    ip,
-                    port,
-                    sa.sin6_flowinfo,
-                    sa.sin6_scope_id,
-                )))
-            }
-            _ => {
-                Err(std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT)
-                    .into())
-            }
+    /// Returns the current local address of an IP socket. A link-local
+    /// address carries the socket's scope name when one is known.
+    pub fn local_addr_ip(&self) -> crate::Result<IpEndpoint> {
+        if self.encap != SocketEncap::Ip {
+            return Err(crate::Error::EncapsulationMismatch);
         }
+        let name = socket_name(self.fd.as_raw_fd(), false)?;
+        self.ip_endpoint(&name)
+    }
+
+    /// Returns the current peer address of an IP socket.
+    ///
+    /// The kernel reports `ENOTCONN` for an IPv6 socket whose peer
+    /// connection ID is zero, which [`TunnelSocket::ip`] never produces.
+    pub fn peer_addr_ip(&self) -> crate::Result<IpEndpoint> {
+        if self.encap != SocketEncap::Ip {
+            return Err(crate::Error::EncapsulationMismatch);
+        }
+        let name = socket_name(self.fd.as_raw_fd(), true)?;
+        self.ip_endpoint(&name)
+    }
+
+    fn udp_endpoint(
+        &self,
+        name: &libc::sockaddr_storage,
+    ) -> crate::Result<UdpEndpoint> {
+        Ok(match self.family {
+            SocketFamily::V4 => UdpEndpoint::V4(sockaddr_in(name)?),
+            SocketFamily::V6 => UdpEndpoint::V6(sockaddr_in6(name)?),
+        })
+    }
+
+    fn ip_endpoint(
+        &self,
+        name: &libc::sockaddr_storage,
+    ) -> crate::Result<IpEndpoint> {
+        Ok(match self.family {
+            SocketFamily::V4 => IpEndpoint::V4(Ipv4Addr::from(
+                l2tp_sockaddr_in(name)?.l2tp_addr.s_addr.to_ne_bytes(),
+            )),
+            SocketFamily::V6 => {
+                let addr = l2tp_sockaddr_in6(name)?;
+                let addr = Ipv6Addr::from(addr.l2tp_addr.s6_addr);
+                IpEndpoint::V6 {
+                    addr,
+                    scope: if addr.is_unicast_link_local() {
+                        self.scope
+                    } else {
+                        None
+                    },
+                }
+            }
+        })
+    }
+
+    /// Duplicates the descriptor, for example to receive the L2TP control
+    /// messages that the kernel delivers on the tunnel socket.
+    pub fn try_clone_fd(&self) -> io::Result<OwnedFd> {
+        self.fd.try_clone()
+    }
+
+    /// Takes the descriptor out of the socket.
+    pub fn into_fd(self) -> OwnedFd {
+        self.fd
+    }
+}
+
+impl AsFd for TunnelSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 
@@ -441,6 +657,24 @@ impl AsRawFd for TunnelSocket {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
+}
+
+impl TryFrom<OwnedFd> for TunnelSocket {
+    type Error = crate::Error;
+
+    fn try_from(fd: OwnedFd) -> crate::Result<Self> {
+        Self::from_fd(fd)
+    }
+}
+
+impl From<TunnelSocket> for OwnedFd {
+    fn from(socket: TunnelSocket) -> Self {
+        socket.fd
+    }
+}
+
+fn errno(code: libc::c_int) -> crate::Error {
+    io::Error::from_raw_os_error(code).into()
 }
 
 fn socket(
@@ -452,7 +686,7 @@ fn socket(
     // a newly owned fd which is wrapped in `OwnedFd` exactly once.
     let fd = unsafe { libc::socket(domain, ty | libc::SOCK_CLOEXEC, protocol) };
     if fd == -1 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(io::Error::last_os_error().into());
     }
 
     // SAFETY: `fd` is a valid newly-created descriptor from `socket` above.
@@ -465,7 +699,7 @@ fn bind(fd: RawFd, addr: &SockAddr) -> crate::Result<()> {
     // `addr.len()`, and `fd` is assumed to be an open socket descriptor.
     let rc = unsafe { libc::bind(fd, addr.as_ptr(), addr.len()) };
     if rc == -1 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(io::Error::last_os_error().into());
     }
     Ok(())
 }
@@ -475,18 +709,17 @@ fn connect(fd: RawFd, addr: &SockAddr) -> crate::Result<()> {
     // `addr.len()`, and `fd` is assumed to be an open socket descriptor.
     let rc = unsafe { libc::connect(fd, addr.as_ptr(), addr.len()) };
     if rc == -1 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(io::Error::last_os_error().into());
     }
     Ok(())
 }
 
-fn set_socket_bool(
+fn set_socket_int(
     fd: RawFd,
     level: libc::c_int,
     option: libc::c_int,
-    enabled: bool,
+    value: libc::c_int,
 ) -> crate::Result<()> {
-    let value = libc::c_int::from(enabled);
     // SAFETY: value is an initialized c_int and its size is passed exactly.
     let rc = unsafe {
         libc::setsockopt(
@@ -498,12 +731,44 @@ fn set_socket_bool(
         )
     };
     if rc == -1 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(io::Error::last_os_error().into());
     }
     Ok(())
 }
 
-fn set_bind_to_device(fd: RawFd, device: &IfName) -> crate::Result<()> {
+fn set_socket_bool(
+    fd: RawFd,
+    level: libc::c_int,
+    option: libc::c_int,
+    enabled: bool,
+) -> crate::Result<()> {
+    set_socket_int(fd, level, option, libc::c_int::from(enabled))
+}
+
+fn socket_option(
+    fd: RawFd,
+    level: libc::c_int,
+    option: libc::c_int,
+) -> crate::Result<libc::c_int> {
+    let mut value: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `value` is writable for `len` bytes and `fd` is an open socket.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            option,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if rc == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(value)
+}
+
+fn set_bind_to_device(fd: RawFd, device: &L2tpIfName) -> crate::Result<()> {
     let bytes = device.as_bytes();
     // SAFETY: `bytes` points to readable memory of length `bytes.len()`, and
     // `fd` is assumed to be an open socket descriptor.
@@ -517,9 +782,119 @@ fn set_bind_to_device(fd: RawFd, device: &IfName) -> crate::Result<()> {
         )
     };
     if rc == -1 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(io::Error::last_os_error().into());
     }
     Ok(())
+}
+
+/// Returns the device the socket is bound to with `SO_BINDTODEVICE`.
+fn bound_device(fd: RawFd) -> crate::Result<Option<L2tpIfName>> {
+    let mut buf = [0u8; IFNAMSIZ];
+    let mut len = IFNAMSIZ as libc::socklen_t;
+    // SAFETY: `buf` is writable for `len` bytes and `fd` is an open socket.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if len == 0 || buf[0] == 0 {
+        return Ok(None);
+    }
+    Ok(Some(L2tpIfName::try_from(buf)?))
+}
+
+fn socket_name(fd: RawFd, peer: bool) -> crate::Result<libc::sockaddr_storage> {
+    // SAFETY: zero-initialization is valid for `sockaddr_storage`.
+    let mut storage: libc::sockaddr_storage = unsafe { zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let ptr = (&mut storage as *mut libc::sockaddr_storage).cast();
+    // SAFETY: storage points to valid writable memory with size `len`, and
+    // `fd` is an open socket descriptor.
+    let rc = unsafe {
+        if peer {
+            libc::getpeername(fd, ptr, &mut len)
+        } else {
+            libc::getsockname(fd, ptr, &mut len)
+        }
+    };
+    if rc == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(storage)
+}
+
+fn check_family(
+    name: &libc::sockaddr_storage,
+    family: libc::c_int,
+) -> crate::Result<()> {
+    if libc::c_int::from(name.ss_family) != family {
+        return Err(errno(libc::EAFNOSUPPORT));
+    }
+    Ok(())
+}
+
+fn sockaddr_in(name: &libc::sockaddr_storage) -> crate::Result<SocketAddrV4> {
+    check_family(name, libc::AF_INET)?;
+    // SAFETY: the kernel reported AF_INET, so the storage holds a
+    // `sockaddr_in`; the read copies it out without alignment assumptions.
+    let sa: libc::sockaddr_in = unsafe {
+        std::ptr::read_unaligned((name as *const libc::sockaddr_storage).cast())
+    };
+    Ok(SocketAddrV4::new(
+        Ipv4Addr::from(sa.sin_addr.s_addr.to_ne_bytes()),
+        u16::from_be(sa.sin_port),
+    ))
+}
+
+fn sockaddr_in6(name: &libc::sockaddr_storage) -> crate::Result<SocketAddrV6> {
+    check_family(name, libc::AF_INET6)?;
+    // SAFETY: the kernel reported AF_INET6, so the storage holds a
+    // `sockaddr_in6`.
+    let sa: libc::sockaddr_in6 = unsafe {
+        std::ptr::read_unaligned((name as *const libc::sockaddr_storage).cast())
+    };
+    Ok(SocketAddrV6::new(
+        Ipv6Addr::from(sa.sin6_addr.s6_addr),
+        u16::from_be(sa.sin6_port),
+        sa.sin6_flowinfo,
+        sa.sin6_scope_id,
+    ))
+}
+
+fn l2tp_sockaddr_in(
+    name: &libc::sockaddr_storage,
+) -> crate::Result<SockaddrL2tpIp> {
+    check_family(name, libc::AF_INET)?;
+    // SAFETY: an AF_INET L2TP/IP socket name is a `sockaddr_l2tpip`.
+    Ok(unsafe {
+        std::ptr::read_unaligned((name as *const libc::sockaddr_storage).cast())
+    })
+}
+
+fn l2tp_sockaddr_in6(
+    name: &libc::sockaddr_storage,
+) -> crate::Result<SockaddrL2tpIp6> {
+    check_family(name, libc::AF_INET6)?;
+    // SAFETY: an AF_INET6 L2TP/IP socket name is a `sockaddr_l2tpip6`.
+    Ok(unsafe {
+        std::ptr::read_unaligned((name as *const libc::sockaddr_storage).cast())
+    })
+}
+
+/// The peer connection ID of an IPv6 L2TP/IP socket, or 0 when the kernel
+/// reports the socket as not connected.
+fn peer_conn_id_in6(fd: RawFd) -> u32 {
+    socket_name(fd, true)
+        .ok()
+        .and_then(|name| l2tp_sockaddr_in6(&name).ok())
+        .map_or(0, |peer| peer.l2tp_conn_id)
 }
 
 fn udp_sockaddr(endpoint: &UdpEndpoint) -> SockAddr {
@@ -547,9 +922,9 @@ fn udp_sockaddr(endpoint: &UdpEndpoint) -> SockAddr {
 /// Returns the single interface named by `scopes`, or an error when they
 /// disagree.
 fn unified_scope<'a>(
-    scopes: impl IntoIterator<Item = Option<&'a IfName>>,
-) -> crate::Result<Option<&'a IfName>> {
-    let mut unified: Option<&IfName> = None;
+    scopes: impl IntoIterator<Item = Option<&'a L2tpIfName>>,
+) -> crate::Result<Option<&'a L2tpIfName>> {
+    let mut unified: Option<&L2tpIfName> = None;
     for scope in scopes.into_iter().flatten() {
         match unified {
             None => unified = Some(scope),
@@ -569,7 +944,7 @@ fn unified_scope<'a>(
 /// interface, given by a scope or by a socket already pinned to one.
 fn require_scope(
     endpoint: &IpEndpoint,
-    scope: Option<&IfName>,
+    scope: Option<&L2tpIfName>,
     pinned: bool,
 ) -> crate::Result<()> {
     match endpoint {
@@ -610,7 +985,7 @@ fn has_link_local_scope(endpoint: &UdpEndpoint) -> bool {
 
 /// Resolves the scope to the interface index at the time of use, so a
 /// re-created interface keeps working.
-fn resolve_scope(scope: Option<&IfName>) -> crate::Result<u32> {
+fn resolve_scope(scope: Option<&L2tpIfName>) -> crate::Result<u32> {
     match scope {
         Some(name) => name.index(),
         None => Ok(0),
@@ -650,14 +1025,12 @@ mod tests {
     use std::{
         io,
         mem::size_of,
-        net::{
-            Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6,
-            UdpSocket,
-        },
+        net::{SocketAddr, UdpSocket},
         time::Duration,
     };
 
     use super::*;
+    use crate::TunnelId;
 
     fn as_v4(addr: SocketAddr) -> SocketAddrV4 {
         match addr {
@@ -674,63 +1047,71 @@ mod tests {
         }
     }
 
-    fn socket_option(
-        fd: RawFd,
-        level: libc::c_int,
-        option: libc::c_int,
-    ) -> libc::c_int {
-        let mut value = 0 as libc::c_int;
-        let mut len = size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: value is writable for len bytes and fd is an open socket.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                level,
-                option,
-                (&mut value as *mut libc::c_int).cast(),
-                &mut len,
-            )
+    fn udp_fd(domain: libc::c_int) -> Option<OwnedFd> {
+        match socket(domain, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
+            Ok(fd) => Some(fd),
+            Err(crate::Error::Io(e))
+                if e.kind() == io::ErrorKind::PermissionDenied =>
+            {
+                None
+            }
+            Err(e) => panic!("unexpected socket create error: {e:?}"),
+        }
+    }
+
+    fn raw_socket(
+        fd: OwnedFd,
+        encap: SocketEncap,
+        family: SocketFamily,
+        scope: Option<L2tpIfName>,
+    ) -> TunnelSocket {
+        TunnelSocket {
+            fd,
+            encap,
+            family,
+            scope,
+            pinned: AtomicBool::new(false),
+            peer_conn_id: 0,
+        }
+    }
+
+    fn connected_v4_pair() -> Option<(TunnelSocket, UdpSocket)> {
+        let receiver = bind_v4_local()?;
+        let receiver_addr = as_v4(receiver.local_addr().unwrap());
+        let sock = match TunnelSocket::udp(
+            &UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            &UdpEndpoint::V4(receiver_addr),
+            None,
+        ) {
+            Ok(s) => s,
+            Err(crate::Error::Io(e))
+                if e.kind() == io::ErrorKind::PermissionDenied =>
+            {
+                return None;
+            }
+            Err(e) => panic!("unexpected tunnel socket error: {e:?}"),
         };
-        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
-        value
+        Some((sock, receiver))
     }
 
     #[test]
     fn managed_udp_checksum_options_follow_configuration() {
         for family in [SocketFamily::V4, SocketFamily::V6] {
-            let domain = match family {
-                SocketFamily::V4 => libc::AF_INET,
-                SocketFamily::V6 => libc::AF_INET6,
+            let Some(fd) = udp_fd(family.domain()) else {
+                return;
             };
-            let fd = match socket(domain, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
-                Ok(fd) => fd,
-                Err(crate::Error::Io(e))
-                    if e.kind() == io::ErrorKind::PermissionDenied =>
-                {
-                    return;
-                }
-                Err(e) => panic!("{e}"),
-            };
-            let sock = TunnelSocket {
-                fd,
-                encap: SocketEncap::Udp,
-                family,
-                scope: None,
-                pinned: AtomicBool::new(false),
-            };
+            let sock = raw_socket(fd, SocketEncap::Udp, family, None);
             let endpoint = match family {
                 SocketFamily::V4 => UdpEndpoint::V4(SocketAddrV4::new(
                     Ipv4Addr::LOCALHOST,
                     1701,
                 )),
-                SocketFamily::V6 => {
-                    UdpEndpoint::V6(std::net::SocketAddrV6::new(
-                        Ipv6Addr::LOCALHOST,
-                        1701,
-                        0,
-                        0,
-                    ))
-                }
+                SocketFamily::V6 => UdpEndpoint::V6(SocketAddrV6::new(
+                    Ipv6Addr::LOCALHOST,
+                    1701,
+                    0,
+                    0,
+                )),
             };
             for enabled in [true, false] {
                 sock.configure(&Encapsulation::Udp {
@@ -746,16 +1127,18 @@ mod tests {
                         sock.as_raw_fd(),
                         libc::SOL_SOCKET,
                         libc::SO_NO_CHECK
-                    ),
+                    )
+                    .unwrap(),
                     i32::from(enabled)
                 );
-                if matches!(family, SocketFamily::V6) {
+                if family == SocketFamily::V6 {
                     assert_eq!(
                         socket_option(
                             sock.as_raw_fd(),
                             libc::IPPROTO_UDP,
                             libc::UDP_NO_CHECK6_TX
-                        ),
+                        )
+                        .unwrap(),
                         i32::from(enabled)
                     );
                     assert_eq!(
@@ -763,7 +1146,8 @@ mod tests {
                             sock.as_raw_fd(),
                             libc::IPPROTO_UDP,
                             libc::UDP_NO_CHECK6_RX
-                        ),
+                        )
+                        .unwrap(),
                         i32::from(enabled)
                     );
                 }
@@ -805,15 +1189,17 @@ mod tests {
     #[test]
     fn link_local_ip_endpoints_require_one_scope() {
         let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-        let eth0 = IfName::new("eth0").unwrap();
-        let eth1 = IfName::new("eth1").unwrap();
+        let eth0 = L2tpIfName::new("eth0").unwrap();
+        let eth1 = L2tpIfName::new("eth1").unwrap();
+        let ids = (TunnelId(1), TunnelId(2));
 
         // Validation runs before any socket is created.
         let err = TunnelSocket::ip(
             &IpEndpoint::v6(link_local),
             &IpEndpoint::v6(Ipv6Addr::LOCALHOST),
             None,
-            TunnelId(1),
+            ids.0,
+            ids.1,
         )
         .unwrap_err();
         assert!(matches!(
@@ -825,7 +1211,8 @@ mod tests {
             &IpEndpoint::v6(Ipv6Addr::UNSPECIFIED),
             &IpEndpoint::v6(link_local),
             None,
-            TunnelId(1),
+            ids.0,
+            ids.1,
         )
         .unwrap_err();
         assert!(matches!(err, crate::Error::ScopeRequired(_)));
@@ -834,7 +1221,8 @@ mod tests {
             &IpEndpoint::v6_scoped(link_local, eth0),
             &IpEndpoint::v6_scoped(link_local, eth1),
             None,
-            TunnelId(1),
+            ids.0,
+            ids.1,
         )
         .unwrap_err();
         assert!(matches!(
@@ -847,18 +1235,20 @@ mod tests {
             &IpEndpoint::v6_scoped(link_local, eth0),
             &IpEndpoint::v6(link_local),
             Some(&eth1),
-            TunnelId(1),
+            ids.0,
+            ids.1,
         )
         .unwrap_err();
         assert!(matches!(err, crate::Error::ScopeMismatch { .. }));
 
         // A scope that names no interface fails before the socket is created.
-        let missing = IfName::new("l2tp-no-such0").unwrap();
+        let missing = L2tpIfName::new("l2tp-no-such0").unwrap();
         let err = TunnelSocket::ip(
             &IpEndpoint::v6_scoped(link_local, missing),
             &IpEndpoint::v6(link_local),
             None,
-            TunnelId(1),
+            ids.0,
+            ids.1,
         )
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENODEV));
@@ -866,24 +1256,11 @@ mod tests {
 
     #[test]
     fn configure_checks_ip_scopes_against_the_socket() {
-        let fd =
-            match socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
-                Ok(fd) => fd,
-                Err(crate::Error::Io(e))
-                    if e.kind() == io::ErrorKind::PermissionDenied =>
-                {
-                    return;
-                }
-                Err(e) => panic!("unexpected socket create error: {e:?}"),
-            };
-        let lo = IfName::new("lo").unwrap();
-        let sock = TunnelSocket {
-            fd,
-            encap: SocketEncap::Ip,
-            family: SocketFamily::V6,
-            scope: Some(lo),
-            pinned: AtomicBool::new(false),
+        let Some(fd) = udp_fd(libc::AF_INET6) else {
+            return;
         };
+        let lo = L2tpIfName::new("lo").unwrap();
+        let sock = raw_socket(fd, SocketEncap::Ip, SocketFamily::V6, Some(lo));
         let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
 
         sock.configure(&Encapsulation::Ip {
@@ -895,7 +1272,7 @@ mod tests {
             .configure(&Encapsulation::Ip {
                 local: IpEndpoint::v6_scoped(
                     link_local,
-                    IfName::new("eth0").unwrap(),
+                    L2tpIfName::new("eth0").unwrap(),
                 ),
                 remote: IpEndpoint::v6(link_local),
             })
@@ -907,7 +1284,7 @@ mod tests {
         let err = sock
             .reconnect_ip(&IpEndpoint::v6_scoped(
                 link_local,
-                IfName::new("eth0").unwrap(),
+                L2tpIfName::new("eth0").unwrap(),
             ))
             .unwrap_err();
         assert!(matches!(err, crate::Error::ScopeMismatch { .. }));
@@ -922,7 +1299,7 @@ mod tests {
     }
 
     /// Returns an interface with a link-local address, when the host has one.
-    fn link_local_interface() -> Option<(Ipv6Addr, IfName)> {
+    fn link_local_interface() -> Option<(Ipv6Addr, L2tpIfName)> {
         let table = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
         table.lines().find_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
@@ -937,8 +1314,23 @@ mod tests {
             for (i, octet) in octets.iter_mut().enumerate() {
                 *octet = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
             }
-            Some((Ipv6Addr::from(octets), IfName::new(name).ok()?))
+            Some((Ipv6Addr::from(octets), L2tpIfName::new(name).ok()?))
         })
+    }
+
+    fn skippable(e: &io::Error) -> bool {
+        e.kind() == io::ErrorKind::PermissionDenied
+            || matches!(
+                e.raw_os_error(),
+                Some(
+                    libc::EPROTONOSUPPORT
+                        | libc::ESOCKTNOSUPPORT
+                        | libc::EAFNOSUPPORT
+                        | libc::EADDRINUSE
+                        | libc::EADDRNOTAVAIL
+                        | libc::ENETUNREACH
+                )
+            )
     }
 
     #[test]
@@ -951,25 +1343,17 @@ mod tests {
         let remote =
             IpEndpoint::v6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x1234));
         let tunnel_id = TunnelId(0x4c32_5450 ^ std::process::id());
-        let sock = match TunnelSocket::ip(&local, &remote, None, tunnel_id) {
+        let peer_tunnel_id = TunnelId(tunnel_id.0 ^ 1);
+        let sock = match TunnelSocket::ip(
+            &local,
+            &remote,
+            None,
+            tunnel_id,
+            peer_tunnel_id,
+        ) {
             Ok(sock) => sock,
             // No l2tp_ip6 support, no permission, or no usable link here.
-            Err(crate::Error::Io(e))
-                if e.kind() == io::ErrorKind::PermissionDenied
-                    || matches!(
-                        e.raw_os_error(),
-                        Some(
-                            libc::EPROTONOSUPPORT
-                                | libc::ESOCKTNOSUPPORT
-                                | libc::EAFNOSUPPORT
-                                | libc::EADDRINUSE
-                                | libc::EADDRNOTAVAIL
-                                | libc::ENETUNREACH
-                        )
-                    ) =>
-            {
-                return;
-            }
+            Err(crate::Error::Io(e)) if skippable(&e) => return,
             Err(e) => panic!("unexpected link-local socket error: {e:?}"),
         };
         assert_eq!(sock.scope, Some(ifname));
@@ -990,11 +1374,28 @@ mod tests {
         assert_eq!(bound.l2tp_scope_id, ifname.index().unwrap());
         assert_eq!(bound.l2tp_conn_id, tunnel_id.0);
 
+        // The accessors report the same, with the scope name attached.
+        assert_eq!(sock.local_addr_ip().unwrap(), local);
+        let peer = sock.peer_addr_ip().unwrap();
+        assert_eq!(peer.ip(), remote.ip());
+        let encapsulation = sock.encapsulation().unwrap();
+        assert!(matches!(encapsulation, Encapsulation::Ip { .. }));
+        let config =
+            TunnelConfig::for_socket(tunnel_id, peer_tunnel_id, &sock).unwrap();
+        assert_eq!(config.encapsulation(), &encapsulation);
+
         // Reconnecting resolves the socket's own scope again.
         sock.reconnect_ip(&IpEndpoint::v6(Ipv6Addr::new(
             0xfe80, 0, 0, 0, 0, 0, 0, 0x5678,
         )))
         .unwrap();
+
+        // An adopted descriptor reads the same state back from the kernel.
+        let adopted = TunnelSocket::from_fd(sock.into_fd()).unwrap();
+        assert_eq!(adopted.encap, SocketEncap::Ip);
+        assert_eq!(adopted.family, SocketFamily::V6);
+        assert!(adopted.pinned.load(Ordering::Relaxed));
+        assert_eq!(adopted.peer_conn_id, peer_tunnel_id.0);
     }
 
     #[test]
@@ -1005,7 +1406,7 @@ mod tests {
         let unscoped =
             UdpEndpoint::V6(SocketAddrV6::new(link_local, 1701, 0, 0));
         let scoped = UdpEndpoint::V6(SocketAddrV6::new(link_local, 1701, 0, 1));
-        let lo = IfName::new("lo").unwrap();
+        let lo = L2tpIfName::new("lo").unwrap();
 
         // Validation runs before any socket is created.
         let err = TunnelSocket::udp(&unscoped, &any, None).unwrap_err();
@@ -1033,23 +1434,10 @@ mod tests {
 
     #[test]
     fn reconnect_udp_requires_a_scope_on_an_unpinned_socket() {
-        let fd =
-            match socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
-                Ok(fd) => fd,
-                Err(crate::Error::Io(e))
-                    if e.kind() == io::ErrorKind::PermissionDenied =>
-                {
-                    return;
-                }
-                Err(e) => panic!("unexpected socket create error: {e:?}"),
-            };
-        let sock = TunnelSocket {
-            fd,
-            encap: SocketEncap::Udp,
-            family: SocketFamily::V6,
-            scope: None,
-            pinned: AtomicBool::new(false),
+        let Some(fd) = udp_fd(libc::AF_INET6) else {
+            return;
         };
+        let sock = raw_socket(fd, SocketEncap::Udp, SocketFamily::V6, None);
         let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
         let err = sock
             .reconnect_udp(&UdpEndpoint::V6(SocketAddrV6::new(
@@ -1078,16 +1466,7 @@ mod tests {
         ));
         let sock = match TunnelSocket::udp(&local, &remote, None) {
             Ok(sock) => sock,
-            // No permission or no usable link here.
-            Err(crate::Error::Io(e))
-                if e.kind() == io::ErrorKind::PermissionDenied
-                    || matches!(
-                        e.raw_os_error(),
-                        Some(libc::EADDRNOTAVAIL | libc::ENETUNREACH)
-                    ) =>
-            {
-                return;
-            }
+            Err(crate::Error::Io(e)) if skippable(&e) => return,
             Err(e) => panic!("unexpected link-local socket error: {e:?}"),
         };
         assert!(sock.pinned.load(Ordering::Relaxed));
@@ -1106,23 +1485,106 @@ mod tests {
             0,
         )))
         .unwrap();
+
+        let adopted = TunnelSocket::from_fd(sock.into_fd()).unwrap();
+        assert_eq!(adopted.encap, SocketEncap::Udp);
+        assert!(adopted.pinned.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn sockaddr_l2tpip6_matches_kernel_size() {
-        assert_eq!(size_of::<SockaddrL2tpIp6>(), 32);
+    fn adopted_udp_socket_describes_itself() {
+        let Some((sock, receiver)) = connected_v4_pair() else {
+            return;
+        };
+        let receiver_addr = as_v4(receiver.local_addr().unwrap());
+        sock.configure(&Encapsulation::Udp {
+            local: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            remote: UdpEndpoint::V4(receiver_addr),
+            udp_csum: false,
+            udp_zero_csum6_tx: false,
+            udp_zero_csum6_rx: false,
+        })
+        .unwrap();
+        let adopted = TunnelSocket::from_fd(sock.into_fd()).unwrap();
+        assert_eq!(adopted.encap, SocketEncap::Udp);
+        assert_eq!(adopted.family, SocketFamily::V4);
+        assert!(!adopted.pinned.load(Ordering::Relaxed));
+
+        let config =
+            TunnelConfig::for_socket(TunnelId(1), TunnelId(2), &adopted)
+                .unwrap();
+        let Encapsulation::Udp {
+            local,
+            remote,
+            udp_csum,
+            ..
+        } = config.encapsulation()
+        else {
+            panic!("expected UDP encapsulation");
+        };
+        assert_eq!(*remote, UdpEndpoint::V4(receiver_addr));
+        assert!(matches!(local, UdpEndpoint::V4(v4) if v4.port() != 0));
+        assert!(!udp_csum);
+        assert_eq!(adopted.peer_addr_udp().unwrap(), *remote);
+
+        // Descriptors that are not datagram sockets are refused.
+        let file: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        assert!(TunnelSocket::from_fd(file).is_err());
+    }
+
+    #[test]
+    fn socket_options_apply_to_udp_sockets() {
+        let Some((sock, _receiver)) = connected_v4_pair() else {
+            return;
+        };
+        sock.set_tos(0xb8).unwrap();
+        assert_eq!(
+            socket_option(sock.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS)
+                .unwrap(),
+            0xb8
+        );
+        sock.set_hop_limit(7).unwrap();
+        assert_eq!(
+            socket_option(sock.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TTL)
+                .unwrap(),
+            7
+        );
+        sock.set_pmtu_discovery(PmtuDiscovery::Do).unwrap();
+        assert_eq!(
+            socket_option(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER
+            )
+            .unwrap(),
+            libc::IP_PMTUDISC_DO
+        );
+        // SO_MARK needs CAP_NET_ADMIN.
+        match sock.set_mark(42) {
+            Ok(()) => assert_eq!(
+                socket_option(
+                    sock.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_MARK
+                )
+                .unwrap(),
+                42
+            ),
+            Err(e) => {
+                assert_eq!(e.kind(), Some(io::ErrorKind::PermissionDenied))
+            }
+        }
+        let duplicate = sock.try_clone_fd().unwrap();
+        assert_ne!(duplicate.as_raw_fd(), sock.as_raw_fd());
+        assert_eq!(sock.as_fd().as_raw_fd(), sock.as_raw_fd());
     }
 
     #[test]
     fn udp_constructor_rejects_family_mismatch() {
         let local =
             UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1701));
-        let remote = UdpEndpoint::V6(std::net::SocketAddrV6::new(
-            Ipv6Addr::LOCALHOST,
-            1701,
-            0,
-            0,
-        ));
+        let remote =
+            UdpEndpoint::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1701, 0, 0));
 
         let err = match TunnelSocket::udp(&local, &remote, None) {
             Ok(_) => panic!("expected address family mismatch"),
@@ -1136,7 +1598,13 @@ mod tests {
         let local = IpEndpoint::V4(Ipv4Addr::LOCALHOST);
         let remote = IpEndpoint::v6(Ipv6Addr::LOCALHOST);
 
-        let err = match TunnelSocket::ip(&local, &remote, None, TunnelId(42)) {
+        let err = match TunnelSocket::ip(
+            &local,
+            &remote,
+            None,
+            TunnelId(42),
+            TunnelId(43),
+        ) {
             Ok(_) => panic!("expected address family mismatch"),
             Err(e) => e,
         };
@@ -1145,7 +1613,7 @@ mod tests {
 
     #[test]
     fn udp_local_addr_and_reconnect_work() {
-        let Some(receiver1) = bind_v4_local() else {
+        let Some((tunnel_socket, receiver1)) = connected_v4_pair() else {
             return;
         };
         let Some(receiver2) = bind_v4_local() else {
@@ -1157,23 +1625,7 @@ mod tests {
         receiver2
             .set_read_timeout(Some(Duration::from_millis(250)))
             .unwrap();
-
-        let receiver1_addr = as_v4(receiver1.local_addr().unwrap());
         let receiver2_addr = as_v4(receiver2.local_addr().unwrap());
-
-        let tunnel_socket = match TunnelSocket::udp(
-            &UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
-            &UdpEndpoint::V4(receiver1_addr),
-            None,
-        ) {
-            Ok(s) => s,
-            Err(crate::Error::Io(e))
-                if e.kind() == io::ErrorKind::PermissionDenied =>
-            {
-                return;
-            }
-            Err(e) => panic!("unexpected tunnel socket error: {e:?}"),
-        };
 
         let local = tunnel_socket.local_addr_udp().unwrap();
         match local {
@@ -1215,23 +1667,10 @@ mod tests {
 
     #[test]
     fn reconnect_udp_and_local_addr_reject_ip_socket() {
-        let fd =
-            match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
-                Ok(fd) => fd,
-                Err(crate::Error::Io(e))
-                    if e.kind() == io::ErrorKind::PermissionDenied =>
-                {
-                    return;
-                }
-                Err(e) => panic!("unexpected socket create error: {e:?}"),
-            };
-        let sock = TunnelSocket {
-            fd,
-            encap: SocketEncap::Ip,
-            family: SocketFamily::V4,
-            scope: None,
-            pinned: AtomicBool::new(false),
+        let Some(fd) = udp_fd(libc::AF_INET) else {
+            return;
         };
+        let sock = raw_socket(fd, SocketEncap::Ip, SocketFamily::V4, None);
 
         let err = sock
             .reconnect_udp(&UdpEndpoint::V4(SocketAddrV4::new(
@@ -1243,44 +1682,28 @@ mod tests {
 
         let err = sock.local_addr_udp().unwrap_err();
         assert!(matches!(err, crate::Error::EncapsulationMismatch));
+        let err = sock.peer_addr_udp().unwrap_err();
+        assert!(matches!(err, crate::Error::EncapsulationMismatch));
     }
 
     #[test]
     fn set_ipv6_dontfrag_on_ipv4_socket_returns_io_error() {
-        let Some(receiver) = bind_v4_local() else {
+        let Some((sock, _receiver)) = connected_v4_pair() else {
             return;
         };
-        let receiver_addr = as_v4(receiver.local_addr().unwrap());
-
-        let sock = match TunnelSocket::udp(
-            &UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
-            &UdpEndpoint::V4(receiver_addr),
-            None,
-        ) {
-            Ok(s) => s,
-            Err(crate::Error::Io(e))
-                if e.kind() == io::ErrorKind::PermissionDenied =>
-            {
-                return;
-            }
-            Err(e) => panic!("unexpected tunnel socket error: {e:?}"),
-        };
-
         let err = sock.set_ipv6_dontfrag(true).unwrap_err();
         assert!(matches!(err, crate::Error::Io(_)));
         assert!(err.raw_os_error().is_some());
+        assert!(matches!(
+            sock.local_addr_ip(),
+            Err(crate::Error::EncapsulationMismatch)
+        ));
     }
 
     #[test]
     fn sockets_are_close_on_exec() {
-        let fd = match socket(libc::AF_INET, libc::SOCK_DGRAM, 0) {
-            Ok(fd) => fd,
-            Err(crate::Error::Io(e))
-                if e.kind() == io::ErrorKind::PermissionDenied =>
-            {
-                return;
-            }
-            Err(e) => panic!("unexpected socket create error: {e:?}"),
+        let Some(fd) = udp_fd(libc::AF_INET) else {
+            return;
         };
         // SAFETY: `fd` is an open descriptor owned by this test.
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
@@ -1290,27 +1713,11 @@ mod tests {
 
     #[test]
     fn reconnect_udp_rejects_family_mismatch_with_clear_error() {
-        let Some(receiver) = bind_v4_local() else {
+        let Some((sock, _receiver)) = connected_v4_pair() else {
             return;
         };
-        let receiver_addr = as_v4(receiver.local_addr().unwrap());
-
-        let sock = match TunnelSocket::udp(
-            &UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
-            &UdpEndpoint::V4(receiver_addr),
-            None,
-        ) {
-            Ok(s) => s,
-            Err(crate::Error::Io(e))
-                if e.kind() == io::ErrorKind::PermissionDenied =>
-            {
-                return;
-            }
-            Err(e) => panic!("unexpected tunnel socket error: {e:?}"),
-        };
-
         let err = sock
-            .reconnect_udp(&UdpEndpoint::V6(std::net::SocketAddrV6::new(
+            .reconnect_udp(&UdpEndpoint::V6(SocketAddrV6::new(
                 Ipv6Addr::LOCALHOST,
                 1701,
                 0,
@@ -1322,23 +1729,10 @@ mod tests {
 
     #[test]
     fn reconnect_ip_rejects_udp_socket() {
-        let fd =
-            match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
-                Ok(fd) => fd,
-                Err(crate::Error::Io(e))
-                    if e.kind() == io::ErrorKind::PermissionDenied =>
-                {
-                    return;
-                }
-                Err(e) => panic!("unexpected socket create error: {e:?}"),
-            };
-        let sock = TunnelSocket {
-            fd,
-            encap: SocketEncap::Udp,
-            family: SocketFamily::V4,
-            scope: None,
-            pinned: AtomicBool::new(false),
+        let Some(fd) = udp_fd(libc::AF_INET) else {
+            return;
         };
+        let sock = raw_socket(fd, SocketEncap::Udp, SocketFamily::V4, None);
 
         let err = sock
             .reconnect_ip(&IpEndpoint::V4(Ipv4Addr::LOCALHOST))
@@ -1348,23 +1742,10 @@ mod tests {
 
     #[test]
     fn reconnect_ip_rejects_family_mismatch_with_clear_error() {
-        let fd =
-            match socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
-                Ok(fd) => fd,
-                Err(crate::Error::Io(e))
-                    if e.kind() == io::ErrorKind::PermissionDenied =>
-                {
-                    return;
-                }
-                Err(e) => panic!("unexpected socket create error: {e:?}"),
-            };
-        let sock = TunnelSocket {
-            fd,
-            encap: SocketEncap::Ip,
-            family: SocketFamily::V4,
-            scope: None,
-            pinned: AtomicBool::new(false),
+        let Some(fd) = udp_fd(libc::AF_INET) else {
+            return;
         };
+        let sock = raw_socket(fd, SocketEncap::Ip, SocketFamily::V4, None);
 
         let err = sock
             .reconnect_ip(&IpEndpoint::v6(Ipv6Addr::LOCALHOST))
@@ -1373,7 +1754,8 @@ mod tests {
     }
 
     #[test]
-    fn sockaddr_l2tpip_matches_sockaddr_size() {
+    fn sockaddr_layouts_match_the_kernel() {
         assert_eq!(size_of::<SockaddrL2tpIp>(), size_of::<libc::sockaddr>());
+        assert_eq!(size_of::<SockaddrL2tpIp6>(), 32);
     }
 }
