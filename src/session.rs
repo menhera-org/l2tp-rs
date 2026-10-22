@@ -48,7 +48,11 @@ pub struct SessionConfig {
     /// Optional interface name for `SESSION_CREATE`.
     ///
     /// For Ethernet pseudowires, this names the `l2tpeth*` netdevice created
-    /// by the kernel. Tunnel objects do not have an `ifname`.
+    /// by the kernel. Tunnel objects do not have an `ifname`. The kernel
+    /// records this name for the session's lifetime; see
+    /// [`SessionInfo::ifname`] before renaming the device. Give each session
+    /// a unique explicit name, so no other device can hold it while the
+    /// session exists.
     #[cfg_attr(
         feature = "serde",
         serde(default, with = "crate::types::ifname_serde")
@@ -144,7 +148,22 @@ pub struct SessionInfo {
     pub lns_mode: bool,
     /// Receive timeout in milliseconds.
     pub recv_timeout_ms: Option<u64>,
-    /// Kernel-assigned or requested session interface name.
+    /// The session interface name as recorded when the session was created.
+    ///
+    /// The kernel copies the `l2tpeth` device's name into the session once,
+    /// right after creating the device, and never updates it: an interface
+    /// renamed afterwards with rtnetlink keeps being reported, and matched
+    /// by the `*_by_ifname` lookups, under this original name. Applications
+    /// that rename these interfaces, or run where udev or networkd rename
+    /// them, must track the device by its interface index:
+    /// [`SessionHandle::ifindex`] captures it from the kernel's registration
+    /// broadcast when the session is created. A lookup of this name with
+    /// [`L2tpIfNameExt::index`](crate::L2tpIfNameExt::index) is only
+    /// correct while the interface still bears it, and the kernel does not
+    /// report the index itself. Request an explicit, unique name in
+    /// [`SessionConfig::ifname`] rather than relying on the kernel's
+    /// `l2tpeth%d` pool, so that no other device can hold the name while
+    /// this one does.
     #[cfg_attr(
         feature = "serde",
         serde(default, with = "crate::types::ifname_serde")
@@ -182,6 +201,7 @@ pub struct SessionHandle {
     pub(crate) tunnel_id: TunnelId,
     pub(crate) session_id: SessionId,
     pub(crate) ifname: Option<L2tpIfName>,
+    pub(crate) ifindex: Option<u32>,
     pub(crate) auto_delete: bool,
     pub(crate) handle: crate::handle::L2tpHandle,
 }
@@ -197,9 +217,36 @@ impl SessionHandle {
         self.session_id
     }
 
-    /// Returns the interface name, if one was assigned.
+    /// Returns the interface name the session was created with, if one was
+    /// assigned.
+    ///
+    /// This is the name the kernel recorded at creation, which a later
+    /// rename does not change; see [`SessionInfo::ifname`]. Use
+    /// [`ifindex`](Self::ifindex) to follow the device through renames.
     pub fn ifname(&self) -> Option<&L2tpIfName> {
         self.ifname.as_ref()
+    }
+
+    /// Returns the interface index of the session's `l2tpeth` device.
+    ///
+    /// The index identifies the device for its whole life, while
+    /// [`ifname`](Self::ifname) is only its name at creation; address the
+    /// device by this index in rtnetlink, including to rename it.
+    ///
+    /// For a session created by
+    /// [`L2tpHandle::create_session`](crate::L2tpHandle::create_session)
+    /// the index comes from the kernel's `RTM_NEWLINK` registration
+    /// broadcast, which a listener joined before the request had received
+    /// by the time the kernel acknowledged it, so a rename by udev or
+    /// networkd right after creation cannot make it name another device.
+    /// Only if that notification was lost, or the listener could not be
+    /// opened, is the index looked up by name. For a handle from the
+    /// `open_*` methods the index is always looked up by name when the
+    /// handle is opened, which is correct unless the interface has been
+    /// renamed in between. `None` when the session has no interface or the
+    /// index could not be determined.
+    pub fn ifindex(&self) -> Option<u32> {
+        self.ifindex
     }
 
     /// Returns whether the session is deleted when the handle is dropped.

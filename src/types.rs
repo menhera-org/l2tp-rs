@@ -323,7 +323,11 @@ pub trait L2tpIfNameExt: sealed::Sealed + Sized {
     /// Interface indexes change when an interface is re-created, so resolve
     /// the name right before it is used. For example, build the scope ID of a
     /// link-local [`SocketAddrV6`](std::net::SocketAddrV6) just before
-    /// creating or reconnecting a UDP tunnel socket. The error carries
+    /// creating or reconnecting a UDP tunnel socket. Conversely, names change
+    /// when an interface is renamed while its index stays: resolve the
+    /// [`SessionInfo::ifname`](crate::SessionInfo::ifname) of a new session
+    /// right away and keep the index, because the kernel reports the
+    /// creation-time name for the session's lifetime. The error carries
     /// `ENODEV` when no interface has this name.
     fn index(&self) -> crate::Result<u32>;
 

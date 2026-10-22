@@ -569,6 +569,7 @@ pub struct SessionHandle {
     tunnel_id: TunnelId,
     session_id: SessionId,
     ifname: Option<L2tpIfName>,
+    ifindex: Option<u32>,
     inner: Option<crate::SessionHandle>,
     l2tp: L2tpHandle,
 }
@@ -579,6 +580,7 @@ impl SessionHandle {
             tunnel_id: inner.tunnel_id(),
             session_id: inner.session_id(),
             ifname: inner.ifname().copied(),
+            ifindex: inner.ifindex(),
             inner: Some(inner),
             l2tp,
         }
@@ -594,9 +596,16 @@ impl SessionHandle {
         self.session_id
     }
 
-    /// Returns the interface name, if one was assigned.
+    /// Returns the interface name the session was created with; see
+    /// [`crate::SessionHandle::ifname`].
     pub fn ifname(&self) -> Option<&L2tpIfName> {
         self.ifname.as_ref()
+    }
+
+    /// Returns the interface index of the session's device; see
+    /// [`crate::SessionHandle::ifindex`].
+    pub fn ifindex(&self) -> Option<u32> {
+        self.ifindex
     }
 
     /// See [`crate::SessionHandle::auto_delete`].

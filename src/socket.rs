@@ -83,6 +83,11 @@ struct Link {
     /// Whether the socket has a peer. Cleared by `disconnect`, because the
     /// kernel keeps reporting the old peer of an IPv6 L2TP/IP socket.
     connected: bool,
+    /// Device the socket is bound to with `SO_BINDTODEVICE`. The kernel
+    /// forgets it on `disconnect`. Unlike `scope`, it is never resolved to
+    /// an index by this type: the kernel routes through it by itself, so
+    /// its disappearance only matters to the kernel.
+    device: Option<L2tpIfName>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +241,7 @@ impl TunnelSocket {
                 pinned,
                 peer_v4: 0,
                 connected: true,
+                device: device.copied(),
             }),
         })
     }
@@ -247,14 +253,16 @@ impl TunnelSocket {
     /// records `peer_tunnel_id` as the peer connection ID.
     ///
     /// Link-local IPv6 endpoints need an interface scope
-    /// ([`IpEndpoint::v6_scoped`]). The scopes of `local` and `remote` and
-    /// the `device` must name the same interface. That name is resolved to
-    /// the interface index here and again on every
-    /// [`reconnect_ip`](Self::reconnect_ip). If the interface is re-created,
-    /// first [`disconnect`](Self::disconnect) to clear the old binding;
-    /// reapply [`bind_to_device`](Self::bind_to_device) if needed, then
-    /// reconnect. The lookup happens in the socket's own network namespace,
-    /// even when the socket was created through
+    /// ([`IpEndpoint::v6_scoped`]) or a `device`, which pins the socket with
+    /// `SO_BINDTODEVICE`. The scopes of `local` and `remote` and the
+    /// `device` must name the same interface. A scope is resolved to the
+    /// interface index whenever a link-local address is bound or connected,
+    /// here and on every [`reconnect_ip`](Self::reconnect_ip); the `device`
+    /// is only ever handed to the kernel by name. If the interface is
+    /// re-created, first [`disconnect`](Self::disconnect) to clear the old
+    /// binding; reapply [`bind_to_device`](Self::bind_to_device) if needed,
+    /// then reconnect. The lookup happens in the socket's own network
+    /// namespace, even when the socket was created through
     /// [`NetNs::run`](crate::NetNs::run) and is reconnected from a thread
     /// in another namespace. Unlike `device`, a scope does not need
     /// `CAP_NET_RAW`.
@@ -268,14 +276,22 @@ impl TunnelSocket {
         if local.ip_version() != remote.ip_version() {
             return Err(crate::Error::AddressFamilyMismatch);
         }
-        let scope =
-            unified_scope([local.scope(), remote.scope(), device])?.copied();
-        require_scope(local, scope.as_ref(), false)?;
-        require_scope(remote, scope.as_ref(), false)?;
+        // The device may stand in for a missing scope, but it is not one:
+        // the kernel pins the socket to it by name, so it is kept apart from
+        // the scope that link-local addresses resolve on every reconnect.
+        let pinning = unified_scope([local.scope(), remote.scope(), device])?;
+        require_scope(local, pinning, false)?;
+        require_scope(remote, pinning, false)?;
+        let scope = unified_scope([local.scope(), remote.scope()])?.copied();
 
         let family = SocketFamily::from_ip(local);
         let fd = socket(family.domain(), libc::SOCK_DGRAM, IPPROTO_L2TP)?;
-        let scope_id = resolve_scope(fd.as_raw_fd(), scope.as_ref())?;
+        let scope_id = if local.is_link_local() || remote.is_link_local() {
+            resolve_scope(fd.as_raw_fd(), scope.as_ref())?
+        } else {
+            // The kernel ignores the scope of other addresses.
+            0
+        };
 
         if let Some(device) = device {
             set_bind_to_device(fd.as_raw_fd(), device)?;
@@ -301,6 +317,7 @@ impl TunnelSocket {
                 pinned,
                 peer_v4: v4_bits(remote),
                 connected: true,
+                device: device.copied(),
             }),
         })
     }
@@ -333,9 +350,12 @@ impl TunnelSocket {
     ///
     /// The socket must be an `AF_INET` or `AF_INET6` `SOCK_DGRAM` socket of
     /// protocol UDP or `IPPROTO_L2TP`; anything else fails with
-    /// `EAFNOSUPPORT`, `ESOCKTNOSUPPORT` or `EPROTONOSUPPORT`. The bound
-    /// device, link-local scope and local connection ID are read back from
-    /// the kernel, as is the peer connection ID for IPv6 L2TP/IP sockets.
+    /// `EAFNOSUPPORT`, `ESOCKTNOSUPPORT` or `EPROTONOSUPPORT`, and the
+    /// descriptor is closed with the error, as it is on any other failure
+    /// here. The bound device, link-local scope and local connection ID are
+    /// read back from the kernel, as is the peer connection ID for IPv6
+    /// L2TP/IP sockets; the scope is the name of the interface a link-local
+    /// local address is bound to, which must still exist.
     /// Build the tunnel configuration from the adopted socket with
     /// [`TunnelConfig::for_socket`], except for an IPv4 L2TP/IP socket,
     /// whose peer the kernel does not report (see
@@ -365,24 +385,25 @@ impl TunnelSocket {
                 _ => return Err(errno(libc::EPROTONOSUPPORT)),
             };
         let device = bound_device(raw)?;
-        let (scoped, conn_id, peer_conn_id) = match (encap, family) {
+        // The interface a bound link-local address is scoped to, by name.
+        let scope_name = |addr: Ipv6Addr, scope_id: u32| {
+            (addr.is_unicast_link_local() && scope_id != 0)
+                .then(|| interface_name(raw, scope_id))
+                .transpose()
+        };
+        let (scope, conn_id, peer_conn_id) = match (encap, family) {
             (SocketEncap::Udp, SocketFamily::V6) => {
-                let name = socket_name(raw, false)?;
-                let addr = sockaddr_in6(&name)?;
-                (
-                    addr.ip().is_unicast_link_local() && addr.scope_id() != 0,
-                    None,
-                    None,
-                )
+                let addr = sockaddr_in6(&socket_name(raw, false)?)?;
+                (scope_name(*addr.ip(), addr.scope_id())?, None, None)
             }
-            (SocketEncap::Udp, SocketFamily::V4) => (false, None, None),
+            (SocketEncap::Udp, SocketFamily::V4) => (None, None, None),
             (SocketEncap::Ip, SocketFamily::V6) => {
                 let local = l2tp_sockaddr_in6(&socket_name(raw, false)?)?;
-                let scoped = Ipv6Addr::from(local.l2tp_addr.s6_addr)
-                    .is_unicast_link_local()
-                    && local.l2tp_scope_id != 0;
                 (
-                    scoped,
+                    scope_name(
+                        Ipv6Addr::from(local.l2tp_addr.s6_addr),
+                        local.l2tp_scope_id,
+                    )?,
                     Some(local.l2tp_conn_id),
                     Some(peer_conn_id_in6(raw)),
                 )
@@ -393,7 +414,7 @@ impl TunnelSocket {
                     .ok()
                     .and_then(|name| l2tp_sockaddr_in(&name).ok());
                 (
-                    false,
+                    None,
                     Some(local.l2tp_conn_id),
                     peer.map(|peer| peer.l2tp_conn_id),
                 )
@@ -403,13 +424,14 @@ impl TunnelSocket {
             fd,
             encap,
             family,
-            scope: device,
+            scope,
             conn_id,
             peer_conn_id,
             link: Mutex::new(Link {
-                pinned: device.is_some() || scoped,
+                pinned: device.is_some() || scope.is_some(),
                 peer_v4: 0,
                 connected: true,
+                device,
             }),
         })
     }
@@ -495,11 +517,14 @@ impl TunnelSocket {
                 {
                     return Err(crate::Error::AddressFamilyMismatch);
                 }
-                // The socket is bound already; the scopes only have to agree.
+                // The socket is bound already; the scopes only have to agree
+                // with each other and with the device the socket is on.
+                let link = self.link();
                 unified_scope([
                     local.scope(),
                     remote.scope(),
                     self.scope.as_ref(),
+                    link.device.as_ref(),
                 ])?;
             }
             _ => return Err(crate::Error::EncapsulationMismatch),
@@ -553,6 +578,7 @@ impl TunnelSocket {
         let mut link = self.link();
         set_bind_to_device(self.fd.as_raw_fd(), device)?;
         link.pinned = true;
+        link.device = Some(*device);
         Ok(())
     }
 
@@ -589,6 +615,7 @@ impl TunnelSocket {
             pinned: false,
             peer_v4: 0,
             connected: false,
+            device: None,
         };
         Ok(())
     }
@@ -673,8 +700,10 @@ impl TunnelSocket {
     /// A link-local `new_remote` needs an interface scope unless the socket
     /// is already pinned to an interface. The socket's own scope is used when
     /// `new_remote` has none, and the two must agree otherwise. The name is
-    /// resolved to the interface index on every call, in the socket's own
-    /// network namespace.
+    /// resolved to the interface index on every call that connects a
+    /// link-local address, in the socket's own network namespace; other
+    /// addresses need no scope and resolve none, so a device the socket was
+    /// bound to may have disappeared.
     ///
     /// If the interface was re-created, call [`disconnect`](Self::disconnect)
     /// first to clear the old interface index. Reapply
@@ -698,7 +727,11 @@ impl TunnelSocket {
         let scope = unified_scope([new_remote.scope(), self.scope.as_ref()])?;
         let mut link = self.link();
         require_scope(new_remote, scope, link.pinned)?;
-        let scope_id = resolve_scope(self.fd.as_raw_fd(), scope)?;
+        let scope_id = if new_remote.is_link_local() {
+            resolve_scope(self.fd.as_raw_fd(), scope)?
+        } else {
+            0
+        };
 
         connect(
             self.fd.as_raw_fd(),
@@ -1185,7 +1218,10 @@ fn resolve_scope(fd: RawFd, scope: Option<&L2tpIfName>) -> crate::Result<u32> {
 /// kernel answers for the namespace the socket lives in; `if_nametoindex(3)`
 /// would use the calling thread's namespace. The error carries `ENODEV` when
 /// no interface has this name.
-fn interface_index(fd: RawFd, name: &L2tpIfName) -> crate::Result<u32> {
+pub(crate) fn interface_index(
+    fd: RawFd,
+    name: &L2tpIfName,
+) -> crate::Result<u32> {
     // SAFETY: an all-zero `ifreq` is a valid value.
     let mut request: libc::ifreq = unsafe { zeroed() };
     for (dst, src) in request.ifr_name.iter_mut().zip(name.as_array()) {
@@ -1309,6 +1345,7 @@ mod tests {
                 pinned: false,
                 peer_v4: 0,
                 connected: true,
+                device: None,
             }),
         }
     }
@@ -1555,6 +1592,59 @@ mod tests {
             .reconnect_ip(&IpEndpoint::v6(link_local))
             .unwrap_err();
         assert!(matches!(err, crate::Error::ScopeRequired(_)));
+
+        // The device the socket is bound to must agree with the scopes too.
+        unscoped.link().device = Some(L2tpIfName::new("eth1").unwrap());
+        let err = unscoped
+            .configure(&Encapsulation::Ip {
+                local: IpEndpoint::v6_scoped(link_local, lo),
+                remote: IpEndpoint::v6(link_local),
+            })
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ScopeMismatch { .. }));
+    }
+
+    #[test]
+    fn device_bindings_are_not_resolved_as_scopes() {
+        let tunnel_id = TunnelId(0x4c32_5100 ^ std::process::id());
+        let localhost = IpEndpoint::v6(Ipv6Addr::LOCALHOST);
+        let sock = match TunnelSocket::ip(
+            &localhost,
+            &localhost,
+            None,
+            tunnel_id,
+            TunnelId(tunnel_id.0 ^ 1),
+        ) {
+            Ok(sock) => sock,
+            Err(crate::Error::Io(e)) if skippable(&e) => return,
+            Err(e) => panic!("unexpected IP socket error: {e:?}"),
+        };
+        assert_eq!(sock.scope, None);
+        assert_eq!(sock.link().device, None);
+
+        // A device that disappeared after SO_BINDTODEVICE was applied is the
+        // kernel's business; reconnecting to a global address never looks
+        // it up.
+        let missing = L2tpIfName::new("l2tp-no-such0").unwrap();
+        sock.link().device = Some(missing);
+        sock.reconnect_ip(&localhost).unwrap();
+        // Disconnecting forgets the device, as the kernel does.
+        sock.disconnect().unwrap();
+        assert_eq!(sock.link().device, None);
+        sock.reconnect_ip(&localhost).unwrap();
+
+        // A scope is resolved only when a link-local address needs it.
+        let scoped = TunnelSocket {
+            scope: Some(missing),
+            ..sock
+        };
+        scoped.reconnect_ip(&localhost).unwrap();
+        let err = scoped
+            .reconnect_ip(&IpEndpoint::v6(Ipv6Addr::new(
+                0xfe80, 0, 0, 0, 0, 0, 0, 1,
+            )))
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENODEV), "{err:?}");
     }
 
     #[tokio::test]

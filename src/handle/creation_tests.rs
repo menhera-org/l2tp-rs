@@ -11,14 +11,19 @@ use std::{
 };
 
 use bytes::BufMut;
-use netlink_packet_core::ErrorMessage;
+use netlink_packet_core::{ErrorMessage, NetlinkSerializable};
+use netlink_packet_generic::ctrl::{
+    GenlCtrl, GenlCtrlCmd,
+    nlas::{GenlCtrlAttrs, McastGrpAttrs},
+};
 use netlink_packet_l2tp::{L2tpCmd, L2tpPwType};
 use netlink_sys::{AsyncSocket, Socket, SocketAddr};
 
-use super::*;
+use super::{tests::TEST_FAMILY_ID, *};
 use crate::{Encapsulation, UdpEndpoint};
 
 type Message = NetlinkMessage<GenlMessage<L2tpMessage>>;
+type FamilyQuery = NetlinkMessage<GenlMessage<GenlCtrl>>;
 type Creation = Pin<Box<dyn Future<Output = crate::Result<()>> + Send>>;
 
 // Exercise the real generic-netlink request queue and response decoder without
@@ -27,7 +32,8 @@ type Creation = Pin<Box<dyn Future<Output = crate::Result<()>> + Send>>;
 // independently of the caller and the creation task.
 #[derive(Default)]
 struct Wire {
-    requests: VecDeque<Message>,
+    /// Requests as sent, so each test decodes them as the family it expects.
+    requests: VecDeque<Vec<u8>>,
     replies: VecDeque<Vec<u8>>,
 }
 
@@ -52,11 +58,7 @@ impl AsyncSocket for TestSocket {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.0
-            .lock()
-            .unwrap()
-            .requests
-            .push_back(Message::deserialize(buf).unwrap());
+        self.0.lock().unwrap().requests.push_back(buf.to_vec());
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -125,26 +127,73 @@ impl Harness {
         tokio::task::yield_now().await;
     }
 
-    async fn next_request(&mut self, expected: L2tpCmd) -> Message {
+    async fn next_raw_request(&mut self, what: &str) -> Vec<u8> {
         for _ in 0..16 {
             self.step().await;
-            if let Some(message) =
-                self.wire.lock().unwrap().requests.pop_front()
-            {
-                assert_eq!(payload(&message).cmd, expected);
-                assert!(
-                    payload(&message)
-                        .attributes
-                        .contains(&L2tpAttribute::ConnId(101))
-                );
-                return message;
+            if let Some(raw) = self.wire.lock().unwrap().requests.pop_front() {
+                return raw;
             }
         }
-        panic!("no {expected:?} request after driving all ready tasks");
+        panic!("no {what} request after driving all ready tasks");
     }
 
-    fn reply(&mut self, request: &Message, mut reply: Message) {
-        reply.header.sequence_number = request.header.sequence_number;
+    async fn next_request(&mut self, expected: L2tpCmd) -> Message {
+        let raw = self.next_raw_request(&format!("{expected:?}")).await;
+        let message = Message::deserialize(&raw).unwrap();
+        assert_eq!(payload(&message).cmd, expected);
+        assert!(
+            payload(&message)
+                .attributes
+                .contains(&L2tpAttribute::ConnId(101))
+        );
+        message
+    }
+
+    /// The `nlctrl` query that resolves the `l2tp` family.
+    async fn next_family_query(&mut self) -> FamilyQuery {
+        let raw = self.next_raw_request("CTRL_CMD_GETFAMILY").await;
+        let message = FamilyQuery::deserialize(&raw).unwrap();
+        let NetlinkPayload::InnerMessage(query) = &message.payload else {
+            panic!("expected a family query");
+        };
+        assert_eq!(query.payload.cmd, GenlCtrlCmd::GetFamily);
+        assert!(
+            query
+                .payload
+                .nlas
+                .contains(&GenlCtrlAttrs::FamilyName("l2tp".to_string()))
+        );
+        message
+    }
+
+    fn family_reply(&mut self, query: &FamilyQuery, family_id: u16) {
+        let reply = GenlMessage::from_payload(GenlCtrl {
+            cmd: GenlCtrlCmd::GetFamily,
+            nlas: vec![
+                GenlCtrlAttrs::FamilyName("l2tp".to_string()),
+                GenlCtrlAttrs::FamilyId(family_id),
+                GenlCtrlAttrs::McastGroups(vec![vec![
+                    McastGrpAttrs::Name("l2tp".to_string()),
+                    McastGrpAttrs::Id(7),
+                ]]),
+            ],
+        });
+        self.reply_with_sequence(
+            query.header.sequence_number,
+            NetlinkMessage::from(reply),
+        );
+    }
+
+    fn reply(&mut self, request: &Message, reply: Message) {
+        self.reply_with_sequence(request.header.sequence_number, reply);
+    }
+
+    fn reply_with_sequence<T: NetlinkSerializable + std::fmt::Debug>(
+        &mut self,
+        sequence_number: u32,
+        mut reply: NetlinkMessage<T>,
+    ) {
+        reply.header.sequence_number = sequence_number;
         reply.finalize();
         let mut bytes = vec![0; reply.buffer_len()];
         reply.serialize(&mut bytes);
@@ -161,6 +210,15 @@ impl Harness {
     }
 
     fn tunnel_reply(&mut self, request: &Message, version: L2tpVersion) {
+        self.tunnel_reply_from(request, version, TEST_FAMILY_ID);
+    }
+
+    fn tunnel_reply_from(
+        &mut self,
+        request: &Message,
+        version: L2tpVersion,
+        family_id: u16,
+    ) {
         let mut message = L2tpMessage::new(L2tpCmd::TunnelGet);
         message.attributes = vec![
             L2tpAttribute::ConnId(101),
@@ -173,7 +231,7 @@ impl Harness {
             L2tpAttribute::UdpDport(1702),
         ];
         let mut genl = GenlMessage::from_payload(message);
-        genl.set_resolved_family_id(1234);
+        genl.set_resolved_family_id(family_id);
         self.reply(request, Message::from(genl));
     }
 
@@ -212,6 +270,18 @@ impl Harness {
             self.ack(&get, libc::ENODEV);
         }
         self.assert_idle().await;
+    }
+
+    /// Drives the transport until `task` has finished, then returns its
+    /// output; the caller's `await` alone would never poll the connection.
+    async fn settle<T>(&mut self, task: tokio::task::JoinHandle<T>) -> T {
+        for _ in 0..64 {
+            if task.is_finished() {
+                return task.await.unwrap();
+            }
+            self.step().await;
+        }
+        panic!("the task did not finish after driving the transport");
     }
 
     async fn assert_idle(&mut self) {
@@ -572,6 +642,50 @@ async fn completed_but_unclaimed_creation_results_are_deleted() {
     }
 }
 
+#[tokio::test]
+async fn requests_retry_once_after_the_family_id_changed() {
+    // Generic netlink answers ENOENT for a family it no longer knows, which
+    // happens when l2tp_netlink was reloaded under a new identifier.
+    let mut harness = Harness::new();
+    let handle = harness.handle.clone();
+    let lookup =
+        tokio::spawn(async move { handle.get_tunnel(TunnelId(101)).await });
+    let get = harness.next_request(L2tpCmd::TunnelGet).await;
+    assert_eq!(get.header.message_type, TEST_FAMILY_ID);
+    harness.ack(&get, libc::ENOENT);
+
+    let query = harness.next_family_query().await;
+    harness.family_reply(&query, 4321);
+    let get = harness.next_request(L2tpCmd::TunnelGet).await;
+    assert_eq!(get.header.message_type, 4321);
+    harness.tunnel_reply_from(&get, L2tpVersion::V3, 4321);
+
+    let info = harness.settle(lookup).await.unwrap();
+    assert_eq!(info.tunnel_id, TunnelId(101));
+    let family = harness.handle.inner.cached_family().unwrap();
+    assert_eq!(family.id, 4321);
+    assert_eq!(family.events_group, Some(7));
+    harness.assert_idle().await;
+}
+
+#[tokio::test]
+async fn requests_are_not_retried_while_the_family_id_is_unchanged() {
+    let mut harness = Harness::new();
+    let handle = harness.handle.clone();
+    let lookup =
+        tokio::spawn(async move { handle.get_tunnel(TunnelId(101)).await });
+    let get = harness.next_request(L2tpCmd::TunnelGet).await;
+    harness.ack(&get, libc::ENOENT);
+    let query = harness.next_family_query().await;
+    harness.family_reply(&query, TEST_FAMILY_ID);
+    // The identifier is current, so ENOENT is the kernel's real answer.
+    assert_eq!(
+        harness.settle(lookup).await.unwrap_err().raw_os_error(),
+        Some(libc::ENOENT)
+    );
+    harness.assert_idle().await;
+}
+
 #[test]
 fn deletion_wait_handles_present_tunnels_without_runtime_drivers() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -606,11 +720,12 @@ fn deletion_wait_handles_present_tunnels_without_runtime_drivers() {
                 assert!(wait.as_mut().poll(cx).is_pending());
                 assert!(harness.connection.as_mut().poll(cx).is_pending());
                 match harness.wire.lock().unwrap().requests.pop_front() {
-                    Some(request) => Poll::Ready(request),
+                    Some(raw) => Poll::Ready(Message::deserialize(&raw)),
                     None => Poll::Pending,
                 }
             })
-            .await;
+            .await
+            .unwrap();
             assert_eq!(payload(&get).cmd, L2tpCmd::TunnelGet);
             harness.ack(&get, code);
             let result = futures::future::poll_fn(|cx| {

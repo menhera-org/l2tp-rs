@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-use std::{fmt, io, os::fd::AsRawFd, sync::Arc};
+use std::{
+    fmt, io,
+    os::fd::AsRawFd,
+    sync::{Arc, PoisonError},
+};
 
 use futures::{Stream, StreamExt, channel::mpsc::UnboundedReceiver};
 use genetlink::{GenetlinkHandle, message::RawGenlMessage};
@@ -16,9 +20,11 @@ use netlink_proto::{
 };
 
 use crate::{
-    Events, L2tpIfName, L2tpVersion, NetNs, SessionConfig, SessionHandle,
-    SessionId, SessionInfo, SessionModify, SessionStats, TunnelConfig,
-    TunnelHandle, TunnelId, TunnelInfo, TunnelSocket, TunnelStats,
+    Events, L2tpIfName, L2tpIfNameExt, L2tpVersion, NetNs, PseudowireType,
+    SessionConfig, SessionHandle, SessionId, SessionInfo, SessionModify,
+    SessionStats, TunnelConfig, TunnelHandle, TunnelId, TunnelInfo,
+    TunnelSocket, TunnelStats,
+    link::LinkMonitor,
     netlink::{self, SessionRef},
 };
 
@@ -37,9 +43,22 @@ pub struct L2tpHandle {
 
 struct L2tpInner {
     genl: GenetlinkHandle,
-    family: tokio::sync::OnceCell<FamilyInfo>,
+    /// The resolved family, refreshed when the kernel no longer knows its
+    /// identifier (the `l2tp_netlink` module was reloaded).
+    family: std::sync::Mutex<Option<FamilyInfo>>,
     /// Namespace the connection was opened in, for further connections.
     netns: NetNs,
+}
+
+impl L2tpInner {
+    fn cached_family(&self) -> Option<FamilyInfo> {
+        *self.family.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set_family(&self, family: FamilyInfo) {
+        *self.family.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(family);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -51,7 +70,7 @@ struct FamilyInfo {
 impl fmt::Debug for L2tpHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("L2tpHandle")
-            .field("family", &self.inner.family.get())
+            .field("family", &self.inner.cached_family())
             .field("netns", &self.inner.netns)
             .finish_non_exhaustive()
     }
@@ -135,7 +154,7 @@ impl L2tpHandle {
         Ok(Self {
             inner: Arc::new(L2tpInner {
                 genl,
-                family: tokio::sync::OnceCell::new(),
+                family: std::sync::Mutex::new(None),
                 netns,
             }),
         })
@@ -252,12 +271,35 @@ impl L2tpHandle {
     /// kernel's acknowledgement and follow-up lookup even if the caller cancels
     /// this future. An unclaimed session is dropped with auto-delete enabled.
     /// The runtime must keep running for this best-effort cleanup to finish.
+    ///
+    /// For Ethernet pseudowires the handle also carries the interface index
+    /// of the new `l2tpeth` device, captured from the kernel's registration
+    /// broadcast; see [`SessionHandle::ifindex`]. Give the session an
+    /// explicit, unique [`SessionConfig::ifname`] where interfaces may be
+    /// renamed by other software.
     pub async fn create_session(
         &self,
         config: SessionConfig,
     ) -> crate::Result<SessionHandle> {
         let message = netlink::encode_session_create(&config)?;
         let handle = self.clone();
+        // Subscribe before the request: the kernel queues the device's
+        // registration before it acknowledges the session.
+        let monitor = match config.pseudowire_type {
+            PseudowireType::Eth | PseudowireType::EthVlan => {
+                match LinkMonitor::open(&self.inner.netns) {
+                    Ok(monitor) => Some(monitor),
+                    Err(err) => {
+                        log::debug!(
+                            "l2tp: cannot watch link registrations, the \
+                             interface index will be looked up by name: {err}"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         run_creation(async move {
             // The kernel stores 32-bit session IDs even for V2, whose wire
             // format truncates them to 16 bits. Only query the parent when an
@@ -271,7 +313,7 @@ impl L2tpHandle {
                 return Err(crate::Error::V2IdTooLarge(id.0));
             }
             handle.send_ack(message).await?;
-            handle.get_created_session(config).await
+            handle.get_created_session(config, monitor).await
         })
         .await
     }
@@ -279,6 +321,7 @@ impl L2tpHandle {
     async fn get_created_session(
         &self,
         config: SessionConfig,
+        monitor: Option<LinkMonitor>,
     ) -> crate::Result<SessionHandle> {
         // Own the acknowledged session before the next await, so cancellation
         // also triggers best-effort deletion.
@@ -286,12 +329,20 @@ impl L2tpHandle {
             tunnel_id: config.tunnel_id,
             session_id: config.session_id,
             ifname: None,
+            ifindex: None,
             auto_delete: true,
             handle: self.clone(),
         };
         match self.get_session(config.tunnel_id, config.session_id).await {
             Ok(info) => {
                 session.ifname = info.ifname;
+                session.ifindex = match (monitor, &info.ifname) {
+                    (Some(monitor), Some(ifname)) => {
+                        self.registered_index(&monitor, ifname)
+                    }
+                    (None, Some(ifname)) => self.index_by_name(ifname),
+                    (_, None) => None,
+                };
                 Ok(session)
             }
             Err(err) => {
@@ -301,8 +352,59 @@ impl L2tpHandle {
         }
     }
 
+    /// The index the registration broadcast reported for `ifname`, or the
+    /// index the name resolves to now if the notification was lost.
+    fn registered_index(
+        &self,
+        monitor: &LinkMonitor,
+        ifname: &L2tpIfName,
+    ) -> Option<u32> {
+        match monitor.registered_index(ifname) {
+            Ok(Some(index)) => return Some(index),
+            Ok(None) => log::debug!(
+                "l2tp: no registration notification for {ifname:?}; looking \
+                 the index up by name"
+            ),
+            Err(err) => log::debug!(
+                "l2tp: link notifications were lost ({err}); looking the \
+                 index of {ifname:?} up by name"
+            ),
+        }
+        // The monitor's socket lives in the handle's namespace.
+        match crate::socket::interface_index(monitor.as_raw_fd(), ifname) {
+            Ok(index) => Some(index),
+            Err(err) => {
+                log::debug!("l2tp: cannot resolve {ifname:?}: {err}");
+                None
+            }
+        }
+    }
+
+    /// Resolves `ifname` in the handle's namespace, which is only correct
+    /// while the interface still bears that name.
+    fn index_by_name(&self, ifname: &L2tpIfName) -> Option<u32> {
+        let name = *ifname;
+        match self.inner.netns.run_if_needed(move || name.index()) {
+            Ok(Ok(index)) => Some(index),
+            Ok(Err(err)) => {
+                log::debug!("l2tp: cannot resolve {ifname:?}: {err}");
+                None
+            }
+            Err(err) => {
+                log::debug!(
+                    "l2tp: cannot enter the namespace to resolve {ifname:?}: \
+                     {err}"
+                );
+                None
+            }
+        }
+    }
+
     /// Returns a handle for an existing session after checking that the
     /// kernel knows it; auto-delete is disabled.
+    ///
+    /// The interface index is looked up by the session's creation-time
+    /// name; see [`SessionHandle::ifindex`].
     pub async fn open_session(
         &self,
         tunnel_id: TunnelId,
@@ -312,6 +414,7 @@ impl L2tpHandle {
         Ok(SessionHandle {
             tunnel_id,
             session_id,
+            ifindex: info.ifname.as_ref().and_then(|n| self.index_by_name(n)),
             ifname: info.ifname,
             auto_delete: false,
             handle: self.clone(),
@@ -320,6 +423,10 @@ impl L2tpHandle {
 
     /// Returns a handle for the existing Ethernet pseudowire session whose
     /// interface is `ifname`; auto-delete is disabled.
+    ///
+    /// `ifname` is the name the interface had when the session was created;
+    /// see [`get_session_by_ifname`](Self::get_session_by_ifname). The
+    /// interface index is looked up by that name too.
     pub async fn open_session_by_ifname(
         &self,
         ifname: &L2tpIfName,
@@ -328,6 +435,7 @@ impl L2tpHandle {
         Ok(SessionHandle {
             tunnel_id: info.tunnel_id,
             session_id: info.session_id,
+            ifindex: info.ifname.as_ref().and_then(|n| self.index_by_name(n)),
             ifname: info.ifname,
             auto_delete: false,
             handle: self.clone(),
@@ -361,6 +469,16 @@ impl L2tpHandle {
 
     /// Returns information for the Ethernet pseudowire session whose
     /// interface is `ifname`.
+    ///
+    /// The kernel matches `ifname` against the name it recorded when the
+    /// session was created. It does not follow later renames of the
+    /// `l2tpeth` device, so a renamed interface is still found under its
+    /// original name and never under its current one. An application that
+    /// renames interfaces should resolve the reported name to its interface
+    /// index right after creation with
+    /// [`L2tpIfNameExt::index`](crate::L2tpIfNameExt::index) and address
+    /// the device by that index from then on. Only L2TPv3 sessions are
+    /// searched.
     pub async fn get_session_by_ifname(
         &self,
         ifname: &L2tpIfName,
@@ -439,9 +557,11 @@ impl L2tpHandle {
     /// also waits, for up to about two seconds, until a lookup reports
     /// `ENODEV`. Once the deletion is acknowledged it is not undone: a
     /// lookup that fails otherwise is returned as is, and a tunnel still
-    /// listed after the wait is reported as [`Error::Io`](crate::Error::Io)
-    /// of kind [`TimedOut`](io::ErrorKind::TimedOut). The wait needs neither
-    /// a Tokio timer nor a free blocking thread.
+    /// listed after the wait is reported as
+    /// [`Error::DeletionPending`](crate::Error::DeletionPending), which
+    /// callers should treat as deleted, because repeating the request then
+    /// fails with `ENODEV`. The wait needs neither a Tokio timer nor a free
+    /// blocking thread.
     pub async fn delete_tunnel(
         &self,
         tunnel_id: TunnelId,
@@ -484,14 +604,7 @@ impl L2tpHandle {
                 return Ok(());
             }
         }
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "tunnel {tunnel_id} is still listed after its deletion was \
-                 acknowledged"
-            ),
-        )
-        .into())
+        Err(crate::Error::DeletionPending(tunnel_id))
     }
 
     async fn tunnel_removed(&self, tunnel_id: TunnelId) -> crate::Result<bool> {
@@ -515,6 +628,9 @@ impl L2tpHandle {
     }
 
     /// Deletes the Ethernet pseudowire session whose interface is `ifname`.
+    ///
+    /// `ifname` is the name the interface had when the session was created;
+    /// see [`get_session_by_ifname`](Self::get_session_by_ifname).
     pub async fn delete_session_by_ifname(
         &self,
         ifname: &L2tpIfName,
@@ -552,6 +668,9 @@ impl L2tpHandle {
 
     /// Returns the statistics of the Ethernet pseudowire session whose
     /// interface is `ifname`.
+    ///
+    /// `ifname` is the name the interface had when the session was created;
+    /// see [`get_session_by_ifname`](Self::get_session_by_ifname).
     pub async fn session_stats_by_ifname(
         &self,
         ifname: &L2tpIfName,
@@ -589,6 +708,9 @@ impl L2tpHandle {
 
     /// Applies mutable session parameters to the Ethernet pseudowire session
     /// whose interface is `ifname`.
+    ///
+    /// `ifname` is the name the interface had when the session was created;
+    /// see [`get_session_by_ifname`](Self::get_session_by_ifname).
     pub async fn modify_session_by_ifname(
         &self,
         ifname: &L2tpIfName,
@@ -624,7 +746,9 @@ impl L2tpHandle {
     /// The stream uses its own netlink connection on the current runtime;
     /// dropping it leaves the multicast group. Joining needs no privilege.
     /// Opening the socket from another namespace requires permission to
-    /// enter the handle's original namespace.
+    /// enter the handle's original namespace. The subscription is bound to
+    /// the family and group identifiers of the loaded `l2tp_netlink`
+    /// module; if the module is reloaded, subscribe again.
     pub async fn events(&self) -> crate::Result<Events> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             io::Error::other("tokio runtime is required for events")
@@ -651,27 +775,29 @@ impl L2tpHandle {
     }
 
     async fn resolve_family(&self) -> crate::Result<FamilyInfo> {
-        self.inner
-            .family
-            .get_or_try_init(|| async {
-                let family = self
-                    .inner
-                    .genl
-                    .resolve_family::<L2tpMessage>()
-                    .await
-                    .map_err(|e| {
-                        crate::Error::FamilyResolution(e.to_string())
-                    })?;
-                Ok(FamilyInfo {
-                    id: family.id,
-                    events_group: family
-                        .multicast_groups
-                        .get(EVENTS_GROUP)
-                        .copied(),
-                })
-            })
+        match self.inner.cached_family() {
+            Some(family) => Ok(family),
+            None => self.refresh_family().await,
+        }
+    }
+
+    /// Queries the family again, bypassing every cache. Generic netlink
+    /// assigns family identifiers dynamically, so a reloaded `l2tp_netlink`
+    /// module may come back under a different one.
+    async fn refresh_family(&self) -> crate::Result<FamilyInfo> {
+        self.inner.genl.clear_family_cache().await;
+        let family = self
+            .inner
+            .genl
+            .resolve_family::<L2tpMessage>()
             .await
-            .copied()
+            .map_err(|e| crate::Error::FamilyResolution(e.to_string()))?;
+        let info = FamilyInfo {
+            id: family.id,
+            events_group: family.multicast_groups.get(EVENTS_GROUP).copied(),
+        };
+        self.inner.set_family(info);
+        Ok(info)
     }
 
     async fn send_ack(&self, payload: L2tpMessage) -> crate::Result<()> {
@@ -686,9 +812,34 @@ impl L2tpHandle {
         payload: L2tpMessage,
         flags: u16,
     ) -> crate::Result<Vec<GenlMessage<L2tpMessage>>> {
+        let family_id = self.resolve_family().await?.id;
+        match self.send_to_family(payload.clone(), flags, family_id).await {
+            // Generic netlink answers ENOENT for a family identifier it no
+            // longer knows. The L2TP commands themselves never produce it,
+            // but only retry once the identifier has actually changed.
+            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {
+                let refreshed = self.refresh_family().await?.id;
+                if refreshed == family_id {
+                    return Err(err);
+                }
+                log::debug!(
+                    "l2tp: family id changed from {family_id} to \
+                     {refreshed}; retrying"
+                );
+                self.send_to_family(payload, flags, refreshed).await
+            }
+            result => result,
+        }
+    }
+
+    async fn send_to_family(
+        &self,
+        payload: L2tpMessage,
+        flags: u16,
+        family_id: u16,
+    ) -> crate::Result<Vec<GenlMessage<L2tpMessage>>> {
         let cmd = payload.cmd;
         log::debug!("l2tp: sending {cmd:?} with flags {flags:#06x}");
-        let family_id = self.resolve_family().await?.id;
         let mut genl = GenlMessage::from_payload(payload);
         genl.set_resolved_family_id(family_id);
 
@@ -901,12 +1052,14 @@ mod tests {
         ))
     }
 
+    pub(super) const TEST_FAMILY_ID: u16 = 1234;
+
     pub(super) fn test_handle(genl: GenetlinkHandle) -> L2tpHandle {
         L2tpHandle {
             inner: Arc::new(L2tpInner {
                 genl,
-                family: tokio::sync::OnceCell::new_with(Some(FamilyInfo {
-                    id: 1234,
+                family: std::sync::Mutex::new(Some(FamilyInfo {
+                    id: TEST_FAMILY_ID,
                     events_group: None,
                 })),
                 netns: NetNs::current().unwrap(),
@@ -1091,6 +1244,7 @@ mod tests {
             // pending.
             let mut lookup = Box::pin(handle.get_created_session(
                 SessionConfig::eth(TunnelId(1), SessionId(2), SessionId(3)),
+                None,
             ));
             assert!(futures::poll!(lookup.as_mut()).is_pending());
             drop(lookup);

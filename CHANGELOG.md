@@ -21,6 +21,11 @@
 - `SessionInfo::l2spec_type` is an `Option<L2SpecType>`. The kernel never
   reports the sublayer type, so it is `None` instead of an invented
   `L2SpecType::None`.
+- `delete_tunnel` and `TunnelHandle::delete` report a tunnel that is still
+  listed after the wait as `Error::DeletionPending` instead of
+  `Error::Io` of kind `TimedOut`; `Error::kind` still returns `TimedOut`
+  for it. The deletion is acknowledged and completes on its own, so callers
+  treat the tunnel as deleted.
 
 ### Added
 
@@ -60,6 +65,14 @@
 - Netlink requests and failures are logged through `log`.
 - CLI: `--proto-version`, `--ifname` as a session selector, cookies and
   peer tunnel identifiers in session output, and `l2tp monitor`.
+- A handle re-resolves the `l2tp` family identifier once when the kernel
+  answers `ENOENT`, so requests keep working after `l2tp_netlink` was
+  reloaded under a different identifier.
+- `SessionHandle::ifindex`: the interface index of an Ethernet session's
+  device. `create_session` captures it from the kernel's `RTM_NEWLINK`
+  registration broadcast, which it subscribes to before sending the
+  request, so a rename by udev or networkd right after creation cannot
+  make it name another device; the `open_*` methods look it up by name.
 
 ### Fixed
 
@@ -112,6 +125,21 @@
 - Documentation: closing a `PPPoL2TP` socket deletes its session, and the
   kernel sends no event for the teardown it performs itself (closed managed
   sockets, sessions of a deleted tunnel, released `PPPoL2TP` sockets).
+- A `device` given to `TunnelSocket::ip` was stored as the socket's
+  link-local scope, so every `reconnect_ip` resolved the device name and
+  failed with `ENODEV` once the device was gone, even for global addresses
+  and after `disconnect` had cleared the binding. The device is now kept
+  apart from the scope and never resolved; a scope is resolved only when a
+  link-local address is bound or connected. `disconnect` forgets the device
+  as the kernel does, and `TunnelConfig::for_socket` reports the scope of an
+  adopted socket by the interface its link-local address is bound to.
+- `Error::ScopeMismatch` escapes the interface names it prints, as
+  `Error::InvalidIfName` does.
+- Documentation: the kernel freezes a session's interface name at creation
+  and does not follow renames, so `SessionInfo::ifname` and the
+  `*_by_ifname` lookups use the original name; the name-to-index lookup is
+  not atomic, and the README describes how to capture the index without it.
+  `TunnelSocket::from_fd` closes the descriptor when it rejects it.
 
 ## 0.3.0 (2026-10-22)
 

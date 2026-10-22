@@ -11,9 +11,9 @@ use std::{
 use futures::StreamExt;
 use l2tp::{
     Cookie, Encapsulation, IpEndpoint, L2SpecType, L2tpEvent, L2tpHandle,
-    L2tpIfName, L2tpVersion, PppSocket, PppUnit, PseudowireType, SessionConfig,
-    SessionHandle, SessionId, SessionModify, TunnelConfig, TunnelHandle,
-    TunnelId, TunnelSocket, UdpEndpoint, blocking,
+    L2tpIfName, L2tpIfNameExt, L2tpVersion, PppSocket, PppUnit, PseudowireType,
+    SessionConfig, SessionHandle, SessionId, SessionModify, TunnelConfig,
+    TunnelHandle, TunnelId, TunnelSocket, UdpEndpoint, blocking,
 };
 
 static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -201,6 +201,18 @@ fn privileged_session_lifecycle_over_genl() {
             .await
             .unwrap_or_else(|e| panic!("create_session failed: {e}"));
         session.set_auto_delete(false);
+        // The index was captured from the registration broadcast and agrees
+        // with the name while the interface still bears it.
+        let ifindex =
+            session.ifindex().expect("ethernet sessions have an index");
+        assert_eq!(
+            session
+                .ifname()
+                .unwrap()
+                .index()
+                .unwrap_or_else(|e| panic!("{e}")),
+            ifindex
+        );
 
         let info = session
             .get()
@@ -238,6 +250,7 @@ fn privileged_session_lifecycle_over_genl() {
             .unwrap_or_else(|e| panic!("open_session_by_ifname failed: {e}"));
         assert!(!opened.auto_delete());
         assert_eq!(opened.ifname(), Some(&ifname));
+        assert_eq!(opened.ifindex(), Some(ifindex));
         drop(opened);
 
         handle

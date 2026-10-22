@@ -34,6 +34,7 @@ netlink-packet-l2tp    = "0.4"
 netlink-packet-core    = "0.9"
 netlink-packet-generic = "0.5"
 netlink-proto          = "0.13"
+netlink-sys            = "0.9"
 genetlink              = "0.3"
 tokio                  = { version = "1", features = ["rt", "sync", "net"] }
 libc                   = "0.2"
@@ -47,7 +48,6 @@ bytes                  = "1"
 # self-describing, and CBOR distinguishes byte strings from sequences.
 ciborium               = "0.2"
 postcard               = { version = "1", default-features = false, features = ["alloc"] }
-netlink-sys            = "0.9"
 serde_json             = "1"
 # README examples are compiled as doctests.
 tokio                  = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

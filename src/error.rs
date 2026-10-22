@@ -103,8 +103,27 @@ pub enum Error {
     #[error("link-local IPv6 address {0} requires an interface scope")]
     ScopeRequired(Ipv6Addr),
 
+    /// The kernel acknowledged a tunnel deletion, but the tunnel was still
+    /// listed when [`delete_tunnel`](crate::L2tpHandle::delete_tunnel)
+    /// stopped waiting for its deferred teardown.
+    ///
+    /// The deletion is not undone: the tunnel disappears once the kernel's
+    /// work queue has run, and a repeated deletion then fails with `ENODEV`.
+    /// Treat the tunnel as deleted; only an immediate re-creation of the
+    /// same identifier may still fail with `EEXIST`. [`kind`](Self::kind)
+    /// reports [`io::ErrorKind::TimedOut`] for this variant.
+    #[error(
+        "tunnel {0} is still listed after its deletion was acknowledged; the \
+         kernel removes it later"
+    )]
+    DeletionPending(TunnelId),
+
     /// The endpoints and device of one socket name different interfaces.
-    #[error("interface scope mismatch: {expected} and {found}")]
+    #[error(
+        "interface scope mismatch: {} and {}",
+        .expected.as_bytes().escape_ascii(),
+        .found.as_bytes().escape_ascii()
+    )]
     ScopeMismatch {
         /// The interface named first.
         expected: L2tpIfName,
@@ -157,12 +176,15 @@ impl Error {
 
     /// Returns the I/O error kind, so callers can match kernel errors such
     /// as [`io::ErrorKind::AlreadyExists`] without depending on `libc`.
+    /// [`DeletionPending`](Self::DeletionPending) reports
+    /// [`io::ErrorKind::TimedOut`].
     pub fn kind(&self) -> Option<io::ErrorKind> {
         match self {
             Self::KernelError { code, .. } => {
                 Some(io::Error::from_raw_os_error(*code).kind())
             }
             Self::Io(err) => Some(err.kind()),
+            Self::DeletionPending(_) => Some(io::ErrorKind::TimedOut),
             _ => None,
         }
     }
@@ -206,9 +228,27 @@ mod tests {
             found: L2tpIfName::new("eth1").unwrap(),
         };
         assert_eq!(err.to_string(), "interface scope mismatch: eth0 and eth1");
+        // Names may hold terminal controls or invalid UTF-8; show them
+        // escaped rather than lossily.
+        let err = Error::ScopeMismatch {
+            expected: L2tpIfName::new(b"\x1b[2Jeth0").unwrap(),
+            found: L2tpIfName::new(b"eth\xff1").unwrap(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "interface scope mismatch: \\x1b[2Jeth0 and eth\\xff1"
+        );
         let err =
             Error::ScopeRequired(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
         assert!(err.to_string().contains("fe80::1"));
+    }
+
+    #[test]
+    fn deletion_pending_is_a_timeout_without_an_os_code() {
+        let err = Error::DeletionPending(crate::TunnelId(7));
+        assert_eq!(err.kind(), Some(io::ErrorKind::TimedOut));
+        assert_eq!(err.raw_os_error(), None);
+        assert!(err.to_string().contains("tunnel 7"));
     }
 
     #[test]

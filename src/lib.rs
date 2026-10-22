@@ -14,6 +14,7 @@ pub mod blocking;
 mod error;
 mod event;
 mod handle;
+mod link;
 mod netlink;
 mod netns;
 mod ppp;

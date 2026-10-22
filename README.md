@@ -100,8 +100,13 @@ async fn main() -> l2tp::Result<()> {
     let socket = TunnelSocket::for_config(&tunnel_cfg, None)?;
     let tunnel = handle.create_tunnel(tunnel_cfg, socket).await?;
 
-    let session_cfg = SessionConfig::eth(tunnel.tunnel_id(), SessionId(3000), SessionId(4000));
+    let mut session_cfg =
+        SessionConfig::eth(tunnel.tunnel_id(), SessionId(3000), SessionId(4000));
+    // A unique name of your own; the kernel keeps it for the session's life.
+    session_cfg.ifname = Some("l2tp-3000".parse()?);
     let session = handle.create_session(session_cfg).await?;
+    // Address the device by index from here on; udev may rename it any time.
+    let _ifindex = session.ifindex();
 
     let _tunnel_info = tunnel.get().await?;
     let _session_info = session.get().await?;
@@ -356,6 +361,10 @@ constructors return `netlink_packet_core::DecodeError`, which converts into
 `Error::Netlink`. The CLI validates `--ifname` and `--device` while parsing
 and accepts non-UTF-8 arguments.
 
+A session's name is the one its interface had when the session was created;
+the kernel does not follow renames. `SessionHandle::ifindex` identifies the
+device for its whole life; see [Kernel Semantics Notes](#kernel-semantics-notes).
+
 ## Sockets
 
 - `TunnelSocket::for_config` creates the socket a `TunnelConfig` describes;
@@ -365,10 +374,18 @@ and accepts non-UTF-8 arguments.
   prepared elsewhere, for example with `socket2` or through socket
   activation, and `TunnelConfig::for_socket` describes such a socket. The
   socket's addresses, bound device, link-local scope and peer connection ID
-  are read back from the kernel.
+  are read back from the kernel. A descriptor that is not such a socket is
+  closed together with the error.
 - `set_tos`, `set_hop_limit`, `set_mark`, `set_pmtu_discovery` and
   `set_ipv6_dontfrag` cover the common options of tunnel traffic;
   `bind_to_device` applies `SO_BINDTODEVICE`, which needs `CAP_NET_RAW`.
+- A `device` is not a scope. The kernel routes through the bound device by
+  itself, so the socket never resolves it to an index; a device that
+  disappears only matters to the kernel. A link-local scope, by contrast,
+  is resolved to the interface index whenever a link-local address is
+  bound or connected, and reconnecting to such an address fails with
+  `ENODEV` while the scope's interface is gone. Other addresses need no
+  scope and resolve none.
 - `disconnect` issues `connect(AF_UNSPEC)`: the kernel forgets the peer,
   the source address it selected and `SO_BINDTODEVICE`, while an L2TP/IP
   socket's connection ID stays bound. Bind the device again if needed, then
@@ -386,9 +403,36 @@ and accepts non-UTF-8 arguments.
 - `L2TP_ATTR_IFNAME` applies to sessions (`SESSION_CREATE`/session lookups), not tunnels.
   Tunnels do not create a netdevice. Sessions can be looked up, modified and
   deleted by interface name.
+- **The session interface name is frozen at creation.** The kernel copies the
+  `l2tpeth` device's name into the session once, right after registering the
+  device, and never updates it. An interface renamed later, by `ip link`,
+  udev or systemd-networkd, is still reported by `SessionInfo::ifname` and
+  matched by the `*_by_ifname` methods under its original name, never its
+  current one. Track these devices by interface index instead:
+  `SessionHandle::ifindex` carries it, and rtnetlink addresses a device by
+  index for everything including renames. Only L2TPv3 sessions are searched
+  by name.
+- L2TP netlink does not report the index, and a lookup by name after the
+  fact can be defeated by udev or networkd renaming the new device at once.
+  `create_session` therefore joins `RTNLGRP_LINK` before it sends
+  `SESSION_CREATE`: the kernel broadcasts the device's registration as
+  `RTM_NEWLINK` with change mask `~0` (renames use `0`) before it
+  acknowledges the creation, so the notification naming the new interface,
+  with its index, is already queued when the session exists. Only a lost
+  notification falls back to a lookup by name, as the `open_*` methods
+  always do. Request an explicit, unique `SessionConfig::ifname` rather than
+  the kernel's `l2tpeth%d` pool, so no other device can hold the name while
+  this one does.
 - Tunnel deletion is acknowledged before the kernel tears the tunnel down on
   a work queue. `delete_tunnel` and `TunnelHandle::delete` wait until the
-  tunnel is gone, so its identifier can be reused immediately afterwards.
+  tunnel is gone, so its identifier can be reused immediately afterwards. If
+  it is still listed after about two seconds they return
+  `Error::DeletionPending`; the deletion is not undone, so treat the tunnel
+  as deleted (a repeated deletion fails with `ENODEV`).
+- Generic netlink assigns the `l2tp` family identifier dynamically. A handle
+  caches it and re-resolves once when the kernel answers `ENOENT` for a
+  request, so it survives a reload of `l2tp_netlink`; an `Events` stream
+  does not, so subscribe again after a module reload.
 - Lookups of a missing tunnel or session fail with `ENODEV`.
 - The kernel never records a peer port for IPv4 L2TP/IP sockets, so
   `getpeername` reports `ENOTCONN` for them. `TunnelSocket::peer_addr_ip`
@@ -486,6 +530,20 @@ The crate logs netlink requests and failures through the `log` crate at
 - `TunnelModify`, `TunnelHandle::modify` and `L2tpHandle::modify_tunnel` were removed:
   the kernel accepted these requests but did not apply their UDP checksum setting.
 - `TunnelSocket::ip` takes `TunnelId`s for the tunnel and its peer instead of a `u32`.
+- `delete_tunnel` and `TunnelHandle::delete` wait, for up to about two
+  seconds, until the kernel has removed the tunnel. A tunnel still listed
+  after that is `Error::DeletionPending`, which callers must treat as
+  deleted: the acknowledged deletion completes on its own, and repeating it
+  fails with `ENODEV`. Code that kept its tunnel state on any error from
+  `delete_tunnel` would otherwise never remove it.
+- `SessionInfo::ifname` and the `*_by_ifname` methods carry the
+  creation-time name only; rename and otherwise address `l2tpeth` devices
+  by `SessionHandle::ifindex`. See [Kernel Semantics Notes](#kernel-semantics-notes).
+- Reconnecting an L2TP/IP socket resolves its link-local scope only when a
+  link-local address is involved. A socket created with a `device` no longer
+  needs that device to exist to reconnect to a global address, and
+  `disconnect` forgets the device as the kernel does; call `bind_to_device`
+  again before reconnecting if the binding is still wanted.
 - `IpEndpoint::V6` is a struct variant with an `addr` and an optional
   interface `scope`; use `IpEndpoint::v6(addr)` or
   `IpEndpoint::v6_scoped(addr, ifname)`. Link-local endpoints without a scope
