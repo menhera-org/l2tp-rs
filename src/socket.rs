@@ -9,8 +9,8 @@ use std::{
 };
 
 use crate::{
-    Encapsulation, IFNAMSIZ, IpEndpoint, L2tpIfName, L2tpIfNameExt,
-    TunnelConfig, TunnelId, UdpEndpoint,
+    Encapsulation, IFNAMSIZ, IpEndpoint, L2tpIfName, TunnelConfig, TunnelId,
+    UdpEndpoint,
 };
 
 const IPPROTO_L2TP: libc::c_int = 115;
@@ -68,6 +68,9 @@ pub struct TunnelSocket {
     /// Peer of an IPv4 L2TP/IP socket as connected by this type, since the
     /// kernel never reports it; `0` when unknown.
     peer_v4: AtomicU32,
+    /// Whether the socket has a peer. Cleared by `disconnect`, because the
+    /// kernel keeps reporting the old peer of an IPv6 L2TP/IP socket.
+    connected: AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +178,8 @@ impl TunnelSocket {
     /// bind/connect.
     ///
     /// A link-local IPv6 endpoint needs an interface, which the kernel takes
-    /// from the [`SocketAddrV6`] scope ID (see [`L2tpIfNameExt::index`]) or
+    /// from the [`SocketAddrV6`] scope ID (see
+    /// [`L2tpIfNameExt::index`](crate::L2tpIfNameExt::index)) or
     /// from `device`. A link-local `remote` may omit its scope ID when
     /// `local` or `device` already pins the socket to an interface. A
     /// missing scope is reported as
@@ -217,6 +221,7 @@ impl TunnelSocket {
             pinned: AtomicBool::new(pinned),
             peer_conn_id: 0,
             peer_v4: AtomicU32::new(0),
+            connected: AtomicBool::new(true),
         })
     }
 
@@ -231,7 +236,11 @@ impl TunnelSocket {
     /// the `device` must name the same interface. That name is resolved to
     /// the interface index here and again on every
     /// [`reconnect_ip`](Self::reconnect_ip), so a re-created interface is
-    /// picked up. Unlike `device`, a scope does not need `CAP_NET_RAW`.
+    /// picked up. The lookup happens in the socket's own network namespace,
+    /// even when the socket was created through
+    /// [`NetNs::run`](crate::NetNs::run) and is reconnected from a thread
+    /// in another namespace. Unlike `device`, a scope does not need
+    /// `CAP_NET_RAW`.
     pub fn ip(
         local: &IpEndpoint,
         remote: &IpEndpoint,
@@ -246,10 +255,10 @@ impl TunnelSocket {
             unified_scope([local.scope(), remote.scope(), device])?.copied();
         require_scope(local, scope.as_ref(), false)?;
         require_scope(remote, scope.as_ref(), false)?;
-        let scope_id = resolve_scope(scope.as_ref())?;
 
         let family = SocketFamily::from_ip(local);
         let fd = socket(family.domain(), libc::SOCK_DGRAM, IPPROTO_L2TP)?;
+        let scope_id = resolve_scope(fd.as_raw_fd(), scope.as_ref())?;
 
         if let Some(device) = device {
             set_bind_to_device(fd.as_raw_fd(), device)?;
@@ -272,6 +281,7 @@ impl TunnelSocket {
             pinned: AtomicBool::new(pinned),
             peer_conn_id: peer_tunnel_id.0,
             peer_v4: AtomicU32::new(v4_bits(remote)),
+            connected: AtomicBool::new(true),
         })
     }
 
@@ -359,6 +369,7 @@ impl TunnelSocket {
             pinned: AtomicBool::new(device.is_some() || scoped),
             peer_conn_id,
             peer_v4: AtomicU32::new(0),
+            connected: AtomicBool::new(true),
         })
     }
 
@@ -501,6 +512,7 @@ impl TunnelSocket {
         }
         self.pinned.store(false, Ordering::Relaxed);
         self.peer_v4.store(0, Ordering::Relaxed);
+        self.connected.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -574,6 +586,7 @@ impl TunnelSocket {
         if new_remote.is_link_local() {
             self.pinned.store(true, Ordering::Relaxed);
         }
+        self.connected.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -582,7 +595,8 @@ impl TunnelSocket {
     /// A link-local `new_remote` needs an interface scope unless the socket
     /// is already pinned to an interface. The socket's own scope is used when
     /// `new_remote` has none, and the two must agree otherwise. The name is
-    /// resolved to the interface index on every call.
+    /// resolved to the interface index on every call, in the socket's own
+    /// network namespace.
     pub fn reconnect_ip(&self, new_remote: &IpEndpoint) -> crate::Result<()> {
         if self.encap != SocketEncap::Ip {
             return Err(crate::Error::EncapsulationMismatch);
@@ -592,7 +606,7 @@ impl TunnelSocket {
         }
         let scope = unified_scope([new_remote.scope(), self.scope.as_ref()])?;
         require_scope(new_remote, scope, self.pinned.load(Ordering::Relaxed))?;
-        let scope_id = resolve_scope(scope)?;
+        let scope_id = resolve_scope(self.fd.as_raw_fd(), scope)?;
 
         connect(
             self.fd.as_raw_fd(),
@@ -602,6 +616,7 @@ impl TunnelSocket {
             self.pinned.store(true, Ordering::Relaxed);
         }
         self.peer_v4.store(v4_bits(new_remote), Ordering::Relaxed);
+        self.connected.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -618,6 +633,9 @@ impl TunnelSocket {
     pub fn peer_addr_udp(&self) -> crate::Result<UdpEndpoint> {
         if self.encap != SocketEncap::Udp {
             return Err(crate::Error::EncapsulationMismatch);
+        }
+        if !self.connected.load(Ordering::Relaxed) {
+            return Err(errno(libc::ENOTCONN));
         }
         let name = socket_name(self.fd.as_raw_fd(), true)?;
         self.udp_endpoint(&name)
@@ -642,10 +660,16 @@ impl TunnelSocket {
     /// [`disconnect`](Self::disconnect). An IPv4 L2TP/IP socket adopted with
     /// [`from_fd`](Self::from_fd) has no known peer and fails with
     /// `ENOTCONN`. For IPv6 the kernel reports `ENOTCONN` only when the peer
-    /// connection ID is zero, which [`TunnelSocket::ip`] never produces.
+    /// connection ID is zero, which [`TunnelSocket::ip`] never produces, and
+    /// it keeps reporting the old peer after
+    /// [`disconnect`](Self::disconnect); this method reports `ENOTCONN` for
+    /// a disconnected socket of either family instead.
     pub fn peer_addr_ip(&self) -> crate::Result<IpEndpoint> {
         if self.encap != SocketEncap::Ip {
             return Err(crate::Error::EncapsulationMismatch);
+        }
+        if !self.connected.load(Ordering::Relaxed) {
+            return Err(errno(libc::ENOTCONN));
         }
         if self.family == SocketFamily::V4 {
             let peer = self.peer_v4.load(Ordering::Relaxed);
@@ -1049,11 +1073,35 @@ fn v4_bits(endpoint: &IpEndpoint) -> u32 {
 
 /// Resolves the scope to the interface index at the time of use, so a
 /// re-created interface keeps working.
-fn resolve_scope(scope: Option<&L2tpIfName>) -> crate::Result<u32> {
+fn resolve_scope(fd: RawFd, scope: Option<&L2tpIfName>) -> crate::Result<u32> {
     match scope {
-        Some(name) => name.index(),
+        Some(name) => interface_index(fd, name),
         None => Ok(0),
     }
+}
+
+/// Looks the interface up with `SIOCGIFINDEX` on the socket itself, which the
+/// kernel answers for the namespace the socket lives in; `if_nametoindex(3)`
+/// would use the calling thread's namespace. The error carries `ENODEV` when
+/// no interface has this name.
+fn interface_index(fd: RawFd, name: &L2tpIfName) -> crate::Result<u32> {
+    // SAFETY: an all-zero `ifreq` is a valid value.
+    let mut request: libc::ifreq = unsafe { zeroed() };
+    for (dst, src) in request.ifr_name.iter_mut().zip(name.as_array()) {
+        *dst = *src as libc::c_char;
+    }
+    // The request type differs between C libraries.
+    #[allow(clippy::unnecessary_cast)]
+    let code = libc::SIOCGIFINDEX as libc::Ioctl;
+    // SAFETY: `request` is initialized, its name is NUL-terminated, and the
+    // ioctl writes the index back into the same struct.
+    let rc = unsafe { libc::ioctl(fd, code, &mut request) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: on success the kernel stored the index in this union member.
+    let index = unsafe { request.ifr_ifru.ifru_ifindex };
+    u32::try_from(index).map_err(|_| errno(libc::ENODEV))
 }
 
 fn l2tp_sockaddr(
@@ -1094,7 +1142,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::TunnelId;
+    use crate::{L2tpIfNameExt, TunnelId};
 
     fn as_v4(addr: SocketAddr) -> SocketAddrV4 {
         match addr {
@@ -1137,7 +1185,24 @@ mod tests {
             pinned: AtomicBool::new(false),
             peer_conn_id: 0,
             peer_v4: AtomicU32::new(0),
+            connected: AtomicBool::new(true),
         }
+    }
+
+    #[test]
+    fn interface_index_resolves_through_the_socket() {
+        let Some(fd) = udp_fd(libc::AF_INET) else {
+            return;
+        };
+        let lo = L2tpIfName::new("lo").unwrap();
+        assert_eq!(
+            interface_index(fd.as_raw_fd(), &lo).unwrap(),
+            lo.index().unwrap()
+        );
+        let missing = L2tpIfName::new("l2tp-no-such0").unwrap();
+        let err = interface_index(fd.as_raw_fd(), &missing).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENODEV), "{err:?}");
+        assert_eq!(resolve_scope(fd.as_raw_fd(), None).unwrap(), 0);
     }
 
     fn connected_v4_pair() -> Option<(TunnelSocket, UdpSocket)> {

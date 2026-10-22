@@ -407,33 +407,54 @@ impl L2tpHandle {
     /// The kernel acknowledges the request and then tears the tunnel down
     /// on a work queue, during which lookups still find it and creating a
     /// tunnel with the same identifier fails with `EEXIST`. This therefore
-    /// also waits, for up to about two seconds, until the tunnel is gone.
+    /// also waits, for up to about two seconds, until a lookup reports
+    /// `ENODEV`. Once the deletion is acknowledged it is not undone: a
+    /// lookup that fails otherwise is returned as is, and a tunnel still
+    /// listed after the wait is reported as [`Error::Io`](crate::Error::Io)
+    /// of kind [`TimedOut`](io::ErrorKind::TimedOut). The wait needs no
+    /// Tokio timer.
     pub async fn delete_tunnel(
         &self,
         tunnel_id: TunnelId,
     ) -> crate::Result<()> {
         self.send_ack(netlink::encode_tunnel_delete(tunnel_id))
             .await?;
-        self.wait_tunnel_removed(tunnel_id).await;
-        Ok(())
+        self.wait_tunnel_removed(tunnel_id).await
     }
 
-    async fn wait_tunnel_removed(&self, tunnel_id: TunnelId) {
+    async fn wait_tunnel_removed(
+        &self,
+        tunnel_id: TunnelId,
+    ) -> crate::Result<()> {
         const POLLS: u32 = 200;
         const INTERVAL: std::time::Duration =
             std::time::Duration::from_millis(10);
+        // The pause runs on the blocking pool, which every runtime has, so
+        // the caller's runtime does not need its timer driver.
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            io::Error::other("tokio runtime is required for deletion")
+        })?;
         for _ in 0..POLLS {
-            // Any failure, normally ENODEV, means the tunnel is no longer
-            // listed.
-            if self.get_tunnel(tunnel_id).await.is_err() {
-                return;
+            match self.get_tunnel(tunnel_id).await {
+                Ok(_) => {}
+                Err(err) if err.raw_os_error() == Some(libc::ENODEV) => {
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
             }
-            tokio::time::sleep(INTERVAL).await;
+            runtime
+                .spawn_blocking(move || std::thread::sleep(INTERVAL))
+                .await
+                .map_err(|err| io::Error::other(err.to_string()))?;
         }
-        log::warn!(
-            "tunnel {tunnel_id} is still listed after its deletion was \
-             acknowledged"
-        );
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "tunnel {tunnel_id} is still listed after its deletion was \
+                 acknowledged"
+            ),
+        )
+        .into())
     }
 
     /// Deletes a session from a tunnel.

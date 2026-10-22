@@ -82,6 +82,18 @@ these.
   wrong on MIPS, PowerPC and SPARC.
 - CLI: `tunnel create --proto-version 2` chooses random identifiers within
   the 16 bits of L2TPv2, so a `PPPoL2TP` socket can attach to the tunnel.
+- `delete_tunnel` needs no Tokio timer, so the blocking API's worker and
+  runtimes built without a time driver cannot panic in it. A lookup that
+  fails for a reason other than `ENODEV` is returned, and a tunnel still
+  listed after the wait is reported as `Error::Io` of kind `TimedOut`.
+- `TunnelSocket` resolves interface scopes with `SIOCGIFINDEX` on the socket
+  itself, in the socket's own network namespace, so a socket created through
+  `NetNs::run` reconnects correctly from any thread.
+- `TunnelSocket::peer_addr_ip` reports `ENOTCONN` after `disconnect`; the
+  kernel keeps reporting the old peer of an IPv6 L2TP/IP socket.
+- Binary `serde` formats such as postcard round-trip `IpEndpoint` and
+  interface-name fields, which are written as a struct and as bytes there
+  instead of the string-or-map forms that need a self-describing format.
 - `L2tpHandle::events` never delivered a notification: the listening socket
   was unbound, and the kernel skips sockets without a port for the
   notifications it sends without a sender port. The socket is now bound.

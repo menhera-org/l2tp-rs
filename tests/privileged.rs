@@ -430,25 +430,67 @@ fn privileged_blocking_api_manages_a_tunnel() {
 }
 
 #[test]
-#[ignore = "requires kernel l2tp_ip support"]
-fn privileged_managed_ipv4_ip_socket_uses_inet_family() {
-    let id = next_id_base();
-    let socket = TunnelSocket::ip(
-        &IpEndpoint::V4(Ipv4Addr::LOCALHOST),
-        &IpEndpoint::V4(Ipv4Addr::LOCALHOST),
-        None,
-        TunnelId(id),
-        TunnelId(id.wrapping_add(1)),
-    )
-    .expect("create an IPv4 L2TP/IP socket");
-    let config = TunnelConfig::for_socket(
-        TunnelId(id),
-        TunnelId(id.wrapping_add(1)),
-        &socket,
-    )
-    .expect("describe the socket");
-    assert!(matches!(config.encapsulation(), Encapsulation::Ip { .. }));
-    drop(socket);
+#[ignore = "requires kernel l2tp_ip and l2tp_ip6 support"]
+fn privileged_managed_ip_sockets_report_their_peer() {
+    for local in [
+        IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+        IpEndpoint::v6(std::net::Ipv6Addr::LOCALHOST),
+    ] {
+        let id = next_id_base();
+        let socket = TunnelSocket::ip(
+            &local,
+            &local,
+            None,
+            TunnelId(id),
+            TunnelId(id.wrapping_add(1)),
+        )
+        .unwrap_or_else(|e| {
+            panic!("create an L2TP/IP socket for {local}: {e}")
+        });
+        // IPv4 L2TP/IP sockets get no peer from the kernel; the socket
+        // remembers it.
+        assert_eq!(
+            socket.peer_addr_ip().unwrap_or_else(|e| panic!("{e}")),
+            local
+        );
+        let config = TunnelConfig::for_socket(
+            TunnelId(id),
+            TunnelId(id.wrapping_add(1)),
+            &socket,
+        )
+        .unwrap_or_else(|e| panic!("describe the socket: {e}"));
+        assert_eq!(
+            *config.encapsulation(),
+            Encapsulation::Ip {
+                local: local.clone(),
+                remote: local.clone()
+            }
+        );
+
+        // After a disconnect the kernel still reports the old IPv6 peer;
+        // the socket does not.
+        socket
+            .disconnect()
+            .unwrap_or_else(|e| panic!("disconnect: {e}"));
+        let err = socket.peer_addr_ip().expect_err("no peer after disconnect");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN), "{err}");
+        assert!(
+            TunnelConfig::for_socket(
+                TunnelId(id),
+                TunnelId(id.wrapping_add(1)),
+                &socket
+            )
+            .is_err()
+        );
+        socket
+            .reconnect_ip(&local)
+            .unwrap_or_else(|e| panic!("reconnect: {e}"));
+        assert_eq!(
+            socket.peer_addr_ip().unwrap_or_else(|e| panic!("{e}")),
+            local
+        );
+        drop(socket);
+    }
 }
 
 #[cfg(feature = "cli")]

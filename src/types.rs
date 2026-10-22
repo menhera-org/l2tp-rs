@@ -278,7 +278,9 @@ pub trait L2tpIfNameExt: sealed::Sealed + Sized {
     fn from_name(name: impl AsRef<[u8]>) -> crate::Result<Self>;
 
     /// Resolves the name to the interface's current index with
-    /// `if_nametoindex(3)`.
+    /// `if_nametoindex(3)`, in the calling thread's network namespace.
+    /// [`TunnelSocket`](crate::TunnelSocket) resolves its scopes in the
+    /// socket's own namespace instead.
     ///
     /// Interface indexes change when an interface is re-created, so resolve
     /// the name right before it is used. For example, build the scope ID of a
@@ -330,8 +332,9 @@ impl L2tpIfNameExt for L2tpIfName {
     }
 }
 
-/// `serde` adapter for `Option<L2tpIfName>` fields: a string when the name
-/// is UTF-8, bytes otherwise, and `null` for `None`.
+/// `serde` adapter for `Option<L2tpIfName>` fields: in human-readable
+/// formats a string when the name is UTF-8 and bytes otherwise, in binary
+/// formats always bytes, and `null` for `None`.
 #[cfg(feature = "serde")]
 pub(crate) mod ifname_serde {
     use std::fmt;
@@ -340,6 +343,19 @@ pub(crate) mod ifname_serde {
 
     use super::{IFNAMSIZ, L2tpIfName};
 
+    /// A byte slice serializes as a sequence; names that are not written as
+    /// strings are bytes instead, which binary formats read back as such.
+    struct Bytes<'a>(&'a [u8]);
+
+    impl serde::Serialize for Bytes<'_> {
+        fn serialize<S: Serializer>(
+            &self,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(self.0)
+        }
+    }
+
     pub(crate) fn serialize<S: Serializer>(
         name: &Option<L2tpIfName>,
         serializer: S,
@@ -347,8 +363,10 @@ pub(crate) mod ifname_serde {
         match name {
             None => serializer.serialize_none(),
             Some(name) => match name.to_str() {
-                Ok(utf8) => serializer.serialize_some(utf8),
-                Err(_) => serializer.serialize_some(name.as_bytes()),
+                Ok(utf8) if serializer.is_human_readable() => {
+                    serializer.serialize_some(utf8)
+                }
+                _ => serializer.serialize_some(&Bytes(name.as_bytes())),
             },
         }
     }
@@ -417,7 +435,13 @@ pub(crate) mod ifname_serde {
             self,
             deserializer: D,
         ) -> Result<Self::Value, D::Error> {
-            deserializer.deserialize_any(NameVisitor).map(Some)
+            // Binary formats cannot tell a string from bytes, so they always
+            // carry bytes.
+            if deserializer.is_human_readable() {
+                deserializer.deserialize_any(NameVisitor).map(Some)
+            } else {
+                deserializer.deserialize_bytes(NameVisitor).map(Some)
+            }
         }
     }
 
@@ -525,8 +549,10 @@ impl<'de> serde::Deserialize<'de> for UdpEndpoint {
 /// It displays and parses as an IP address with an optional `%scope` suffix
 /// naming the interface of a link-local IPv6 address, such as
 /// `192.0.2.1` or `fe80::1%eth0`. With the `serde` feature it serializes as
-/// that string, except that a non-UTF-8 scope name is written as a map
-/// `{"addr": ..., "scope": [bytes]}`, which deserialization accepts too.
+/// that string in human-readable formats, except that a non-UTF-8 scope name
+/// is written as a map `{"addr": ..., "scope": [bytes]}`, which
+/// deserialization accepts too. Binary formats carry a struct of the
+/// address and the optional scope bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpEndpoint {
     /// IPv4 endpoint.
@@ -590,6 +616,16 @@ impl std::str::FromStr for IpEndpoint {
     }
 }
 
+/// The representation of an [`IpEndpoint`] in binary `serde` formats, which
+/// cannot distinguish a string from a map.
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BinaryIpEndpoint {
+    addr: std::net::IpAddr,
+    #[serde(with = "ifname_serde")]
+    scope: Option<L2tpIfName>,
+}
+
 #[cfg(feature = "serde")]
 impl serde::Serialize for IpEndpoint {
     fn serialize<S: serde::Serializer>(
@@ -598,6 +634,13 @@ impl serde::Serialize for IpEndpoint {
     ) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
 
+        if !serializer.is_human_readable() {
+            return BinaryIpEndpoint {
+                addr: self.ip(),
+                scope: self.scope().copied(),
+            }
+            .serialize(serializer);
+        }
         match self {
             Self::V6 {
                 addr,
@@ -658,6 +701,18 @@ impl<'de> serde::Deserialize<'de> for IpEndpoint {
             }
         }
 
+        if !deserializer.is_human_readable() {
+            let raw = BinaryIpEndpoint::deserialize(deserializer)?;
+            return match (raw.addr, raw.scope) {
+                (std::net::IpAddr::V4(addr), None) => Ok(IpEndpoint::V4(addr)),
+                (std::net::IpAddr::V4(_), Some(_)) => Err(
+                    serde::de::Error::custom("an IPv4 endpoint has no scope"),
+                ),
+                (std::net::IpAddr::V6(addr), scope) => {
+                    Ok(IpEndpoint::V6 { addr, scope })
+                }
+            };
+        }
         deserializer.deserialize_any(EndpointVisitor)
     }
 }
@@ -925,6 +980,70 @@ mod tests {
 
         let err = L2tpIfName::from_index(u32::MAX).unwrap_err();
         assert!(matches!(err, crate::Error::Io(_)));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn binary_serde_round_trips() {
+        fn round_trip<T>(value: &T) -> T
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned,
+        {
+            let bytes = postcard::to_allocvec(value).unwrap();
+            postcard::from_bytes(&bytes).unwrap()
+        }
+
+        let raw = L2tpIfName::new(b"eth\xff0").unwrap();
+        for endpoint in [
+            IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+            IpEndpoint::v6(Ipv6Addr::LOCALHOST),
+            IpEndpoint::v6_scoped(
+                Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                L2tpIfName::new("eth0").unwrap(),
+            ),
+            IpEndpoint::v6_scoped(
+                Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                raw,
+            ),
+        ] {
+            assert_eq!(round_trip(&endpoint), endpoint);
+        }
+        let udp =
+            UdpEndpoint::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1701, 0, 7));
+        assert_eq!(round_trip(&udp), udp);
+        let cookie = Cookie::from([1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(round_trip(&cookie), cookie);
+
+        let mut session = crate::SessionConfig::eth(
+            TunnelId(1),
+            crate::SessionId(2),
+            crate::SessionId(3),
+        );
+        session.ifname = Some(raw);
+        assert_eq!(round_trip(&session), session);
+        session.ifname = None;
+        assert_eq!(round_trip(&session), session);
+        let tunnel = crate::TunnelConfig::new(
+            TunnelId(1),
+            TunnelId(2),
+            Encapsulation::Ip {
+                local: IpEndpoint::v6_scoped(
+                    Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                    raw,
+                ),
+                remote: IpEndpoint::v6(Ipv6Addr::LOCALHOST),
+            },
+        )
+        .unwrap();
+        assert_eq!(round_trip(&tunnel), tunnel);
+
+        // A scoped IPv4 address is rejected rather than silently unscoped.
+        let bytes = postcard::to_allocvec(&BinaryIpEndpoint {
+            addr: std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            scope: Some(raw),
+        })
+        .unwrap();
+        assert!(postcard::from_bytes::<IpEndpoint>(&bytes).is_err());
     }
 
     #[cfg(feature = "serde")]
