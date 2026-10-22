@@ -50,7 +50,9 @@ impl LinkMonitor {
     ///
     /// The kernel marks a registration with an all-ones change mask;
     /// renames and other changes carry a zero mask, so a device that merely
-    /// took over the name is not mistaken for the new one. The error is the
+    /// took over the name is not mistaken for the new one. Only messages
+    /// from the kernel (port 0) count; a unicast from another process would
+    /// need `CAP_NET_ADMIN` on `NETLINK_ROUTE` anyway. The error is the
     /// socket's, typically `ENOBUFS` when notifications were lost.
     pub(crate) fn registered_index(
         &self,
@@ -59,7 +61,10 @@ impl LinkMonitor {
         let mut found = None;
         loop {
             match self.socket.recv_from_full() {
-                Ok((datagram, _)) => {
+                Ok((datagram, source)) => {
+                    if source.port_number() != 0 {
+                        continue;
+                    }
                     if let Some(index) = registration_in(&datagram, ifname) {
                         found = Some(index);
                     }

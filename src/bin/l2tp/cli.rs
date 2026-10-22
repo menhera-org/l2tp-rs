@@ -686,8 +686,12 @@ async fn session_create(
 
     let mut session = handle.create_session(config).await?;
     session.set_auto_delete(false);
+    let device = match session.ifindex() {
+        Some(index) => format!(" with interface index {index}"),
+        None => String::new(),
+    };
     out.success(&format!(
-        "created session {} in tunnel {}",
+        "created session {} in tunnel {}{device}",
         args.session_id, args.tunnel_id
     ));
     Ok(())

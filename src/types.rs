@@ -590,11 +590,14 @@ impl<'de> serde::Deserialize<'de> for UdpEndpoint {
 ///
 /// It displays and parses as an IP address with an optional `%scope` suffix
 /// naming the interface of a link-local IPv6 address, such as
-/// `192.0.2.1` or `fe80::1%eth0`. With the `serde` feature it serializes as
-/// that string in human-readable formats, except that a non-UTF-8 scope name
-/// is written as a map `{"addr": ..., "scope": [bytes]}`, which
-/// deserialization accepts too. Binary formats carry a struct of the
-/// address and the optional scope bytes.
+/// `192.0.2.1` or `fe80::1%eth0`. `Display` is lossy for a non-UTF-8 scope
+/// name (invalid bytes become U+FFFD, which parses back as a different
+/// name); use [`scope`](Self::scope) or `serde` for an exact round trip.
+/// With the `serde` feature it serializes as that string in human-readable
+/// formats, except that a non-UTF-8 scope name is written as a map
+/// `{"addr": ..., "scope": [bytes]}`, which deserialization accepts too.
+/// Binary formats carry a struct of the address and the optional scope
+/// bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpEndpoint {
     /// IPv4 endpoint.

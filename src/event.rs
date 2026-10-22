@@ -23,7 +23,11 @@ use crate::{SessionInfo, TunnelInfo, netlink};
 ///
 /// Deletion events carry the state the object had before it was removed.
 /// The kernel sends tunnel modification events for `TUNNEL_MODIFY` requests
-/// although it changes nothing.
+/// although it changes nothing. A session event names its interface by the
+/// creation-time name only; the interface index is known to the process
+/// that created the session
+/// ([`SessionHandle::ifindex`](crate::SessionHandle::ifindex)), and an observer
+/// can only look the name up while the interface still bears it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[non_exhaustive]
