@@ -14,6 +14,9 @@
   removed. The kernel acknowledged these requests but never applied the UDP
   checksum setting.
 - `TunnelSocket::ip` takes a `TunnelId` instead of a `u32`.
+- `IpEndpoint::V6` is a struct variant with an `addr` and an optional
+  interface `scope`. Construct it with `IpEndpoint::v6` or
+  `IpEndpoint::v6_scoped`.
 - `Error` is `#[non_exhaustive]`. `Error::Netlink` holds a message instead of a
   `netlink-packet-core` type. Malformed kernel replies are
   `Error::UnexpectedReply`, operations on a socket of the wrong encapsulation
@@ -58,10 +61,31 @@
   Previously the tunnel was torn down when the command exited and closed its
   socket.
 - CLI: a non-ASCII `--cookie` value is rejected instead of panicking.
-- CLI: automatically chosen tunnel IDs come from the OS random number
-  generator.
+- CLI: automatically chosen tunnel IDs come from `getrandom(2)`. A failure is
+  reported instead of falling back to a time-and-pid mix.
+- `L2tpHandle::new` returns `Error::Io` instead of panicking when the Tokio
+  runtime was built without its I/O driver.
+- Link-local IPv6 endpoints are rejected early where the kernel cannot use
+  them: `Error::ScopeRequired` for a managed socket without an interface
+  scope, and `Error::UnmanagedLinkLocal` for unmanaged tunnels, whose
+  kernel-created socket has no scope. Previously the kernel returned a bare
+  `EINVAL`.
 
 ### Added
+
+- Interface scopes for link-local L2TP/IP endpoints: `IpEndpoint::v6_scoped`
+  takes an `IfName` that is resolved to the interface index each time the
+  socket binds, connects or reconnects, so a re-created interface keeps
+  working. The scopes of both endpoints and the `device` must agree
+  (`Error::ScopeMismatch`). `IfName::index` and `IfName::from_index` convert
+  between names and indexes, for example to build `SocketAddrV6` scope IDs
+  for UDP endpoints.
+- `IfName` implements `FromStr`, `TryFrom<&str>`, `TryFrom<String>`,
+  `TryFrom<&[u8]>`, `AsRef<str>`, `From<IfName> for String`, `Hash` and
+  `Ord`, and has `as_bytes`. Non-UTF-8 names remain unsupported because
+  `netlink-packet-l2tp` carries names as `String`.
+- `IpEndpoint::v6`, `IpEndpoint::scope`, `IpEndpoint::is_link_local` and
+  `UdpEndpoint::is_link_local`.
 
 - `TunnelHandle::delete` and `SessionHandle::delete`, which wait for the
   kernel's acknowledgement and keep running if the caller is cancelled.
@@ -70,6 +94,13 @@
 - `TunnelConfig` accessors and `SessionModify::is_empty()`.
 - The README is the crate documentation and its examples are compiled as
   doctests.
+
+### Documentation
+
+- The kernel reports the IPv4 UDP checksum setting only for IPv4 sockets, so
+  `TunnelInfo` shows `udp_csum: false` for every IPv6 tunnel.
+- Every L2TP netlink command, including `get` and `list`, requires
+  `CAP_NET_ADMIN`.
 
 ## 0.2.1 and earlier
 

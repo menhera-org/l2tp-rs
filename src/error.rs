@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-use std::io;
+use std::{io, net::Ipv6Addr};
+
+use crate::IfName;
 
 /// Errors returned by this crate.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +41,30 @@ pub enum Error {
     /// The operation does not match the socket's encapsulation (UDP or IP).
     #[error("encapsulation mismatch: operation does not apply to this socket")]
     EncapsulationMismatch,
+
+    /// A link-local IPv6 endpoint was given without an interface scope.
+    ///
+    /// The kernel refuses to bind or connect a link-local address without an
+    /// interface; see [`IpEndpoint::v6_scoped`](crate::IpEndpoint::v6_scoped).
+    #[error("link-local IPv6 address {0} requires an interface scope")]
+    ScopeRequired(Ipv6Addr),
+
+    /// The endpoints and device of one socket name different interfaces.
+    #[error("interface scope mismatch: {expected} and {found}")]
+    ScopeMismatch {
+        /// The interface named first.
+        expected: IfName,
+        /// The conflicting interface.
+        found: IfName,
+    },
+
+    /// Unmanaged tunnels cannot use link-local IPv6 endpoints, because the
+    /// kernel creates their socket without an interface scope.
+    #[error(
+        "unmanaged tunnels cannot use link-local IPv6 endpoints; use a \
+         managed TunnelSocket with an interface scope"
+    )]
+    UnmanagedLinkLocal,
 
     /// Operation requires an owned tunnel socket fd in this process.
     #[error(
@@ -99,7 +125,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 mod tests {
     use std::io;
 
-    use super::Error;
+    use super::{Error, IfName, Ipv6Addr};
 
     #[test]
     fn kernel_error_exposes_os_code_and_kind() {
@@ -110,6 +136,19 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
         assert_eq!(err.kind(), Some(io::ErrorKind::AlreadyExists));
         assert_eq!(Error::AddressFamilyMismatch.kind(), None);
+        assert_eq!(Error::UnmanagedLinkLocal.raw_os_error(), None);
+    }
+
+    #[test]
+    fn scope_errors_name_the_interfaces() {
+        let err = Error::ScopeMismatch {
+            expected: IfName::new("eth0").unwrap(),
+            found: IfName::new("eth1").unwrap(),
+        };
+        assert_eq!(err.to_string(), "interface scope mismatch: eth0 and eth1");
+        let err =
+            Error::ScopeRequired(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        assert!(err.to_string().contains("fe80::1"));
     }
 
     #[test]

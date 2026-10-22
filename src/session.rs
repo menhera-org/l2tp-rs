@@ -215,8 +215,8 @@ mod tests {
         assert_eq!(config.peer_session_id, SessionId(3));
         assert_eq!(config.pseudowire_type, PseudowireType::Eth);
         assert_eq!(config.l2spec_type, L2SpecType::None);
-        assert_eq!(config.cookie.as_bytes(), &[]);
-        assert_eq!(config.peer_cookie.as_bytes(), &[]);
+        assert!(config.cookie.as_bytes().is_empty());
+        assert!(config.peer_cookie.as_bytes().is_empty());
         assert!(!config.recv_seq);
         assert!(!config.send_seq);
         assert!(!config.lns_mode);

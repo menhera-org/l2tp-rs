@@ -29,6 +29,20 @@ pub(crate) fn encode_tunnel_create(
         L2tpAttribute::ProtoVersion(3),
     ];
 
+    // Kernel-created sockets get no interface scope, so they can neither bind
+    // nor connect a link-local address.
+    let link_local = match &config.encapsulation {
+        Encapsulation::Udp { local, remote, .. } => {
+            local.is_link_local() || remote.is_link_local()
+        }
+        Encapsulation::Ip { local, remote } => {
+            local.is_link_local() || remote.is_link_local()
+        }
+    };
+    if fd.is_none() && link_local {
+        return Err(crate::Error::UnmanagedLinkLocal);
+    }
+
     match &config.encapsulation {
         Encapsulation::Udp {
             local,
@@ -81,7 +95,10 @@ pub(crate) fn encode_tunnel_create(
                     attrs.push(L2tpAttribute::IpSaddr(*local));
                     attrs.push(L2tpAttribute::IpDaddr(*remote));
                 }
-                (IpEndpoint::V6(local), IpEndpoint::V6(remote)) => {
+                (
+                    IpEndpoint::V6 { addr: local, .. },
+                    IpEndpoint::V6 { addr: remote, .. },
+                ) => {
                     attrs.push(L2tpAttribute::Ip6Saddr(*local));
                     attrs.push(L2tpAttribute::Ip6Daddr(*remote));
                 }
@@ -295,9 +312,10 @@ pub(crate) fn decode_tunnel_info(
             } else if let (Some(local), Some(remote)) =
                 (ip_saddr_v6, ip_daddr_v6)
             {
+                // The kernel does not report interface scopes.
                 Encapsulation::Ip {
-                    local: IpEndpoint::V6(local),
-                    remote: IpEndpoint::V6(remote),
+                    local: IpEndpoint::v6(local),
+                    remote: IpEndpoint::v6(remote),
                 }
             } else {
                 return Err(missing_attr_error(
@@ -731,13 +749,59 @@ mod tests {
     }
 
     #[test]
+    fn unmanaged_tunnels_reject_link_local_endpoints() {
+        let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let eth0 = IfName::new("eth0").unwrap();
+        let configs = [
+            Encapsulation::Ip {
+                local: IpEndpoint::v6_scoped(link_local, eth0.clone()),
+                remote: IpEndpoint::v6(Ipv6Addr::LOCALHOST),
+            },
+            Encapsulation::Ip {
+                local: IpEndpoint::v6(Ipv6Addr::UNSPECIFIED),
+                remote: IpEndpoint::v6_scoped(link_local, eth0),
+            },
+            Encapsulation::Udp {
+                local: UdpEndpoint::V6(SocketAddrV6::new(
+                    Ipv6Addr::UNSPECIFIED,
+                    1701,
+                    0,
+                    0,
+                )),
+                remote: UdpEndpoint::V6(SocketAddrV6::new(
+                    link_local, 1701, 0, 2,
+                )),
+                udp_csum: true,
+                udp_zero_csum6_tx: false,
+                udp_zero_csum6_rx: false,
+            },
+        ];
+        for encapsulation in configs {
+            let cfg =
+                TunnelConfig::new(TunnelId(1), TunnelId(2), encapsulation)
+                    .unwrap();
+            assert!(matches!(
+                encode_tunnel_create(&cfg, None),
+                Err(crate::Error::UnmanagedLinkLocal)
+            ));
+            // A managed socket carries its own scope.
+            let message = encode_tunnel_create(&cfg, Some(7)).unwrap();
+            assert!(has_attr(&message.attributes, |a| matches!(
+                a,
+                L2tpAttribute::Fd(7)
+            )));
+            assert_wire_round_trip(message);
+        }
+    }
+
+    #[test]
     fn encode_tunnel_create_ip_v6_includes_ip_fields() {
         let cfg = TunnelConfig::new(
             TunnelId(30),
             TunnelId(40),
             Encapsulation::Ip {
-                local: IpEndpoint::V6(Ipv6Addr::LOCALHOST),
-                remote: IpEndpoint::V6(Ipv6Addr::new(
+                local: IpEndpoint::v6(Ipv6Addr::LOCALHOST),
+                remote: IpEndpoint::v6(Ipv6Addr::new(
                     0x2001, 0xdb8, 1, 2, 3, 4, 5, 6,
                 )),
             },
@@ -799,7 +863,7 @@ mod tests {
             peer_tunnel_id: TunnelId(12),
             encapsulation: Encapsulation::Ip {
                 local: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
-                remote: IpEndpoint::V6(Ipv6Addr::LOCALHOST),
+                remote: IpEndpoint::v6(Ipv6Addr::LOCALHOST),
             },
         };
 
@@ -906,6 +970,22 @@ mod tests {
         assert_eq!(info.peer_tunnel_id, TunnelId(200));
         assert_eq!(info.proto_version, 3);
         assert!(info.using_ipsec);
+
+        let ip_attrs = vec![
+            L2tpAttribute::ConnId(1),
+            L2tpAttribute::PeerConnId(2),
+            L2tpAttribute::ProtoVersion(3),
+            L2tpAttribute::EncapType(L2tpEncapType::Ip),
+            L2tpAttribute::Ip6Saddr(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            L2tpAttribute::Ip6Daddr(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2)),
+        ];
+        let ip_info = decode_tunnel_info(&ip_attrs).unwrap();
+        let Encapsulation::Ip { local, remote } = ip_info.encapsulation else {
+            panic!("expected IP encapsulation");
+        };
+        // Scopes are not reported by the kernel.
+        assert!(local.is_link_local() && local.scope().is_none());
+        assert!(remote.is_link_local() && remote.scope().is_none());
 
         match info.encapsulation {
             Encapsulation::Udp {

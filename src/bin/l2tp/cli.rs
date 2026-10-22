@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
-    fmt,
-    io::{self, Read},
+    fmt, io,
     net::{IpAddr, SocketAddr, SocketAddrV6},
     process::ExitCode,
-    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -278,7 +276,22 @@ struct SessionStatsArgs {
     session_id: u32,
 }
 
+// Persistent CLI tunnels use a kernel-created socket, which has no interface
+// scope, so `%ifname` zone suffixes cannot be honoured.
+fn reject_scoped_addr(s: &str) -> Result<(), String> {
+    if s.contains('%') {
+        return Err(format!(
+            "interface-scoped address '{s}' is unsupported for persistent CLI \
+             tunnels, because the kernel creates their socket without an \
+             interface scope; use the library's managed tunnel API for \
+             link-local addresses"
+        ));
+    }
+    Ok(())
+}
+
 fn parse_udp_addr(s: &str) -> Result<UdpEndpoint, String> {
+    reject_scoped_addr(s)?;
     if let Ok(sa) = s.parse::<SocketAddr>() {
         return Ok(match sa {
             SocketAddr::V4(v4) => UdpEndpoint::V4(v4),
@@ -334,9 +347,10 @@ fn resolve_udp_endpoints(
 }
 
 fn parse_ip_addr(s: &str) -> Result<IpEndpoint, String> {
+    reject_scoped_addr(s)?;
     match s.parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => Ok(IpEndpoint::V4(v4)),
-        Ok(IpAddr::V6(v6)) => Ok(IpEndpoint::V6(v6)),
+        Ok(IpAddr::V6(v6)) => Ok(IpEndpoint::v6(v6)),
         Err(_) => Err(format!("invalid address '{s}'")),
     }
 }
@@ -512,10 +526,18 @@ async fn tunnel_create(
     };
 
     let attempts = if args.tunnel_id.is_some() { 1 } else { 32 };
-    for attempt in 0..attempts {
+    for _ in 0..attempts {
         let tunnel_id = TunnelId(match args.tunnel_id {
             Some(v) => v,
-            None => random_tunnel_id(attempt as u32),
+            None => random_tunnel_id().map_err(|e| {
+                CliError::L2tp(
+                    io::Error::new(
+                        e.kind(),
+                        format!("cannot choose a random tunnel id: {e}"),
+                    )
+                    .into(),
+                )
+            })?,
         });
         let peer_tunnel_id = TunnelId(args.peer_tunnel_id);
         let config = TunnelConfig::new(
@@ -541,6 +563,14 @@ async fn tunnel_create(
                     "--no-udp-csum is unsupported for IPv4-mapped peers on \
                      persistent IPv6 tunnels; use IPv4 --local and --remote \
                      endpoints or the library's managed tunnel API"
+                        .to_string(),
+                ));
+            }
+            Err(l2tp::Error::UnmanagedLinkLocal) => {
+                return Err(CliError::Usage(
+                    "link-local addresses are unsupported for persistent CLI \
+                     tunnels, because the kernel creates their socket without \
+                     an interface scope; use the library's managed tunnel API"
                         .to_string(),
                 ));
             }
@@ -622,25 +652,34 @@ async fn session_change(
 }
 
 // L2TPv3 relies on identifiers an off-path attacker cannot guess, so take them
-// from the OS RNG; the time/pid mix is only a fallback.
-fn random_tunnel_id(attempt: u32) -> u32 {
+// from the kernel's random number generator. getrandom(2) needs no /dev node
+// and blocks until the generator is seeded; there is no weaker fallback.
+fn random_tunnel_id() -> io::Result<u32> {
     let mut bytes = [0u8; 4];
-    let random = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .map(|()| u32::from_ne_bytes(bytes));
-    let value = random.unwrap_or_else(|_| {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_nanos() as u64;
-        let pid = u64::from(std::process::id());
-        let mixed = now
-            ^ (pid << 32)
-            ^ u64::from(attempt).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        (mixed ^ (mixed >> 32)) as u32
-    });
+    let mut filled = 0;
+    while filled < bytes.len() {
+        let rest = &mut bytes[filled..];
+        // SAFETY: `rest` is a valid, writable buffer of `rest.len()` bytes.
+        let n =
+            unsafe { libc::getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) };
+        match usize::try_from(n) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "getrandom returned no bytes",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(_) => {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
+    }
     let span = u32::MAX - 999_999;
-    1_000_000 + (value % span)
+    Ok(1_000_000 + (u32::from_ne_bytes(bytes) % span))
 }
 
 fn map_pw(v: PwTypeArg) -> PseudowireType {
@@ -796,8 +835,55 @@ mod tests {
 
     #[test]
     fn random_tunnel_ids_stay_in_range_and_vary() {
-        let ids: Vec<u32> = (0..32).map(random_tunnel_id).collect();
+        let ids: Vec<u32> =
+            (0..32).map(|_| random_tunnel_id().unwrap()).collect();
         assert!(ids.iter().all(|&id| id >= 1_000_000));
         assert!(ids.windows(2).any(|w| w[0] != w[1]));
+    }
+
+    #[tokio::test]
+    async fn persistent_tunnels_reject_link_local_addresses() {
+        let handle = L2tpHandle::new().await.unwrap();
+        let out = Output::new(OutputFmt::Text);
+        for (encap, local, remote, expected) in [
+            // Zone suffixes are rejected while parsing.
+            ("ip", "fe80::1%eth0", "fe80::2", "interface-scoped"),
+            (
+                "udp",
+                "[::]:1701",
+                "[fe80::2%eth0]:1701",
+                "interface-scoped",
+            ),
+            // Plain link-local addresses fail before any netlink request.
+            ("ip", "fe80::1", "fe80::2", "link-local"),
+            ("udp", "[::]:1701", "[fe80::2]:1701", "link-local"),
+        ] {
+            let argv = [
+                "l2tp",
+                "tunnel",
+                "create",
+                "--peer-tunnel-id",
+                "2",
+                "--encap",
+                encap,
+                "--local",
+                local,
+                "--remote",
+                remote,
+            ];
+            let Cli {
+                cmd:
+                    Cmd::Tunnel(TunnelArgs {
+                        cmd: TunnelCmd::Create(args),
+                    }),
+                ..
+            } = Cli::try_parse_from(argv).unwrap()
+            else {
+                panic!("expected tunnel create");
+            };
+            let err = tunnel_create(args, &handle, &out).await.unwrap_err();
+            assert!(matches!(err, CliError::Usage(_)), "{err}");
+            assert!(err.to_string().contains(expected), "{err}");
+        }
     }
 }

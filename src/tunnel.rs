@@ -57,8 +57,10 @@ impl TunnelConfig {
 
 /// Runtime information returned by the kernel for a tunnel.
 ///
-/// IPv6 scope IDs and flow labels are not reported by the kernel, so IPv6
-/// endpoints always have them set to `0`.
+/// IPv6 scope IDs and flow labels are not reported by the kernel, so IPv6 UDP
+/// endpoints always have them set to `0` and IPv6 IP endpoints have no scope.
+/// The kernel reports the IPv4 UDP checksum setting only for IPv4 sockets, so
+/// `udp_csum` is `false` for every IPv6 tunnel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TunnelInfo {
@@ -236,7 +238,7 @@ mod tests {
             TunnelId(2),
             Encapsulation::Ip {
                 local: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
-                remote: IpEndpoint::V6(Ipv6Addr::LOCALHOST),
+                remote: IpEndpoint::v6(Ipv6Addr::LOCALHOST),
             },
         ) {
             Ok(_) => panic!("expected address family mismatch"),

@@ -40,8 +40,12 @@ impl L2tpHandle {
     ///
     /// This must be awaited while running inside a Tokio runtime with I/O
     /// enabled, because the internal Generic Netlink connection task is
-    /// spawned onto the current Tokio executor. The handle is cheap to clone;
-    /// clones share one netlink connection.
+    /// spawned onto the current Tokio executor. Without a runtime, or with a
+    /// runtime built without `enable_io`, this returns
+    /// [`Error::Io`](crate::Error::Io). Tokio reports a missing I/O driver by
+    /// panicking inside the netlink socket registration; that panic is caught
+    /// and turned into the error, so the panic hook still runs. The handle is
+    /// cheap to clone; clones share one netlink connection.
     ///
     /// Requests that refer to a tunnel or session the kernel does not know
     /// fail with [`Error::KernelError`](crate::Error::KernelError) carrying
@@ -50,7 +54,18 @@ impl L2tpHandle {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             io::Error::other("tokio runtime is required for L2tpHandle::new()")
         })?;
-        let (mut connection, genl, _unsolicited) = genetlink::new_connection()?;
+        // netlink-sys registers its socket with Tokio's I/O driver through
+        // `AsyncFd`, which panics instead of failing when the runtime has no
+        // I/O driver. Tokio offers no way to check for the driver first.
+        let (mut connection, genl, _unsolicited) = std::panic::catch_unwind(
+            genetlink::new_connection,
+        )
+        .map_err(|_| {
+            io::Error::other(
+                "tokio runtime with I/O enabled is required for \
+                 L2tpHandle::new()",
+            )
+        })??;
         connection.set_forward_ack(true);
         connection.set_forward_done(true);
         runtime.spawn(connection);
@@ -768,6 +783,24 @@ mod tests {
             Err(crate::Error::Io(e)) => {
                 assert!(
                     e.to_string().contains("tokio runtime is required"),
+                    "unexpected error message: {e}"
+                );
+            }
+            Err(e) => panic!("unexpected error type: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn new_fails_without_io_driver() {
+        // No `enable_io`: Tokio panics when the netlink socket registers.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        match runtime.block_on(L2tpHandle::new()) {
+            Ok(_) => panic!("expected failure without an I/O driver"),
+            Err(crate::Error::Io(e)) => {
+                assert!(
+                    e.to_string().contains("I/O enabled"),
                     "unexpected error message: {e}"
                 );
             }

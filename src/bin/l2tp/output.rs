@@ -335,7 +335,11 @@ fn fmt_udp(ep: &UdpEndpoint) -> String {
 fn fmt_ip(ep: &IpEndpoint) -> String {
     match ep {
         IpEndpoint::V4(addr) => addr.to_string(),
-        IpEndpoint::V6(addr) => addr.to_string(),
+        IpEndpoint::V6 { addr, scope: None } => addr.to_string(),
+        IpEndpoint::V6 {
+            addr,
+            scope: Some(scope),
+        } => format!("{addr}%{scope}"),
     }
 }
 

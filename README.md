@@ -11,8 +11,10 @@ It does **not** configure interfaces/bridges/routes (`rtnetlink` tasks belong in
   binary only reports that the platform is unsupported.
 - Rust 1.89 or newer (required by the netlink dependencies).
 - Linux kernel with L2TP Generic Netlink support (`l2tp` family).
-- Tokio runtime.
-- `CAP_NET_ADMIN` (or root) for most create/modify/delete operations.
+- Tokio runtime with its I/O driver enabled. `L2tpHandle::new` returns an
+  error without one.
+- `CAP_NET_ADMIN` (or root) for every L2TP netlink command, including `get`
+  and `list`; the kernel marks them all `GENL_UNS_ADMIN_PERM`.
 
 ## Installation
 
@@ -111,6 +113,71 @@ async fn main() -> l2tp::Result<()> {
 }
 ```
 
+### Link-local IPv6 endpoints
+
+The kernel refuses to bind or connect a link-local address without an
+interface. Scope the endpoint with an interface name; it is resolved to the
+interface index each time the socket binds, connects or reconnects, so the
+tunnel keeps working with an interface that was re-created under a new index.
+The scopes of both endpoints and the `device` must name the same interface.
+
+```rust,no_run
+use l2tp::{
+    Encapsulation, IfName, IpEndpoint, L2tpHandle, TunnelConfig, TunnelId,
+    TunnelSocket,
+};
+use std::net::Ipv6Addr;
+
+#[tokio::main]
+async fn main() -> l2tp::Result<()> {
+    let handle = L2tpHandle::new().await?;
+
+    let eth0: IfName = "eth0".parse()?;
+    let local =
+        IpEndpoint::v6_scoped(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), eth0);
+    // A link-local peer without a scope uses the local endpoint's interface.
+    let remote = IpEndpoint::v6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2));
+
+    let socket = TunnelSocket::ip(&local, &remote, None, TunnelId(7000))?;
+    let cfg = TunnelConfig::new(
+        TunnelId(7000),
+        TunnelId(8000),
+        Encapsulation::Ip { local, remote },
+    )?;
+
+    let _tunnel = handle.create_tunnel(cfg, socket).await?;
+    Ok(())
+}
+```
+
+UDP endpoints carry the numeric scope ID of `SocketAddrV6`. Resolve the name
+with `IfName::index()` right before creating or reconnecting the socket:
+
+```rust,ignore
+let scope_id = IfName::new("eth0")?.index()?;
+let local = UdpEndpoint::V6(SocketAddrV6::new(link_local, 1701, 0, scope_id));
+```
+
+Unmanaged tunnels cannot use link-local endpoints, because the kernel creates
+their socket without an interface scope; `create_unmanaged_tunnel` returns
+`Error::UnmanagedLinkLocal` before contacting the kernel. Re-creating a tunnel
+after its interface disappears is left to the application; this crate does
+not watch rtnetlink link events.
+
+## Interface Names
+
+`IfName` is a checked newtype for Linux interface names. `IfName::new`,
+`str::parse` and `TryFrom<&str>`, `TryFrom<String>` and `TryFrom<&[u8]>`
+validate the name with the kernel's `dev_valid_name()` rules: non-empty, at
+most `IFNAMSIZ - 1` bytes, not `.` or `..`, and no NUL, `/`, `:` or
+whitespace. Read it back with `as_str`, `as_bytes`, `AsRef<str>`, `Display`
+or `String::from`. `IfName::index` and `IfName::from_index` convert between
+names and the kernel's interface indexes.
+
+The kernel accepts non-UTF-8 names, but `netlink-packet-l2tp` represents
+`L2TP_ATTR_IFNAME` as a `String`, so such names cannot be used with this crate
+and a session listing that contains one fails to decode.
+
 ## Binding Managed Sockets to an Interface
 
 Use `IfName` with managed sockets:
@@ -121,12 +188,18 @@ Use `IfName` with managed sockets:
 - After creation:
   - `tunnel.socket().unwrap().bind_to_device(&ifname)?`
 
-`SO_BINDTODEVICE` requires `CAP_NET_RAW`.
+`SO_BINDTODEVICE` requires `CAP_NET_RAW`. A link-local scope only selects the
+interface of a link-local address and needs no extra capability.
 
 ## Kernel Semantics Notes
 
 - `L2TP_ATTR_IFNAME` applies to sessions (`SESSION_CREATE`/session lookups), not tunnels.
   Tunnels do not create a netdevice.
+- The kernel reports the IPv4 UDP checksum setting (`L2TP_ATTR_UDP_CSUM`) only
+  for IPv4 sockets. `TunnelInfo` therefore shows `udp_csum: false` for every
+  IPv6 tunnel, even when its IPv4-mapped peer receives checksums.
+- The kernel does not report IPv6 scope IDs or flow labels, so `TunnelInfo`
+  UDP endpoints have them set to `0` and IP endpoints have no scope.
 - Managed tunnels are fd-backed. When the managed tunnel socket is closed, the kernel
   tears down that tunnel and its sessions. Sockets are created with `SOCK_CLOEXEC`
   so child processes do not keep tunnels alive.
@@ -189,6 +262,13 @@ match handle.create_unmanaged_tunnel(cfg).await {
 - `TunnelModify`, `TunnelHandle::modify` and `L2tpHandle::modify_tunnel` were removed:
   the kernel accepted these requests but did not apply their UDP checksum setting.
 - `TunnelSocket::ip` takes a `TunnelId` instead of a `u32`.
+- `IpEndpoint::V6` is a struct variant with an `addr` and an optional
+  interface `scope`; use `IpEndpoint::v6(addr)` or
+  `IpEndpoint::v6_scoped(addr, ifname)`. Link-local endpoints without a scope
+  are rejected with `Error::ScopeRequired`, and unmanaged tunnels reject
+  link-local endpoints with `Error::UnmanagedLinkLocal`.
+- `L2tpHandle::new` returns `Error::Io` instead of panicking when the Tokio
+  runtime has no I/O driver.
 - `Error` is `#[non_exhaustive]`. `Error::Netlink` holds a message instead of a
   `netlink-packet-core` type. Malformed kernel replies are reported as
   `Error::UnexpectedReply` instead of a synthetic `KernelError`, and socket
@@ -225,3 +305,11 @@ socket, including when an IPv4 `--remote` is automatically mapped to match an
 IPv6 `--local`. Use IPv4 endpoints for both addresses, or the library's managed
 tunnel API, to disable IPv4 checksums. Mapped tunnels with checksums enabled
 remain supported.
+
+Link-local addresses, with or without a `%ifname` zone suffix, are rejected
+for the same reason: the kernel-created socket has no interface scope. Use the
+library's managed tunnel API for link-local endpoints.
+
+Automatically chosen tunnel IDs come from `getrandom(2)`; when that fails the
+command reports the error instead of falling back to a predictable source.
+Pass `--tunnel-id` to choose the ID yourself.

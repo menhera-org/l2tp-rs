@@ -23,6 +23,8 @@ pub struct TunnelSocket {
     fd: OwnedFd,
     encap: SocketEncap,
     family: SocketFamily,
+    /// Interface scope of an IP socket, resolved again on every reconnect.
+    scope: Option<IfName>,
 }
 
 #[derive(Debug)]
@@ -48,7 +50,7 @@ impl SocketFamily {
     fn from_ip(endpoint: &IpEndpoint) -> Self {
         match endpoint {
             IpEndpoint::V4(_) => Self::V4,
-            IpEndpoint::V6(_) => Self::V6,
+            IpEndpoint::V6 { .. } => Self::V6,
         }
     }
 
@@ -149,6 +151,7 @@ impl TunnelSocket {
             fd,
             encap: SocketEncap::Udp,
             family: SocketFamily::from_udp(local),
+            scope: None,
         })
     }
 
@@ -157,6 +160,13 @@ impl TunnelSocket {
     /// The local bind uses `tunnel_id` as `l2tp_conn_id`, so it must match the
     /// tunnel ID passed to [`L2tpHandle::create_tunnel`]; the remote connect
     /// uses conn_id `0`.
+    ///
+    /// Link-local IPv6 endpoints need an interface scope
+    /// ([`IpEndpoint::v6_scoped`]). The scopes of `local` and `remote` and
+    /// the `device` must name the same interface. That name is resolved to
+    /// the interface index here and again on every
+    /// [`reconnect_ip`](Self::reconnect_ip), so a re-created interface is
+    /// picked up. Unlike `device`, a scope does not need `CAP_NET_RAW`.
     ///
     /// [`L2tpHandle::create_tunnel`]: crate::L2tpHandle::create_tunnel
     pub fn ip(
@@ -168,10 +178,15 @@ impl TunnelSocket {
         if local.ip_version() != remote.ip_version() {
             return Err(crate::Error::AddressFamilyMismatch);
         }
+        let scope =
+            unified_scope([local.scope(), remote.scope(), device])?.cloned();
+        require_scope(local, scope.as_ref())?;
+        require_scope(remote, scope.as_ref())?;
+        let scope_id = resolve_scope(scope.as_ref())?;
 
         let family = match local {
             IpEndpoint::V4(_) => libc::AF_INET,
-            IpEndpoint::V6(_) => libc::AF_INET6,
+            IpEndpoint::V6 { .. } => libc::AF_INET6,
         };
 
         let fd = socket(family, libc::SOCK_DGRAM, IPPROTO_L2TP)?;
@@ -180,16 +195,17 @@ impl TunnelSocket {
             set_bind_to_device(fd.as_raw_fd(), device)?;
         }
 
-        let local_addr = l2tp_sockaddr(local, tunnel_id.0);
+        let local_addr = l2tp_sockaddr(local, tunnel_id.0, scope_id);
         bind(fd.as_raw_fd(), &local_addr)?;
 
-        let remote_addr = l2tp_sockaddr(remote, 0);
+        let remote_addr = l2tp_sockaddr(remote, 0, scope_id);
         connect(fd.as_raw_fd(), &remote_addr)?;
 
         Ok(Self {
             fd,
             encap: SocketEncap::Ip,
             family: SocketFamily::from_ip(local),
+            scope,
         })
     }
 
@@ -242,6 +258,12 @@ impl TunnelSocket {
                 {
                     return Err(crate::Error::AddressFamilyMismatch);
                 }
+                // The socket is bound already; the scopes only have to agree.
+                unified_scope([
+                    local.scope(),
+                    remote.scope(),
+                    self.scope.as_ref(),
+                ])?;
             }
             _ => return Err(crate::Error::EncapsulationMismatch),
         }
@@ -289,6 +311,10 @@ impl TunnelSocket {
     }
 
     /// Reconnects a managed IP tunnel socket to a new remote endpoint.
+    ///
+    /// A link-local `new_remote` needs an interface scope. The socket's own
+    /// scope is used when `new_remote` has none, and the two must agree
+    /// otherwise. The name is resolved to the interface index on every call.
     pub fn reconnect_ip(&self, new_remote: &IpEndpoint) -> crate::Result<()> {
         if let SocketEncap::Udp = self.encap {
             return Err(crate::Error::EncapsulationMismatch);
@@ -296,8 +322,11 @@ impl TunnelSocket {
         if self.family.ip_version() != new_remote.ip_version() {
             return Err(crate::Error::AddressFamilyMismatch);
         }
+        let scope = unified_scope([new_remote.scope(), self.scope.as_ref()])?;
+        require_scope(new_remote, scope)?;
+        let scope_id = resolve_scope(scope)?;
 
-        let remote_addr = l2tp_sockaddr(new_remote, 0);
+        let remote_addr = l2tp_sockaddr(new_remote, 0, scope_id);
         connect(self.fd.as_raw_fd(), &remote_addr)
     }
 
@@ -469,7 +498,57 @@ fn udp_sockaddr(endpoint: &UdpEndpoint) -> SockAddr {
     }
 }
 
-fn l2tp_sockaddr(endpoint: &IpEndpoint, conn_id: u32) -> SockAddr {
+/// Returns the single interface named by `scopes`, or an error when they
+/// disagree.
+fn unified_scope<'a>(
+    scopes: impl IntoIterator<Item = Option<&'a IfName>>,
+) -> crate::Result<Option<&'a IfName>> {
+    let mut unified: Option<&IfName> = None;
+    for scope in scopes.into_iter().flatten() {
+        match unified {
+            None => unified = Some(scope),
+            Some(expected) if expected != scope => {
+                return Err(crate::Error::ScopeMismatch {
+                    expected: expected.clone(),
+                    found: scope.clone(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(unified)
+}
+
+/// The kernel cannot bind or connect a link-local address without an
+/// interface.
+fn require_scope(
+    endpoint: &IpEndpoint,
+    scope: Option<&IfName>,
+) -> crate::Result<()> {
+    match endpoint {
+        IpEndpoint::V6 { addr, .. }
+            if addr.is_unicast_link_local() && scope.is_none() =>
+        {
+            Err(crate::Error::ScopeRequired(*addr))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Resolves the scope to the interface index at the time of use, so a
+/// re-created interface keeps working.
+fn resolve_scope(scope: Option<&IfName>) -> crate::Result<u32> {
+    match scope {
+        Some(name) => name.index(),
+        None => Ok(0),
+    }
+}
+
+fn l2tp_sockaddr(
+    endpoint: &IpEndpoint,
+    conn_id: u32,
+    scope_id: u32,
+) -> SockAddr {
     match endpoint {
         IpEndpoint::V4(addr) => SockAddr::L2tpV4(SockaddrL2tpIp {
             l2tp_family: libc::AF_INET as libc::sa_family_t,
@@ -480,14 +559,14 @@ fn l2tp_sockaddr(endpoint: &IpEndpoint, conn_id: u32) -> SockAddr {
             l2tp_conn_id: conn_id,
             _pad: [0; 4],
         }),
-        IpEndpoint::V6(addr) => SockAddr::L2tpV6(SockaddrL2tpIp6 {
+        IpEndpoint::V6 { addr, .. } => SockAddr::L2tpV6(SockaddrL2tpIp6 {
             l2tp_family: libc::AF_INET6 as libc::sa_family_t,
             l2tp_unused: 0,
             l2tp_flowinfo: 0,
             l2tp_addr: libc::in6_addr {
                 s6_addr: addr.octets(),
             },
-            l2tp_scope_id: 0,
+            l2tp_scope_id: scope_id,
             l2tp_conn_id: conn_id,
         }),
     }
@@ -560,6 +639,7 @@ mod tests {
                 fd,
                 encap: SocketEncap::Udp,
                 family,
+                scope: None,
             };
             let endpoint = match family {
                 SocketFamily::V4 => UdpEndpoint::V4(SocketAddrV4::new(
@@ -624,12 +704,223 @@ mod tests {
     #[test]
     fn ipv4_l2tp_sockaddr_uses_inet_family() {
         let SockAddr::L2tpV4(addr) =
-            l2tp_sockaddr(&IpEndpoint::V4(Ipv4Addr::LOCALHOST), 42)
+            l2tp_sockaddr(&IpEndpoint::V4(Ipv4Addr::LOCALHOST), 42, 0)
         else {
             panic!("expected IPv4 L2TP address");
         };
         assert_eq!(i32::from(addr.l2tp_family), libc::AF_INET);
         assert_eq!(addr.l2tp_conn_id, 42);
+    }
+
+    #[test]
+    fn ipv6_l2tp_sockaddr_carries_scope_and_conn_id() {
+        let SockAddr::L2tpV6(addr) =
+            l2tp_sockaddr(&IpEndpoint::v6(Ipv6Addr::LOCALHOST), 42, 7)
+        else {
+            panic!("expected IPv6 L2TP address");
+        };
+        assert_eq!(i32::from(addr.l2tp_family), libc::AF_INET6);
+        assert_eq!(addr.l2tp_addr.s6_addr, Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(addr.l2tp_scope_id, 7);
+        assert_eq!(addr.l2tp_conn_id, 42);
+    }
+
+    #[test]
+    fn link_local_ip_endpoints_require_one_scope() {
+        let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let eth0 = IfName::new("eth0").unwrap();
+        let eth1 = IfName::new("eth1").unwrap();
+
+        // Validation runs before any socket is created.
+        let err = TunnelSocket::ip(
+            &IpEndpoint::v6(link_local),
+            &IpEndpoint::v6(Ipv6Addr::LOCALHOST),
+            None,
+            TunnelId(1),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::ScopeRequired(addr) if addr == link_local
+        ));
+
+        let err = TunnelSocket::ip(
+            &IpEndpoint::v6(Ipv6Addr::UNSPECIFIED),
+            &IpEndpoint::v6(link_local),
+            None,
+            TunnelId(1),
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::Error::ScopeRequired(_)));
+
+        let err = TunnelSocket::ip(
+            &IpEndpoint::v6_scoped(link_local, eth0.clone()),
+            &IpEndpoint::v6_scoped(link_local, eth1.clone()),
+            None,
+            TunnelId(1),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &err,
+            crate::Error::ScopeMismatch { expected, found }
+                if *expected == eth0 && *found == eth1
+        ));
+
+        let err = TunnelSocket::ip(
+            &IpEndpoint::v6_scoped(link_local, eth0.clone()),
+            &IpEndpoint::v6(link_local),
+            Some(&eth1),
+            TunnelId(1),
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::Error::ScopeMismatch { .. }));
+
+        // A scope that names no interface fails before the socket is created.
+        let missing = IfName::new("l2tp-no-such0").unwrap();
+        let err = TunnelSocket::ip(
+            &IpEndpoint::v6_scoped(link_local, missing),
+            &IpEndpoint::v6(link_local),
+            None,
+            TunnelId(1),
+        )
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENODEV));
+    }
+
+    #[test]
+    fn configure_checks_ip_scopes_against_the_socket() {
+        let fd =
+            match socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
+                Ok(fd) => fd,
+                Err(crate::Error::Io(e))
+                    if e.kind() == io::ErrorKind::PermissionDenied =>
+                {
+                    return;
+                }
+                Err(e) => panic!("unexpected socket create error: {e:?}"),
+            };
+        let lo = IfName::new("lo").unwrap();
+        let sock = TunnelSocket {
+            fd,
+            encap: SocketEncap::Ip,
+            family: SocketFamily::V6,
+            scope: Some(lo.clone()),
+        };
+        let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+
+        sock.configure(&Encapsulation::Ip {
+            local: IpEndpoint::v6_scoped(link_local, lo),
+            remote: IpEndpoint::v6(link_local),
+        })
+        .unwrap();
+        let err = sock
+            .configure(&Encapsulation::Ip {
+                local: IpEndpoint::v6_scoped(
+                    link_local,
+                    IfName::new("eth0").unwrap(),
+                ),
+                remote: IpEndpoint::v6(link_local),
+            })
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ScopeMismatch { .. }));
+
+        // Reconnecting to another interface is rejected the same way, and a
+        // link-local peer still needs a scope on an unscoped socket.
+        let err = sock
+            .reconnect_ip(&IpEndpoint::v6_scoped(
+                link_local,
+                IfName::new("eth0").unwrap(),
+            ))
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ScopeMismatch { .. }));
+        let unscoped = TunnelSocket {
+            scope: None,
+            ..sock
+        };
+        let err = unscoped
+            .reconnect_ip(&IpEndpoint::v6(link_local))
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ScopeRequired(_)));
+    }
+
+    /// Returns an interface with a link-local address, when the host has one.
+    fn link_local_interface() -> Option<(Ipv6Addr, IfName)> {
+        let table = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
+        table.lines().find_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let [hex, _index, _prefix, scope, _flags, name] = fields[..] else {
+                return None;
+            };
+            // IPV6_ADDR_LINKLOCAL scope value.
+            if scope != "20" || hex.len() != 32 {
+                return None;
+            }
+            let mut octets = [0u8; 16];
+            for (i, octet) in octets.iter_mut().enumerate() {
+                *octet = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+            }
+            Some((Ipv6Addr::from(octets), IfName::new(name).ok()?))
+        })
+    }
+
+    #[test]
+    fn link_local_ip_socket_binds_to_the_scoped_interface() {
+        let Some((addr, ifname)) = link_local_interface() else {
+            return;
+        };
+        let local = IpEndpoint::v6_scoped(addr, ifname.clone());
+        // The peer takes its scope from the local endpoint.
+        let remote =
+            IpEndpoint::v6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x1234));
+        let tunnel_id = TunnelId(0x4c32_5450 ^ std::process::id());
+        let sock = match TunnelSocket::ip(&local, &remote, None, tunnel_id) {
+            Ok(sock) => sock,
+            // No l2tp_ip6 support, no permission, or no usable link here.
+            Err(crate::Error::Io(e))
+                if e.kind() == io::ErrorKind::PermissionDenied
+                    || matches!(
+                        e.raw_os_error(),
+                        Some(
+                            libc::EPROTONOSUPPORT
+                                | libc::ESOCKTNOSUPPORT
+                                | libc::EAFNOSUPPORT
+                                | libc::EADDRINUSE
+                                | libc::EADDRNOTAVAIL
+                                | libc::ENETUNREACH
+                        )
+                    ) =>
+            {
+                return;
+            }
+            Err(e) => panic!("unexpected link-local socket error: {e:?}"),
+        };
+        assert_eq!(sock.scope, Some(ifname.clone()));
+
+        // SAFETY: zero-initialization is valid for this plain C struct.
+        let mut bound: SockaddrL2tpIp6 = unsafe { zeroed() };
+        let mut len = size_of::<SockaddrL2tpIp6>() as libc::socklen_t;
+        // SAFETY: `bound` is writable for `len` bytes and the fd is open.
+        let rc = unsafe {
+            libc::getsockname(
+                sock.as_raw_fd(),
+                (&mut bound as *mut SockaddrL2tpIp6).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        assert_eq!(bound.l2tp_scope_id, ifname.index().unwrap());
+        assert_eq!(bound.l2tp_conn_id, tunnel_id.0);
+
+        // Reconnecting resolves the socket's own scope again.
+        sock.reconnect_ip(&IpEndpoint::v6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 0x5678,
+        )))
+        .unwrap();
+    }
+
+    #[test]
+    fn sockaddr_l2tpip6_matches_kernel_size() {
+        assert_eq!(size_of::<SockaddrL2tpIp6>(), 32);
     }
 
     #[test]
@@ -653,7 +944,7 @@ mod tests {
     #[test]
     fn ip_constructor_rejects_family_mismatch() {
         let local = IpEndpoint::V4(Ipv4Addr::LOCALHOST);
-        let remote = IpEndpoint::V6(Ipv6Addr::LOCALHOST);
+        let remote = IpEndpoint::v6(Ipv6Addr::LOCALHOST);
 
         let err = match TunnelSocket::ip(&local, &remote, None, TunnelId(42)) {
             Ok(_) => panic!("expected address family mismatch"),
@@ -748,6 +1039,7 @@ mod tests {
             fd,
             encap: SocketEncap::Ip,
             family: SocketFamily::V4,
+            scope: None,
         };
 
         let err = sock
@@ -853,6 +1145,7 @@ mod tests {
             fd,
             encap: SocketEncap::Udp,
             family: SocketFamily::V4,
+            scope: None,
         };
 
         let err = sock
@@ -877,10 +1170,11 @@ mod tests {
             fd,
             encap: SocketEncap::Ip,
             family: SocketFamily::V4,
+            scope: None,
         };
 
         let err = sock
-            .reconnect_ip(&IpEndpoint::V6(Ipv6Addr::LOCALHOST))
+            .reconnect_ip(&IpEndpoint::v6(Ipv6Addr::LOCALHOST))
             .unwrap_err();
         assert!(matches!(err, crate::Error::AddressFamilyMismatch));
     }
