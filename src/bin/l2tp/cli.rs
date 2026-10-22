@@ -97,6 +97,9 @@ fn ifname_parser() -> IfNameParser {
     OsStringValueParser::new().try_map(parse_ifname)
 }
 
+/// Supplementary L2TP tool for testing only.
+///
+/// Serialized output is for inspection and may be lossy.
 #[derive(Parser)]
 #[command(name = "l2tp")]
 struct Cli {

@@ -16,7 +16,7 @@ exclude = [".github/", ".licenserc.yaml"]
 # Derive `serde` traits for the configuration, information, identifier and
 # statistics types.
 serde = ["dep:serde"]
-# Build the `l2tp` command-line tool.
+# Build the supplementary, testing-only `l2tp` command-line tool.
 cli = ["serde", "dep:clap", "dep:serde_json", "tokio/rt-multi-thread", "tokio/macros"]
 
 [[bin]]

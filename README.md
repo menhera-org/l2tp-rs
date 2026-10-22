@@ -37,12 +37,18 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
   event, identifier and statistics types. Endpoints are strings such as
   `192.0.2.1:1701` or `fe80::1%eth0`, cookies are hexadecimal strings, and
   interface names are strings, or byte arrays when they are not UTF-8.
-- `cli`: builds the `l2tp` command-line tool (implies `serde`).
+- `cli`: builds the supplementary, testing-only `l2tp` command-line tool
+  (implies `serde`).
 
 No features are enabled by default, so library users do not pull in the CLI's
 dependencies.
 
 ## Command-Line Tool
+
+The `l2tp` CLI is a supplementary tool intended only for testing the library.
+Its text and JSON output are for inspection; serialization losses, such as
+omitted IPv6 UDP flow information, are expected. Use the Rust API for
+applications that need complete configuration values.
 
 The `l2tp` binary is behind the `cli` feature. Install it with:
 
