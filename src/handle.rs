@@ -144,8 +144,9 @@ impl L2tpHandle {
     /// UDP checksum settings from `config` are applied to `socket` before
     /// registering it with the kernel.
     ///
-    /// For IP encapsulation, `socket` must have been created by
-    /// [`TunnelSocket::ip`] with the same tunnel ID as `config`.
+    /// For IP encapsulation, `socket` must be bound to the same tunnel ID as
+    /// `config`; otherwise this returns
+    /// [`Error::TunnelIdMismatch`](crate::Error::TunnelIdMismatch).
     /// [`TunnelSocket::for_config`] creates a matching socket, and
     /// [`TunnelConfig::for_socket`] describes an existing one.
     ///
@@ -160,6 +161,14 @@ impl L2tpHandle {
         socket: TunnelSocket,
     ) -> crate::Result<TunnelHandle> {
         socket.configure(&config.encapsulation)?;
+        if let Some(conn_id) = socket.conn_id()
+            && conn_id != config.tunnel_id.0
+        {
+            return Err(crate::Error::TunnelIdMismatch {
+                socket: TunnelId(conn_id),
+                config: config.tunnel_id,
+            });
+        }
         let message =
             netlink::encode_tunnel_create(&config, Some(socket.as_raw_fd()))?;
         let handle = self.clone();
@@ -429,6 +438,10 @@ impl L2tpHandle {
         const POLLS: u32 = 200;
         const INTERVAL: std::time::Duration =
             std::time::Duration::from_millis(10);
+        // Most tunnels are gone by the first lookup; only pace the rest.
+        if self.tunnel_removed(tunnel_id).await? {
+            return Ok(());
+        }
         // A thread of its own paces the polls and exits once the receiver is
         // gone, so the wait depends neither on the runtime's timer driver
         // nor on a spare thread in its blocking pool.
@@ -443,16 +456,12 @@ impl L2tpHandle {
                     }
                 }
             })?;
-        for _ in 0..POLLS {
-            match self.get_tunnel(tunnel_id).await {
-                Ok(_) => {}
-                Err(err) if err.raw_os_error() == Some(libc::ENODEV) => {
-                    return Ok(());
-                }
-                Err(err) => return Err(err),
-            }
+        for _ in 1..POLLS {
             if tick_rx.recv().await.is_none() {
                 return Err(crate::Error::other("the deletion wait stopped"));
+            }
+            if self.tunnel_removed(tunnel_id).await? {
+                return Ok(());
             }
         }
         Err(io::Error::new(
@@ -463,6 +472,14 @@ impl L2tpHandle {
             ),
         )
         .into())
+    }
+
+    async fn tunnel_removed(&self, tunnel_id: TunnelId) -> crate::Result<bool> {
+        match self.get_tunnel(tunnel_id).await {
+            Ok(_) => Ok(false),
+            Err(err) if err.raw_os_error() == Some(libc::ENODEV) => Ok(true),
+            Err(err) => Err(err),
+        }
     }
 
     /// Deletes a session from a tunnel.
@@ -599,7 +616,7 @@ impl L2tpHandle {
         // Requests are never sent on this connection; it only listens.
         drop(genl);
         let task = runtime.spawn(connection);
-        Ok(Events::new(receiver, task))
+        Ok(Events::new(receiver, task, family.id))
     }
 
     async fn resolve_family(&self) -> crate::Result<FamilyInfo> {

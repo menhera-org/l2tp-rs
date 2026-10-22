@@ -4,7 +4,7 @@ use std::{io, net::Ipv6Addr};
 
 use netlink_packet_core::DecodeError;
 
-use crate::L2tpIfName;
+use crate::{L2tpIfName, TunnelId};
 
 /// Errors returned by this crate.
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +69,24 @@ pub enum Error {
     /// The operation does not match the socket's encapsulation (UDP or IP).
     #[error("encapsulation mismatch: operation does not apply to this socket")]
     EncapsulationMismatch,
+
+    /// The managed IP socket is bound with a different connection ID than
+    /// the tunnel configuration names.
+    #[error(
+        "tunnel ID mismatch: socket is bound to {socket}, config names \
+         {config}"
+    )]
+    TunnelIdMismatch {
+        /// Connection ID the socket is bound with.
+        socket: TunnelId,
+        /// Tunnel ID named by the configuration.
+        config: TunnelId,
+    },
+
+    /// The socket was adopted without a peer connection ID and the kernel
+    /// does not report it, so the socket cannot be reconnected.
+    #[error("the peer connection ID of this adopted L2TP/IP socket is unknown")]
+    UnknownPeerConnId,
 
     /// A link-local IPv6 endpoint was given without an interface scope.
     ///

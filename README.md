@@ -55,6 +55,11 @@ session management, `l2tp monitor` prints kernel notifications as they
 happen, and sessions can be selected by `--ifname` instead of their
 identifiers.
 
+For UDP tunnels, omitting `--local` binds the IPv6 wildcard `::`; an IPv4
+remote is then mapped to IPv6. Pass `--local 0.0.0.0` (or an IPv4 address,
+optionally with a port) to create an IPv4 socket. An explicit IPv4 `--local`
+is required when using an IPv4 remote with `--no-udp-csum`.
+
 ## Quick Start
 
 ### Managed UDP tunnel + Ethernet session
@@ -358,6 +363,11 @@ and accepts non-UTF-8 arguments.
 - The kernel accepts the L2-specific sublayer type (`L2TP_ATTR_L2SPEC_TYPE`)
   when a session is created but never reports it, so `SessionInfo::l2spec_type`
   is `None` and the CLI shows `unknown`.
+- `SessionConfig::eth`, `SessionConfig::ppp` and the CLI default the
+  L2-specific sublayer to `L2SpecType::None`. The kernel and iproute2 default
+  to `L2SpecType::Default`; set `l2spec_type` to `L2SpecType::Default` (CLI:
+  `--l2spec default`) when matching a peer configured with that default.
+  Both peers must use the same type for their session wire formats to match.
 - The kernel reports the IPv4 UDP checksum setting (`L2TP_ATTR_UDP_CSUM`) only
   for IPv4 sockets. `TunnelInfo` therefore shows `udp_csum: false` for every
   IPv6 tunnel, even when its IPv4-mapped peer receives checksums.

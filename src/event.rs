@@ -46,6 +46,7 @@ pub enum L2tpEvent {
 pub struct Events {
     receiver: UnboundedReceiver<(NetlinkMessage<RawGenlMessage>, SocketAddr)>,
     connection: tokio::task::JoinHandle<()>,
+    family_id: u16,
 }
 
 impl Events {
@@ -55,10 +56,12 @@ impl Events {
             SocketAddr,
         )>,
         connection: tokio::task::JoinHandle<()>,
+        family_id: u16,
     ) -> Self {
         Self {
             receiver,
             connection,
+            family_id,
         }
     }
 }
@@ -72,11 +75,13 @@ impl Stream for Events {
     ) -> Poll<Option<Self::Item>> {
         loop {
             match Pin::new(&mut self.receiver).poll_next(cx) {
-                Poll::Ready(Some((message, _))) => match decode(message) {
-                    Ok(Some(event)) => return Poll::Ready(Some(Ok(event))),
-                    Ok(None) => continue,
-                    Err(err) => return Poll::Ready(Some(Err(err))),
-                },
+                Poll::Ready(Some((message, _))) => {
+                    match decode(message, self.family_id) {
+                        Ok(Some(event)) => return Poll::Ready(Some(Ok(event))),
+                        Ok(None) => continue,
+                        Err(err) => return Poll::Ready(Some(Err(err))),
+                    }
+                }
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
@@ -94,7 +99,11 @@ impl Drop for Events {
 
 pub(crate) fn decode(
     message: NetlinkMessage<RawGenlMessage>,
+    family_id: u16,
 ) -> crate::Result<Option<L2tpEvent>> {
+    if message.header.message_type != family_id {
+        return Ok(None);
+    }
     let NetlinkPayload::InnerMessage(raw) = message.payload else {
         return Ok(None);
     };
@@ -135,13 +144,18 @@ mod tests {
     use super::*;
     use crate::{SessionId, TunnelId};
 
+    const FAMILY_ID: u16 = 42;
+
     fn notification(
+        family_id: u16,
         cmd: L2tpCmd,
         attributes: Vec<L2tpAttribute>,
     ) -> NetlinkMessage<RawGenlMessage> {
         let genl = GenlMessage::from_payload(L2tpMessage { cmd, attributes });
+        let mut header = NetlinkHeader::default();
+        header.message_type = family_id;
         NetlinkMessage::new(
-            NetlinkHeader::default(),
+            header,
             NetlinkPayload::InnerMessage(RawGenlMessage::from_genlmsg(genl)),
         )
     }
@@ -156,9 +170,12 @@ mod tests {
             L2tpAttribute::IpSaddr(Ipv4Addr::LOCALHOST),
             L2tpAttribute::IpDaddr(Ipv4Addr::LOCALHOST),
         ];
-        let event = decode(notification(L2tpCmd::TunnelDelete, tunnel))
-            .unwrap()
-            .unwrap();
+        let event = decode(
+            notification(FAMILY_ID, L2tpCmd::TunnelDelete, tunnel),
+            FAMILY_ID,
+        )
+        .unwrap()
+        .unwrap();
         let L2tpEvent::TunnelDeleted(info) = event else {
             panic!("expected a tunnel deletion");
         };
@@ -171,27 +188,42 @@ mod tests {
             L2tpAttribute::PeerSessionId(4),
             L2tpAttribute::PwType(L2tpPwType::Eth),
         ];
-        let event = decode(notification(L2tpCmd::SessionCreate, session))
-            .unwrap()
-            .unwrap();
+        let event = decode(
+            notification(FAMILY_ID, L2tpCmd::SessionCreate, session),
+            FAMILY_ID,
+        )
+        .unwrap()
+        .unwrap();
         let L2tpEvent::SessionCreated(info) = event else {
             panic!("expected a session creation");
         };
         assert_eq!(info.session_id, SessionId(3));
 
         // Other commands and non-notification payloads are skipped.
-        assert_eq!(decode(notification(L2tpCmd::Noop, vec![])).unwrap(), None);
+        assert_eq!(
+            decode(notification(FAMILY_ID, L2tpCmd::Noop, vec![]), FAMILY_ID)
+                .unwrap(),
+            None
+        );
         let done = NetlinkMessage::new(
             NetlinkHeader::default(),
             NetlinkPayload::Done(DoneMessage::default()),
         );
-        assert_eq!(decode(done).unwrap(), None);
+        assert_eq!(decode(done, FAMILY_ID).unwrap(), None);
 
         // A malformed notification is an error, not a panic.
-        let broken = notification(L2tpCmd::TunnelCreate, vec![]);
+        let broken = notification(FAMILY_ID, L2tpCmd::TunnelCreate, vec![]);
         assert!(matches!(
-            decode(broken),
+            decode(broken, FAMILY_ID),
             Err(crate::Error::UnexpectedReply(_))
         ));
+    }
+
+    #[test]
+    fn notifications_from_other_families_are_skipped() {
+        // The matching L2TP command would be malformed without attributes.
+        let foreign =
+            notification(FAMILY_ID + 1, L2tpCmd::TunnelCreate, vec![]);
+        assert_eq!(decode(foreign, FAMILY_ID).unwrap(), None);
     }
 }

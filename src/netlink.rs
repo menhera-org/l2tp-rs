@@ -45,6 +45,14 @@ pub(crate) fn encode_tunnel_create(
     config: &TunnelConfig,
     fd: Option<RawFd>,
 ) -> crate::Result<L2tpMessage> {
+    // L2TPv2 identifiers are 16-bit on the wire.
+    if config.version == L2tpVersion::V2 {
+        for id in [config.tunnel_id, config.peer_tunnel_id] {
+            if u16::try_from(id.0).is_err() {
+                return Err(crate::Error::V2IdTooLarge(id.0));
+            }
+        }
+    }
     let mut attrs = vec![
         L2tpAttribute::ConnId(config.tunnel_id.0),
         L2tpAttribute::PeerConnId(config.peer_tunnel_id.0),
@@ -669,6 +677,43 @@ mod tests {
             L2tpAttribute::ProtoVersion(2)
         )));
         assert_wire_round_trip(v2);
+    }
+
+    #[test]
+    fn v2_tunnel_create_rejects_oversized_local_and_peer_ids() {
+        for (tunnel_id, peer_tunnel_id) in [(0x1_0000, 2), (1, 0x1_0000)] {
+            let mut cfg = udp_v4_config(true).with_version(L2tpVersion::V2);
+            cfg.tunnel_id = TunnelId(tunnel_id);
+            cfg.peer_tunnel_id = TunnelId(peer_tunnel_id);
+            for fd in [None, Some(7)] {
+                assert!(matches!(
+                    encode_tunnel_create(&cfg, fd),
+                    Err(crate::Error::V2IdTooLarge(0x1_0000))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn tunnel_create_preserves_maximum_ids_for_each_version() {
+        for (version, id) in [
+            (L2tpVersion::V2, u32::from(u16::MAX)),
+            (L2tpVersion::V3, u32::MAX),
+        ] {
+            let mut cfg = udp_v4_config(true).with_version(version);
+            cfg.tunnel_id = TunnelId(id);
+            cfg.peer_tunnel_id = TunnelId(id);
+            for fd in [None, Some(7)] {
+                let message = encode_tunnel_create(&cfg, fd).unwrap();
+                assert!(
+                    message.attributes.contains(&L2tpAttribute::ConnId(id))
+                );
+                assert!(
+                    message.attributes.contains(&L2tpAttribute::PeerConnId(id))
+                );
+                assert_wire_round_trip(message);
+            }
+        }
     }
 
     #[test]

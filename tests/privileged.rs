@@ -42,6 +42,12 @@ fn is_eexist(err: &l2tp::Error) -> bool {
 
 fn udp_loopback(version: L2tpVersion) -> TunnelConfig {
     let base = next_id_base();
+    let base = if version == L2tpVersion::V2 {
+        // Keep both IDs nonzero and leave room for the peer's ID.
+        base % (u32::from(u16::MAX) - 1) + 1
+    } else {
+        base
+    };
     TunnelConfig::new(
         TunnelId(base),
         TunnelId(base.wrapping_add(1)),

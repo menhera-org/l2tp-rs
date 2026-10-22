@@ -59,8 +59,11 @@ pub struct TunnelSocket {
     family: SocketFamily,
     /// Interface name that scopes an IP socket, resolved on every reconnect.
     scope: Option<L2tpIfName>,
-    /// Peer tunnel identifier of an IP socket, repeated on reconnect.
-    peer_conn_id: u32,
+    /// Connection ID an IP socket is bound with; `None` for UDP.
+    conn_id: Option<u32>,
+    /// Peer tunnel identifier repeated on reconnect; unknown for adopted
+    /// IPv4 IP sockets unless explicitly supplied, and unused for UDP.
+    peer_conn_id: Option<u32>,
     /// Connection state the kernel does not report back. Every syscall that
     /// changes it runs under this lock together with its update, so
     /// concurrent reconnects and disconnects cannot leave the cache behind.
@@ -227,7 +230,8 @@ impl TunnelSocket {
             encap: SocketEncap::Udp,
             family,
             scope: None,
-            peer_conn_id: 0,
+            conn_id: None,
+            peer_conn_id: None,
             link: Mutex::new(Link {
                 pinned,
                 peer_v4: 0,
@@ -289,7 +293,8 @@ impl TunnelSocket {
             encap: SocketEncap::Ip,
             family,
             scope,
-            peer_conn_id: peer_tunnel_id.0,
+            conn_id: Some(tunnel_id.0),
+            peer_conn_id: Some(peer_tunnel_id.0),
             link: Mutex::new(Link {
                 pinned,
                 peer_v4: v4_bits(remote),
@@ -327,12 +332,17 @@ impl TunnelSocket {
     /// The socket must be an `AF_INET` or `AF_INET6` `SOCK_DGRAM` socket of
     /// protocol UDP or `IPPROTO_L2TP`; anything else fails with
     /// `EAFNOSUPPORT`, `ESOCKTNOSUPPORT` or `EPROTONOSUPPORT`. The bound
-    /// device, link-local scope and peer connection ID are read back from
-    /// the kernel. Build the tunnel configuration from the adopted socket
-    /// with [`TunnelConfig::for_socket`], except for an IPv4 L2TP/IP socket,
+    /// device, link-local scope and local connection ID are read back from
+    /// the kernel, as is the peer connection ID for IPv6 L2TP/IP sockets.
+    /// Build the tunnel configuration from the adopted socket with
+    /// [`TunnelConfig::for_socket`], except for an IPv4 L2TP/IP socket,
     /// whose peer the kernel does not report (see
     /// [`peer_addr_ip`](Self::peer_addr_ip)); describe that one with
-    /// [`TunnelConfig::new`].
+    /// [`TunnelConfig::new`]. Reconnecting an IPv4 L2TP/IP socket adopted
+    /// here fails with
+    /// [`Error::UnknownPeerConnId`](crate::Error::UnknownPeerConnId).
+    /// Use [`from_fd_with_peer`](Self::from_fd_with_peer) to supply its peer
+    /// connection ID and allow reconnects.
     pub fn from_fd(fd: OwnedFd) -> crate::Result<Self> {
         let raw = fd.as_raw_fd();
         let family =
@@ -353,25 +363,38 @@ impl TunnelSocket {
                 _ => return Err(errno(libc::EPROTONOSUPPORT)),
             };
         let device = bound_device(raw)?;
-        let (scoped, peer_conn_id) = match (encap, family) {
+        let (scoped, conn_id, peer_conn_id) = match (encap, family) {
             (SocketEncap::Udp, SocketFamily::V6) => {
                 let name = socket_name(raw, false)?;
                 let addr = sockaddr_in6(&name)?;
-                (addr.ip().is_unicast_link_local() && addr.scope_id() != 0, 0)
+                (
+                    addr.ip().is_unicast_link_local() && addr.scope_id() != 0,
+                    None,
+                    None,
+                )
             }
-            (SocketEncap::Udp, SocketFamily::V4) => (false, 0),
+            (SocketEncap::Udp, SocketFamily::V4) => (false, None, None),
             (SocketEncap::Ip, SocketFamily::V6) => {
                 let local = l2tp_sockaddr_in6(&socket_name(raw, false)?)?;
                 let scoped = Ipv6Addr::from(local.l2tp_addr.s6_addr)
                     .is_unicast_link_local()
                     && local.l2tp_scope_id != 0;
-                (scoped, peer_conn_id_in6(raw))
+                (
+                    scoped,
+                    Some(local.l2tp_conn_id),
+                    Some(peer_conn_id_in6(raw)),
+                )
             }
             (SocketEncap::Ip, SocketFamily::V4) => {
+                let local = l2tp_sockaddr_in(&socket_name(raw, false)?)?;
                 let peer = socket_name(raw, true)
                     .ok()
                     .and_then(|name| l2tp_sockaddr_in(&name).ok());
-                (false, peer.map_or(0, |peer| peer.l2tp_conn_id))
+                (
+                    false,
+                    Some(local.l2tp_conn_id),
+                    peer.map(|peer| peer.l2tp_conn_id),
+                )
             }
         };
         Ok(Self {
@@ -379,6 +402,7 @@ impl TunnelSocket {
             encap,
             family,
             scope: device,
+            conn_id,
             peer_conn_id,
             link: Mutex::new(Link {
                 pinned: device.is_some() || scoped,
@@ -386,6 +410,33 @@ impl TunnelSocket {
                 connected: true,
             }),
         })
+    }
+
+    /// Adopts an L2TP/IP socket with an explicit peer connection ID for
+    /// subsequent [`reconnect_ip`](Self::reconnect_ip) calls.
+    ///
+    /// This has the same requirements as [`from_fd`](Self::from_fd), but
+    /// rejects UDP sockets with
+    /// [`Error::EncapsulationMismatch`](crate::Error::EncapsulationMismatch).
+    /// The supplied ID is remembered without changing the socket's current
+    /// connection. It should match the descriptor's peer tunnel ID and may
+    /// be zero. This is needed for adopted IPv4 L2TP/IP sockets because the
+    /// kernel does not report their peer connection ID. Their peer address
+    /// remains unknown until a successful reconnect.
+    pub fn from_fd_with_peer(
+        fd: OwnedFd,
+        peer_tunnel_id: TunnelId,
+    ) -> crate::Result<Self> {
+        let mut socket = Self::from_fd(fd)?;
+        if socket.encap != SocketEncap::Ip {
+            return Err(crate::Error::EncapsulationMismatch);
+        }
+        socket.peer_conn_id = Some(peer_tunnel_id.0);
+        Ok(socket)
+    }
+
+    pub(crate) fn conn_id(&self) -> Option<u32> {
+        self.conn_id
     }
 
     /// The cached connection state; a poisoned lock still holds valid data.
@@ -622,6 +673,12 @@ impl TunnelSocket {
     /// `new_remote` has none, and the two must agree otherwise. The name is
     /// resolved to the interface index on every call, in the socket's own
     /// network namespace.
+    ///
+    /// An IPv4 L2TP/IP socket adopted with [`from_fd`](Self::from_fd) has no
+    /// known peer connection ID and returns
+    /// [`Error::UnknownPeerConnId`](crate::Error::UnknownPeerConnId). Adopt
+    /// it with [`from_fd_with_peer`](Self::from_fd_with_peer) to allow
+    /// reconnects.
     pub fn reconnect_ip(&self, new_remote: &IpEndpoint) -> crate::Result<()> {
         if self.encap != SocketEncap::Ip {
             return Err(crate::Error::EncapsulationMismatch);
@@ -629,6 +686,8 @@ impl TunnelSocket {
         if self.family.ip_version() != new_remote.ip_version() {
             return Err(crate::Error::AddressFamilyMismatch);
         }
+        let peer_conn_id =
+            self.peer_conn_id.ok_or(crate::Error::UnknownPeerConnId)?;
         let scope = unified_scope([new_remote.scope(), self.scope.as_ref()])?;
         let mut link = self.link();
         require_scope(new_remote, scope, link.pinned)?;
@@ -636,7 +695,7 @@ impl TunnelSocket {
 
         connect(
             self.fd.as_raw_fd(),
-            &l2tp_sockaddr(new_remote, self.peer_conn_id, scope_id),
+            &l2tp_sockaddr(new_remote, peer_conn_id, scope_id),
         )?;
         if new_remote.is_link_local() {
             link.pinned = true;
@@ -687,10 +746,12 @@ impl TunnelSocket {
     /// type therefore remembers the peer it connected to with
     /// [`TunnelSocket::ip`], [`reconnect_ip`](Self::reconnect_ip) or
     /// [`disconnect`](Self::disconnect). An IPv4 L2TP/IP socket adopted with
-    /// [`from_fd`](Self::from_fd) has no known peer and fails with
-    /// `ENOTCONN`. For IPv6 the kernel reports `ENOTCONN` only when the peer
-    /// connection ID is zero, which [`TunnelSocket::ip`] never produces, and
-    /// it keeps reporting the old peer after
+    /// [`from_fd`](Self::from_fd) or
+    /// [`from_fd_with_peer`](Self::from_fd_with_peer) has no known peer
+    /// address and fails with `ENOTCONN` until reconnected. For IPv6 the
+    /// kernel reports `ENOTCONN` only when the peer connection ID is zero,
+    /// which only a `peer_tunnel_id` of 0 produces, and it keeps reporting
+    /// the old peer after
     /// [`disconnect`](Self::disconnect); this method reports `ENOTCONN` for
     /// a disconnected socket of either family instead.
     pub fn peer_addr_ip(&self) -> crate::Result<IpEndpoint> {
@@ -1209,7 +1270,8 @@ mod tests {
             encap,
             family,
             scope,
-            peer_conn_id: 0,
+            conn_id: (encap == SocketEncap::Ip).then_some(0),
+            peer_conn_id: (encap == SocketEncap::Ip).then_some(0),
             link: Mutex::new(Link {
                 pinned: false,
                 peer_v4: 0,
@@ -1457,6 +1519,44 @@ mod tests {
         assert!(matches!(err, crate::Error::ScopeRequired(_)));
     }
 
+    #[tokio::test]
+    async fn create_tunnel_rejects_a_mismatched_bound_connection_id() {
+        use futures::FutureExt;
+
+        let handle = match crate::L2tpHandle::new().await {
+            Ok(handle) => handle,
+            Err(crate::Error::Io(e)) if skippable(&e) => return,
+            Err(e) => panic!("unexpected netlink socket error: {e:?}"),
+        };
+        for conn_id in [0, 42] {
+            let Some(fd) = udp_fd(libc::AF_INET) else {
+                return;
+            };
+            // Validation uses cached IP metadata, so no L2TP support or
+            // privileged kernel request is needed for this regression.
+            let mut socket =
+                raw_socket(fd, SocketEncap::Ip, SocketFamily::V4, None);
+            socket.conn_id = Some(conn_id);
+            let config = TunnelConfig::new(
+                TunnelId(43),
+                TunnelId(73),
+                Encapsulation::Ip {
+                    local: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+                    remote: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+                },
+            )
+            .unwrap();
+            let result = handle.create_tunnel(config, socket).now_or_never();
+            assert!(matches!(
+                result,
+                Some(Err(crate::Error::TunnelIdMismatch {
+                    socket: TunnelId(id),
+                    config: TunnelId(43),
+                })) if id == conn_id
+            ));
+        }
+    }
+
     /// Returns an interface with a link-local address, when the host has one.
     fn link_local_interface() -> Option<(Ipv6Addr, L2tpIfName)> {
         let table = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
@@ -1554,7 +1654,72 @@ mod tests {
         assert_eq!(adopted.encap, SocketEncap::Ip);
         assert_eq!(adopted.family, SocketFamily::V6);
         assert!(adopted.link().pinned);
-        assert_eq!(adopted.peer_conn_id, peer_tunnel_id.0);
+        assert_eq!(adopted.conn_id(), Some(tunnel_id.0));
+        assert_eq!(adopted.peer_conn_id, Some(peer_tunnel_id.0));
+    }
+
+    #[test]
+    fn adopted_ip_sockets_keep_bound_and_peer_connection_ids() {
+        for (index, endpoint) in [
+            IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+            IpEndpoint::v6(Ipv6Addr::LOCALHOST),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for peer_tunnel_id in [TunnelId(73), TunnelId(0)] {
+                let tunnel_id =
+                    TunnelId(0x4c32_5000 ^ std::process::id() ^ index as u32);
+                let socket = match TunnelSocket::ip(
+                    &endpoint,
+                    &endpoint,
+                    None,
+                    tunnel_id,
+                    peer_tunnel_id,
+                ) {
+                    Ok(socket) => socket,
+                    Err(crate::Error::Io(e)) if skippable(&e) => continue,
+                    Err(e) => panic!("unexpected IP socket error: {e:?}"),
+                };
+                assert_eq!(socket.conn_id(), Some(tunnel_id.0));
+                let adopted = TunnelSocket::from_fd(socket.into_fd()).unwrap();
+                assert_eq!(adopted.conn_id(), Some(tunnel_id.0));
+                if endpoint.ip_version() == 4 {
+                    assert_eq!(adopted.peer_conn_id, None);
+                    assert!(matches!(
+                        adopted.reconnect_ip(&endpoint),
+                        Err(crate::Error::UnknownPeerConnId)
+                    ));
+                } else {
+                    assert_eq!(adopted.peer_conn_id, Some(peer_tunnel_id.0));
+                    adopted.reconnect_ip(&endpoint).unwrap();
+                }
+
+                let adopted = TunnelSocket::from_fd_with_peer(
+                    adopted.into_fd(),
+                    peer_tunnel_id,
+                )
+                .unwrap();
+                assert_eq!(adopted.conn_id(), Some(tunnel_id.0));
+                assert_eq!(adopted.peer_conn_id, Some(peer_tunnel_id.0));
+                adopted.disconnect().unwrap();
+                adopted.reconnect_ip(&endpoint).unwrap();
+                if endpoint.ip_version() == 6 && peer_tunnel_id.0 == 0 {
+                    assert_eq!(
+                        adopted.peer_addr_ip().unwrap_err().raw_os_error(),
+                        Some(libc::ENOTCONN)
+                    );
+                } else {
+                    assert_eq!(adopted.peer_addr_ip().unwrap(), endpoint);
+                }
+                let read_back =
+                    TunnelSocket::from_fd(adopted.into_fd()).unwrap();
+                assert_eq!(read_back.conn_id(), Some(tunnel_id.0));
+                if endpoint.ip_version() == 6 {
+                    assert_eq!(read_back.peer_conn_id, Some(peer_tunnel_id.0));
+                }
+            }
+        }
     }
 
     #[test]
@@ -1667,6 +1832,8 @@ mod tests {
         let adopted = TunnelSocket::from_fd(sock.into_fd()).unwrap();
         assert_eq!(adopted.encap, SocketEncap::Udp);
         assert_eq!(adopted.family, SocketFamily::V4);
+        assert_eq!(adopted.conn_id(), None);
+        assert_eq!(adopted.peer_conn_id, None);
         assert!(!adopted.link().pinned);
 
         let config =
@@ -1689,6 +1856,18 @@ mod tests {
         // Descriptors that are not datagram sockets are refused.
         let file: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
         assert!(TunnelSocket::from_fd(file).is_err());
+    }
+
+    #[test]
+    fn explicit_peer_connection_id_rejects_udp_sockets() {
+        let Some((socket, _receiver)) = connected_v4_pair() else {
+            return;
+        };
+        assert_eq!(socket.conn_id(), None);
+        assert!(matches!(
+            TunnelSocket::from_fd_with_peer(socket.into_fd(), TunnelId(73)),
+            Err(crate::Error::EncapsulationMismatch)
+        ));
     }
 
     #[test]
@@ -1937,6 +2116,36 @@ mod tests {
             .reconnect_ip(&IpEndpoint::v6(Ipv6Addr::LOCALHOST))
             .unwrap_err();
         assert!(matches!(err, crate::Error::AddressFamilyMismatch));
+    }
+
+    #[test]
+    fn reconnect_ip_requires_a_known_peer_connection_id() {
+        let Some(fd) = udp_fd(libc::AF_INET) else {
+            return;
+        };
+        let mut socket =
+            raw_socket(fd, SocketEncap::Ip, SocketFamily::V4, None);
+        socket.peer_conn_id = None;
+        {
+            let mut link = socket.link();
+            link.connected = false;
+            link.peer_v4 = u32::from(Ipv4Addr::LOCALHOST);
+        }
+
+        assert!(matches!(
+            socket.reconnect_ip(&IpEndpoint::V4(Ipv4Addr::new(127, 0, 0, 2))),
+            Err(crate::Error::UnknownPeerConnId)
+        ));
+        let link = socket.link();
+        assert!(!link.connected);
+        assert_eq!(link.peer_v4, u32::from(Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            socket_name(socket.as_raw_fd(), true)
+                .err()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOTCONN)
+        );
     }
 
     #[test]

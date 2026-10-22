@@ -881,6 +881,10 @@ pub enum PseudowireType {
 }
 
 /// L2-specific sublayer header type.
+///
+/// This crate and its CLI default to [`Self::None`]. The kernel and iproute2
+/// default to [`Self::Default`] instead; select the same type on both peers
+/// so their session wire formats match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[non_exhaustive]

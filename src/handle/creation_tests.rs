@@ -445,3 +445,60 @@ async fn completed_but_unclaimed_creation_results_are_deleted() {
         }
     }
 }
+
+#[test]
+fn deletion_wait_handles_present_tunnels_without_runtime_drivers() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for code in [libc::ENODEV, libc::EIO] {
+            let mut harness = Harness::new();
+            let handle = harness.handle.clone();
+            let mut wait = Box::pin(handle.wait_tunnel_removed(TunnelId(101)));
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+            let get = harness.next_request(L2tpCmd::TunnelGet).await;
+            let mut message = L2tpMessage::new(L2tpCmd::TunnelGet);
+            message.attributes = vec![
+                L2tpAttribute::ConnId(101),
+                L2tpAttribute::PeerConnId(102),
+                L2tpAttribute::ProtoVersion(3),
+                L2tpAttribute::EncapType(
+                    netlink_packet_l2tp::L2tpEncapType::Ip,
+                ),
+                L2tpAttribute::IpSaddr(std::net::Ipv4Addr::LOCALHOST),
+                L2tpAttribute::IpDaddr(std::net::Ipv4Addr::LOCALHOST),
+            ];
+            let mut genl = GenlMessage::from_payload(message);
+            genl.set_resolved_family_id(1234);
+            harness.reply(&get, Message::from(genl));
+
+            // The first lookup still finds the tunnel. Drive the transport
+            // until the pacing thread wakes the wait for another lookup,
+            // without enabling Tokio's timer or I/O drivers.
+            let get = futures::future::poll_fn(|cx| {
+                assert!(wait.as_mut().poll(cx).is_pending());
+                assert!(harness.connection.as_mut().poll(cx).is_pending());
+                match harness.wire.lock().unwrap().requests.pop_front() {
+                    Some(request) => Poll::Ready(request),
+                    None => Poll::Pending,
+                }
+            })
+            .await;
+            assert_eq!(payload(&get).cmd, L2tpCmd::TunnelGet);
+            harness.ack(&get, code);
+            let result = futures::future::poll_fn(|cx| {
+                let result = wait.as_mut().poll(cx);
+                assert!(harness.connection.as_mut().poll(cx).is_pending());
+                result
+            })
+            .await;
+            if code == libc::ENODEV {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
+            }
+            assert!(harness.wire.lock().unwrap().requests.is_empty());
+        }
+    });
+}
