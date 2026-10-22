@@ -245,11 +245,49 @@ impl<'de> serde::Deserialize<'de> for Cookie {
         use serde::de::Error as _;
         if deserializer.is_human_readable() {
             let hex = <Cow<'de, str>>::deserialize(deserializer)?;
-            hex.parse().map_err(D::Error::custom)
-        } else {
-            let bytes = <Cow<'de, [u8]>>::deserialize(deserializer)?;
-            Self::try_from(bytes.as_ref()).map_err(D::Error::custom)
+            return hex.parse().map_err(D::Error::custom);
         }
+
+        // Serialization writes a byte string, which formats such as CBOR
+        // distinguish from a sequence; accept both.
+        struct BytesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BytesVisitor {
+            type Value = Cookie;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a cookie of 0, 4 or 8 bytes")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(
+                self,
+                v: &[u8],
+            ) -> Result<Cookie, E> {
+                Cookie::try_from(v).map_err(E::custom)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Cookie, A::Error> {
+                let mut bytes = [0u8; 8];
+                let mut len = 0;
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    if len == bytes.len() {
+                        return Err(serde::de::Error::invalid_length(
+                            len + 1,
+                            &self,
+                        ));
+                    }
+                    bytes[len] = byte;
+                    len += 1;
+                }
+                Cookie::try_from(&bytes[..len])
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_bytes(BytesVisitor)
     }
 }
 
@@ -987,12 +1025,25 @@ mod tests {
     fn binary_serde_round_trips() {
         fn round_trip<T>(value: &T) -> T
         where
-            T: serde::Serialize + serde::de::DeserializeOwned,
+            T: serde::Serialize
+                + serde::de::DeserializeOwned
+                + PartialEq
+                + std::fmt::Debug,
         {
             let bytes = postcard::to_allocvec(value).unwrap();
-            postcard::from_bytes(&bytes).unwrap()
+            let decoded: T = postcard::from_bytes(&bytes).unwrap();
+            // CBOR tells byte strings from sequences, which postcard
+            // encodes alike.
+            let mut cbor = Vec::new();
+            ciborium::into_writer(value, &mut cbor).unwrap();
+            let from_cbor: T = ciborium::from_reader(cbor.as_slice()).unwrap();
+            assert_eq!(from_cbor, decoded);
+            decoded
         }
 
+        for cookie in [Cookie::none(), Cookie::from([1, 2, 3, 4])] {
+            assert_eq!(round_trip(&cookie), cookie);
+        }
         let raw = L2tpIfName::new(b"eth\xff0").unwrap();
         for endpoint in [
             IpEndpoint::V4(Ipv4Addr::LOCALHOST),

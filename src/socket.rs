@@ -5,7 +5,7 @@ use std::{
     mem::{size_of, zeroed},
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::{Mutex, MutexGuard, PoisonError},
 };
 
 use crate::{
@@ -59,18 +59,27 @@ pub struct TunnelSocket {
     family: SocketFamily,
     /// Interface name that scopes an IP socket, resolved on every reconnect.
     scope: Option<L2tpIfName>,
+    /// Peer tunnel identifier of an IP socket, repeated on reconnect.
+    peer_conn_id: u32,
+    /// Connection state the kernel does not report back. Every syscall that
+    /// changes it runs under this lock together with its update, so
+    /// concurrent reconnects and disconnects cannot leave the cache behind.
+    link: Mutex<Link>,
+}
+
+/// Cached connection state of a [`TunnelSocket`].
+#[derive(Debug, Clone, Copy)]
+struct Link {
     /// Whether the kernel has pinned the socket to an interface, through a
     /// link-local scope or `SO_BINDTODEVICE`. A link-local peer without a
     /// scope of its own needs that.
-    pinned: AtomicBool,
-    /// Peer tunnel identifier of an IP socket, repeated on reconnect.
-    peer_conn_id: u32,
+    pinned: bool,
     /// Peer of an IPv4 L2TP/IP socket as connected by this type, since the
     /// kernel never reports it; `0` when unknown.
-    peer_v4: AtomicU32,
+    peer_v4: u32,
     /// Whether the socket has a peer. Cleared by `disconnect`, because the
     /// kernel keeps reporting the old peer of an IPv6 L2TP/IP socket.
-    connected: AtomicBool,
+    connected: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,10 +227,12 @@ impl TunnelSocket {
             encap: SocketEncap::Udp,
             family,
             scope: None,
-            pinned: AtomicBool::new(pinned),
             peer_conn_id: 0,
-            peer_v4: AtomicU32::new(0),
-            connected: AtomicBool::new(true),
+            link: Mutex::new(Link {
+                pinned,
+                peer_v4: 0,
+                connected: true,
+            }),
         })
     }
 
@@ -278,10 +289,12 @@ impl TunnelSocket {
             encap: SocketEncap::Ip,
             family,
             scope,
-            pinned: AtomicBool::new(pinned),
             peer_conn_id: peer_tunnel_id.0,
-            peer_v4: AtomicU32::new(v4_bits(remote)),
-            connected: AtomicBool::new(true),
+            link: Mutex::new(Link {
+                pinned,
+                peer_v4: v4_bits(remote),
+                connected: true,
+            }),
         })
     }
 
@@ -366,11 +379,18 @@ impl TunnelSocket {
             encap,
             family,
             scope: device,
-            pinned: AtomicBool::new(device.is_some() || scoped),
             peer_conn_id,
-            peer_v4: AtomicU32::new(0),
-            connected: AtomicBool::new(true),
+            link: Mutex::new(Link {
+                pinned: device.is_some() || scoped,
+                peer_v4: 0,
+                connected: true,
+            }),
         })
+    }
+
+    /// The cached connection state; a poisoned lock still holds valid data.
+    fn link(&self) -> MutexGuard<'_, Link> {
+        self.link.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn configure(
@@ -477,8 +497,9 @@ impl TunnelSocket {
     ///
     /// Afterwards a link-local remote may omit its scope on reconnect.
     pub fn bind_to_device(&self, device: &L2tpIfName) -> crate::Result<()> {
+        let mut link = self.link();
         set_bind_to_device(self.fd.as_raw_fd(), device)?;
-        self.pinned.store(true, Ordering::Relaxed);
+        link.pinned = true;
         Ok(())
     }
 
@@ -495,6 +516,7 @@ impl TunnelSocket {
     /// bound address and port, but a port the kernel chose is replaced on
     /// [`reconnect_udp`](Self::reconnect_udp).
     pub fn disconnect(&self) -> crate::Result<()> {
+        let mut link = self.link();
         // SAFETY: an all-zero sockaddr is a valid value; only its family is
         // read for `AF_UNSPEC`, and the length passed is the struct's size.
         let mut addr: libc::sockaddr = unsafe { std::mem::zeroed() };
@@ -510,9 +532,11 @@ impl TunnelSocket {
         if rc == -1 {
             return Err(io::Error::last_os_error().into());
         }
-        self.pinned.store(false, Ordering::Relaxed);
-        self.peer_v4.store(0, Ordering::Relaxed);
-        self.connected.store(false, Ordering::Relaxed);
+        *link = Link {
+            pinned: false,
+            peer_v4: 0,
+            connected: false,
+        };
         Ok(())
     }
 
@@ -580,13 +604,14 @@ impl TunnelSocket {
         if self.family.ip_version() != new_remote.ip_version() {
             return Err(crate::Error::AddressFamilyMismatch);
         }
-        require_udp_scope(new_remote, self.pinned.load(Ordering::Relaxed))?;
+        let mut link = self.link();
+        require_udp_scope(new_remote, link.pinned)?;
 
         connect(self.fd.as_raw_fd(), &udp_sockaddr(new_remote))?;
         if new_remote.is_link_local() {
-            self.pinned.store(true, Ordering::Relaxed);
+            link.pinned = true;
         }
-        self.connected.store(true, Ordering::Relaxed);
+        link.connected = true;
         Ok(())
     }
 
@@ -605,7 +630,8 @@ impl TunnelSocket {
             return Err(crate::Error::AddressFamilyMismatch);
         }
         let scope = unified_scope([new_remote.scope(), self.scope.as_ref()])?;
-        require_scope(new_remote, scope, self.pinned.load(Ordering::Relaxed))?;
+        let mut link = self.link();
+        require_scope(new_remote, scope, link.pinned)?;
         let scope_id = resolve_scope(self.fd.as_raw_fd(), scope)?;
 
         connect(
@@ -613,10 +639,10 @@ impl TunnelSocket {
             &l2tp_sockaddr(new_remote, self.peer_conn_id, scope_id),
         )?;
         if new_remote.is_link_local() {
-            self.pinned.store(true, Ordering::Relaxed);
+            link.pinned = true;
         }
-        self.peer_v4.store(v4_bits(new_remote), Ordering::Relaxed);
-        self.connected.store(true, Ordering::Relaxed);
+        link.peer_v4 = v4_bits(new_remote);
+        link.connected = true;
         Ok(())
     }
 
@@ -634,7 +660,10 @@ impl TunnelSocket {
         if self.encap != SocketEncap::Udp {
             return Err(crate::Error::EncapsulationMismatch);
         }
-        if !self.connected.load(Ordering::Relaxed) {
+        // Held across the lookup, so a concurrent disconnect cannot slip in
+        // between the check and the kernel's answer.
+        let link = self.link();
+        if !link.connected {
             return Err(errno(libc::ENOTCONN));
         }
         let name = socket_name(self.fd.as_raw_fd(), true)?;
@@ -668,14 +697,12 @@ impl TunnelSocket {
         if self.encap != SocketEncap::Ip {
             return Err(crate::Error::EncapsulationMismatch);
         }
-        if !self.connected.load(Ordering::Relaxed) {
+        let link = self.link();
+        if !link.connected {
             return Err(errno(libc::ENOTCONN));
         }
-        if self.family == SocketFamily::V4 {
-            let peer = self.peer_v4.load(Ordering::Relaxed);
-            if peer != 0 {
-                return Ok(IpEndpoint::V4(Ipv4Addr::from(peer)));
-            }
+        if self.family == SocketFamily::V4 && link.peer_v4 != 0 {
+            return Ok(IpEndpoint::V4(Ipv4Addr::from(link.peer_v4)));
         }
         let name = socket_name(self.fd.as_raw_fd(), true)?;
         self.ip_endpoint(&name)
@@ -1182,10 +1209,12 @@ mod tests {
             encap,
             family,
             scope,
-            pinned: AtomicBool::new(false),
             peer_conn_id: 0,
-            peer_v4: AtomicU32::new(0),
-            connected: AtomicBool::new(true),
+            link: Mutex::new(Link {
+                pinned: false,
+                peer_v4: 0,
+                connected: true,
+            }),
         }
     }
 
@@ -1487,7 +1516,7 @@ mod tests {
             Err(e) => panic!("unexpected link-local socket error: {e:?}"),
         };
         assert_eq!(sock.scope, Some(ifname));
-        assert!(sock.pinned.load(Ordering::Relaxed));
+        assert!(sock.link().pinned);
 
         // SAFETY: zero-initialization is valid for this plain C struct.
         let mut bound: SockaddrL2tpIp6 = unsafe { zeroed() };
@@ -1524,7 +1553,7 @@ mod tests {
         let adopted = TunnelSocket::from_fd(sock.into_fd()).unwrap();
         assert_eq!(adopted.encap, SocketEncap::Ip);
         assert_eq!(adopted.family, SocketFamily::V6);
-        assert!(adopted.pinned.load(Ordering::Relaxed));
+        assert!(adopted.link().pinned);
         assert_eq!(adopted.peer_conn_id, peer_tunnel_id.0);
     }
 
@@ -1599,7 +1628,7 @@ mod tests {
             Err(crate::Error::Io(e)) if skippable(&e) => return,
             Err(e) => panic!("unexpected link-local socket error: {e:?}"),
         };
-        assert!(sock.pinned.load(Ordering::Relaxed));
+        assert!(sock.link().pinned);
 
         let UdpEndpoint::V6(bound) = sock.local_addr_udp().unwrap() else {
             panic!("expected an IPv6 local address");
@@ -1618,7 +1647,7 @@ mod tests {
 
         let adopted = TunnelSocket::from_fd(sock.into_fd()).unwrap();
         assert_eq!(adopted.encap, SocketEncap::Udp);
-        assert!(adopted.pinned.load(Ordering::Relaxed));
+        assert!(adopted.link().pinned);
     }
 
     #[test]
@@ -1638,7 +1667,7 @@ mod tests {
         let adopted = TunnelSocket::from_fd(sock.into_fd()).unwrap();
         assert_eq!(adopted.encap, SocketEncap::Udp);
         assert_eq!(adopted.family, SocketFamily::V4);
-        assert!(!adopted.pinned.load(Ordering::Relaxed));
+        assert!(!adopted.link().pinned);
 
         let config =
             TunnelConfig::for_socket(TunnelId(1), TunnelId(2), &adopted)
@@ -1672,10 +1701,10 @@ mod tests {
             sock.peer_addr_udp().unwrap(),
             UdpEndpoint::V4(receiver_addr)
         );
-        sock.pinned.store(true, Ordering::Relaxed);
+        sock.link().pinned = true;
 
         sock.disconnect().unwrap();
-        assert!(!sock.pinned.load(Ordering::Relaxed));
+        assert!(!sock.link().pinned);
         let err = sock.peer_addr_udp().unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN), "{err:?}");
         // Disconnecting twice is harmless.
@@ -1686,7 +1715,7 @@ mod tests {
             sock.peer_addr_udp().unwrap(),
             UdpEndpoint::V4(receiver_addr)
         );
-        assert!(!sock.pinned.load(Ordering::Relaxed));
+        assert!(!sock.link().pinned);
     }
 
     #[test]

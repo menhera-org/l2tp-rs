@@ -411,8 +411,8 @@ impl L2tpHandle {
     /// `ENODEV`. Once the deletion is acknowledged it is not undone: a
     /// lookup that fails otherwise is returned as is, and a tunnel still
     /// listed after the wait is reported as [`Error::Io`](crate::Error::Io)
-    /// of kind [`TimedOut`](io::ErrorKind::TimedOut). The wait needs no
-    /// Tokio timer.
+    /// of kind [`TimedOut`](io::ErrorKind::TimedOut). The wait needs neither
+    /// a Tokio timer nor a free blocking thread.
     pub async fn delete_tunnel(
         &self,
         tunnel_id: TunnelId,
@@ -429,11 +429,20 @@ impl L2tpHandle {
         const POLLS: u32 = 200;
         const INTERVAL: std::time::Duration =
             std::time::Duration::from_millis(10);
-        // The pause runs on the blocking pool, which every runtime has, so
-        // the caller's runtime does not need its timer driver.
-        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
-            io::Error::other("tokio runtime is required for deletion")
-        })?;
+        // A thread of its own paces the polls and exits once the receiver is
+        // gone, so the wait depends neither on the runtime's timer driver
+        // nor on a spare thread in its blocking pool.
+        let (tick_tx, mut tick_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::Builder::new()
+            .name("l2tp-delete-wait".to_string())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(INTERVAL);
+                    if tick_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            })?;
         for _ in 0..POLLS {
             match self.get_tunnel(tunnel_id).await {
                 Ok(_) => {}
@@ -442,10 +451,9 @@ impl L2tpHandle {
                 }
                 Err(err) => return Err(err),
             }
-            runtime
-                .spawn_blocking(move || std::thread::sleep(INTERVAL))
-                .await
-                .map_err(|err| io::Error::other(err.to_string()))?;
+            if tick_rx.recv().await.is_none() {
+                return Err(crate::Error::other("the deletion wait stopped"));
+            }
         }
         Err(io::Error::new(
             io::ErrorKind::TimedOut,

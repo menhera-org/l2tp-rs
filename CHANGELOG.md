@@ -82,8 +82,17 @@ these.
   wrong on MIPS, PowerPC and SPARC.
 - CLI: `tunnel create --proto-version 2` chooses random identifiers within
   the 16 bits of L2TPv2, so a `PPPoL2TP` socket can attach to the tunnel.
-- `delete_tunnel` needs no Tokio timer, so the blocking API's worker and
-  runtimes built without a time driver cannot panic in it. A lookup that
+- `TunnelSocket` keeps its cached connection state (pinned interface, IPv4
+  peer, connected) under one lock together with the syscall that changes it,
+  so a concurrent `disconnect` and `reconnect_*` cannot leave the cache
+  contradicting the kernel.
+- `Cookie` deserializes from a byte string in binary formats, as it is
+  serialized; formats that distinguish bytes from sequences, such as CBOR,
+  previously rejected it and every session configuration with it.
+- `delete_tunnel` needs no Tokio timer and no free blocking thread, so the
+  blocking API's worker, runtimes built without a time driver and a
+  `block_on` from a saturated blocking pool cannot panic or deadlock in it.
+  A lookup that
   fails for a reason other than `ENODEV` is returned, and a tunnel still
   listed after the wait is reported as `Error::Io` of kind `TimedOut`.
 - `TunnelSocket` resolves interface scopes with `SIOCGIFINDEX` on the socket
