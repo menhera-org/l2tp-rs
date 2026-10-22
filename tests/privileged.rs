@@ -12,8 +12,8 @@ use futures::StreamExt;
 use l2tp::{
     Cookie, Encapsulation, IpEndpoint, L2SpecType, L2tpEvent, L2tpHandle,
     L2tpIfName, L2tpVersion, PppSocket, PppUnit, PseudowireType, SessionConfig,
-    SessionId, SessionModify, TunnelConfig, TunnelId, TunnelSocket,
-    UdpEndpoint, blocking,
+    SessionHandle, SessionId, SessionModify, TunnelConfig, TunnelHandle,
+    TunnelId, TunnelSocket, UdpEndpoint, blocking,
 };
 
 static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -283,50 +283,115 @@ fn privileged_events_report_tunnel_lifecycle() {
     });
 }
 
+/// A PPP session on a fresh unmanaged tunnel, with the `PPPoL2TP` socket
+/// attached to it. The session handle has auto-delete disabled, because the
+/// kernel deletes the session together with the socket.
+async fn attached_ppp_session(
+    handle: &L2tpHandle,
+) -> (
+    TunnelConfig,
+    TunnelHandle,
+    SessionId,
+    SessionHandle,
+    PppSocket,
+) {
+    let (config, tunnel) =
+        create_unmanaged(handle, || udp_loopback(L2tpVersion::V3)).await;
+    let session_id = SessionId(config.tunnel_id().0.wrapping_add(2));
+    let peer_session_id = SessionId(config.tunnel_id().0.wrapping_add(3));
+    let mut session = handle
+        .create_session(SessionConfig::ppp(
+            config.tunnel_id(),
+            session_id,
+            peer_session_id,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("create_session failed: {e}"));
+    session.set_auto_delete(false);
+
+    let socket = PppSocket::connect(
+        L2tpVersion::V3,
+        config.tunnel_id(),
+        config.peer_tunnel_id(),
+        session_id,
+        peer_session_id,
+    )
+    .unwrap_or_else(|e| panic!("PppSocket::connect failed: {e}"));
+    (config, tunnel, session_id, session, socket)
+}
+
 #[test]
-#[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp_ppp and ppp_generic \
-            support"]
+#[ignore = "requires CAP_NET_ADMIN/root and the kernel l2tp_ppp module"]
 fn privileged_ppp_session_attaches_a_pppol2tp_socket() {
     runtime().block_on(async {
         let handle = L2tpHandle::new()
             .await
             .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
-        let (config, tunnel) =
-            create_unmanaged(&handle, || udp_loopback(L2tpVersion::V3)).await;
-        let session_id = SessionId(config.tunnel_id().0.wrapping_add(2));
-        let peer_session_id = SessionId(config.tunnel_id().0.wrapping_add(3));
-        let session = handle
-            .create_session(SessionConfig::ppp(
-                config.tunnel_id(),
-                session_id,
-                peer_session_id,
-            ))
-            .await
-            .unwrap_or_else(|e| panic!("create_session failed: {e}"));
-
-        let socket = PppSocket::connect(
-            L2tpVersion::V3,
-            config.tunnel_id(),
-            config.peer_tunnel_id(),
-            session_id,
-            peer_session_id,
-        )
-        .unwrap_or_else(|e| panic!("PppSocket::connect failed: {e}"));
+        let (config, tunnel, session_id, session, socket) =
+            attached_ppp_session(&handle).await;
         let channel = socket
             .channel_index()
             .unwrap_or_else(|e| panic!("channel_index failed: {e}"));
         assert!(channel >= 0);
+        // A second socket cannot attach to the same session.
+        let err = PppSocket::connect(
+            L2tpVersion::V3,
+            config.tunnel_id(),
+            config.peer_tunnel_id(),
+            session_id,
+            SessionId(session_id.0.wrapping_add(1)),
+        )
+        .err()
+        .map(|e| e.raw_os_error());
+        assert_eq!(err, Some(Some(libc::EEXIST)));
 
-        let unit = PppUnit::new().unwrap_or_else(|e| panic!("PppUnit: {e}"));
+        // Releasing the PPPoL2TP socket deletes the session in the kernel.
+        drop(socket);
+        let err = handle
+            .get_session(config.tunnel_id(), session_id)
+            .await
+            .expect_err("the session is gone with its socket");
+        assert_eq!(err.raw_os_error(), Some(libc::ENODEV), "{err}");
+        drop(session);
+        tunnel.delete().await.unwrap_or_else(|e| panic!("{e}"));
+    });
+}
+
+#[test]
+#[ignore = "requires CAP_NET_ADMIN/root, the kernel l2tp_ppp module and \
+            /dev/ppp"]
+fn privileged_ppp_unit_connects_and_disconnects_a_channel() {
+    runtime().block_on(async {
+        let handle = L2tpHandle::new()
+            .await
+            .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
+        let (_config, tunnel, _session_id, _session, socket) =
+            attached_ppp_session(&handle).await;
+
+        let unit = match PppUnit::new() {
+            Ok(unit) => unit,
+            // Without the device node (for example in a user namespace that
+            // cannot create one) there is nothing to test.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                eprintln!("skipping: /dev/ppp is absent: {e}");
+                drop(socket);
+                tunnel.delete().await.unwrap_or_else(|e| panic!("{e}"));
+                return;
+            }
+            Err(e) => panic!("PppUnit::new failed: {e}"),
+        };
         assert!(unit.ifname().as_bytes().starts_with(b"ppp"));
         let link = unit
             .connect_channel(&socket)
             .unwrap_or_else(|e| panic!("connect_channel failed: {e}"));
+        // Dropping the channel disconnects it, so it can be connected again.
+        drop(link);
+        let link = unit
+            .connect_channel(&socket)
+            .unwrap_or_else(|e| panic!("second connect_channel failed: {e}"));
         drop(link);
         drop(unit);
         drop(socket);
-
-        session.delete().await.unwrap_or_else(|e| panic!("{e}"));
         tunnel.delete().await.unwrap_or_else(|e| panic!("{e}"));
     });
 }

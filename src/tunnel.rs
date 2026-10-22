@@ -190,7 +190,8 @@ impl TunnelHandle {
         self.handle.tunnel_stats(self.tunnel_id).await
     }
 
-    /// Deletes the tunnel and waits for the kernel to acknowledge it.
+    /// Deletes the tunnel and waits until the kernel has removed it; see
+    /// [`L2tpHandle::delete_tunnel`](crate::L2tpHandle::delete_tunnel).
     /// Once polled inside a Tokio runtime, deletion continues even if the
     /// caller cancels this future.
     pub async fn delete(mut self) -> crate::Result<()> {

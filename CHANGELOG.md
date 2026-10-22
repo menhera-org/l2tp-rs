@@ -21,6 +21,9 @@ these.
   `TryFrom<Vec<u8>>`, `From<[u8; 4]>` and `From<[u8; 8]>`.
 - `PppUnit::new`, `PppUnit::with_index`, `PppUnit::connect_channel` and
   `PppSocket::channel_index` return `l2tp::Result`.
+- `SessionInfo::l2spec_type` is an `Option<L2SpecType>`. The kernel never
+  reports the sublayer type, so it is `None` instead of an invented
+  `L2SpecType::None`.
 
 ### Added
 
@@ -66,6 +69,31 @@ these.
 - No public function panics on its input. `run_creation` no longer unwraps
   the task result, the CLI output never unwraps JSON encoding, and the
   blocking handles never unwrap their inner state.
+- Blocking API: dropping a `TunnelHandle` or `SessionHandle` with auto-delete
+  enabled runs the deletion inside the worker's tracked task, so the worker
+  no longer shuts down before it is sent. The worker reaps finished requests
+  as they complete instead of holding every completed task until shutdown.
+  `EventIter::next` blocks on a std channel and so works from any context,
+  including an async task; it no longer panics inside a Tokio context.
+- Dropping a `PppChannel` disconnects the channel from its unit with
+  `PPPIOCDISCONN`; before, the channel stayed connected while its
+  `PppSocket` lived and could not be connected again.
+- The PPP ioctl requests are encoded per architecture; the fixed values were
+  wrong on MIPS, PowerPC and SPARC.
+- CLI: `tunnel create --proto-version 2` chooses random identifiers within
+  the 16 bits of L2TPv2, so a `PPPoL2TP` socket can attach to the tunnel.
+- `L2tpHandle::events` never delivered a notification: the listening socket
+  was unbound, and the kernel skips sockets without a port for the
+  notifications it sends without a sender port. The socket is now bound.
+- `delete_tunnel` and `TunnelHandle::delete` wait until the kernel's
+  deferred teardown has removed the tunnel, so a lookup right after no
+  longer finds it and the identifier can be reused without `EEXIST`.
+- `TunnelSocket::peer_addr_ip` and `TunnelConfig::for_socket` work for IPv4
+  L2TP/IP sockets, whose peer the kernel never reports through
+  `getpeername`; the socket reports the peer it connected to.
+- Documentation: closing a `PPPoL2TP` socket deletes its session, and the
+  kernel sends no event for the teardown it performs itself (closed managed
+  sockets, sessions of a deleted tunnel, released `PPPoL2TP` sockets).
 
 ## 0.3.0 (unreleased)
 

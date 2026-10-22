@@ -396,7 +396,7 @@ pub(crate) fn decode_session_info(
             "L2TP_ATTR_PEER_SESSION_ID",
         )?,
         pseudowire_type: required(pseudowire_type, "L2TP_ATTR_PW_TYPE")?,
-        l2spec_type: l2spec_type.unwrap_or_default(),
+        l2spec_type,
         cookie,
         peer_cookie,
         recv_seq,
@@ -1062,7 +1062,7 @@ mod tests {
         assert_eq!(info.session_id, SessionId(8));
         assert_eq!(info.peer_session_id, SessionId(9));
         assert_eq!(info.pseudowire_type, PseudowireType::Ppp);
-        assert_eq!(info.l2spec_type, L2SpecType::None);
+        assert_eq!(info.l2spec_type, Some(L2SpecType::None));
         assert_eq!(info.cookie, Cookie::from([1, 2, 3, 4]));
         assert_eq!(info.peer_cookie, Cookie::from([5, 6, 7, 8, 9, 10, 11, 12]));
         assert!(info.recv_seq);
@@ -1084,7 +1084,8 @@ mod tests {
         ];
 
         let info = decode_session_info(&attrs).unwrap();
-        assert_eq!(info.l2spec_type, L2SpecType::None);
+        // The kernel never reports the sublayer type; it stays unknown.
+        assert_eq!(info.l2spec_type, None);
         assert!(info.cookie.is_empty());
         assert!(info.peer_cookie.is_empty());
         assert_eq!(info.ifname, None);
@@ -1106,7 +1107,7 @@ mod tests {
         ];
         let info = decode_session_info(&attrs).unwrap();
         assert_eq!(info.pseudowire_type, PseudowireType::Other(777));
-        assert_eq!(info.l2spec_type, L2SpecType::Other(9));
+        assert_eq!(info.l2spec_type, Some(L2SpecType::Other(9)));
     }
 
     #[test]

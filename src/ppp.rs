@@ -24,13 +24,61 @@ use crate::{L2tpIfName, L2tpVersion, SessionId, TunnelId};
 
 const PX_PROTO_OL2TP: libc::c_int = 1;
 
-// `_IOR('t', 55, int)`, `_IOWR('t', 62, int)`, `_IOW('t', 58, int)` and
-// `_IOW('t', 56, int)` from `linux/ppp-ioctl.h`. The request type differs
-// between C libraries, so the constants are cast.
-const PPPIOCGCHAN: libc::Ioctl = 0x8004_7437_u32 as libc::Ioctl;
-const PPPIOCNEWUNIT: libc::Ioctl = 0xc004_743e_u32 as libc::Ioctl;
-const PPPIOCCONNECT: libc::Ioctl = 0x4004_743a_u32 as libc::Ioctl;
-const PPPIOCATTCHAN: libc::Ioctl = 0x4004_7438_u32 as libc::Ioctl;
+// The `_IOC` request encoding of `asm-generic/ioctl.h`. MIPS, PowerPC and
+// SPARC use different direction bits and a narrower size field
+// (`asm/ioctl.h` of each), so the requests are computed per architecture.
+#[cfg(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "sparc",
+    target_arch = "sparc64",
+))]
+mod ioc {
+    pub(super) const NONE: u32 = 1;
+    pub(super) const READ: u32 = 2;
+    pub(super) const WRITE: u32 = 4;
+    pub(super) const SIZE_BITS: u32 = 13;
+}
+#[cfg(not(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "sparc",
+    target_arch = "sparc64",
+)))]
+mod ioc {
+    pub(super) const NONE: u32 = 0;
+    pub(super) const WRITE: u32 = 1;
+    pub(super) const READ: u32 = 2;
+    pub(super) const SIZE_BITS: u32 = 14;
+}
+
+/// `_IOC(dir, 't', nr, size)`. The request type differs between C
+/// libraries, so the value is cast.
+const fn ppp_ioctl(dir: u32, nr: u8, size: usize) -> libc::Ioctl {
+    const TYPE_SHIFT: u32 = 8;
+    const SIZE_SHIFT: u32 = 16;
+    const DIR_SHIFT: u32 = SIZE_SHIFT + ioc::SIZE_BITS;
+    ((dir << DIR_SHIFT)
+        | ((size as u32) << SIZE_SHIFT)
+        | ((b't' as u32) << TYPE_SHIFT)
+        | nr as u32) as libc::Ioctl
+}
+
+// From `linux/ppp-ioctl.h`.
+const INT: usize = size_of::<libc::c_int>();
+const PPPIOCGCHAN: libc::Ioctl = ppp_ioctl(ioc::READ, 55, INT);
+const PPPIOCATTCHAN: libc::Ioctl = ppp_ioctl(ioc::WRITE, 56, INT);
+const PPPIOCDISCONN: libc::Ioctl = ppp_ioctl(ioc::NONE, 57, 0);
+const PPPIOCCONNECT: libc::Ioctl = ppp_ioctl(ioc::WRITE, 58, INT);
+const PPPIOCNEWUNIT: libc::Ioctl = ppp_ioctl(ioc::READ | ioc::WRITE, 62, INT);
 
 // `sizeof(struct sockaddr_pppol2tp)` and `sizeof(struct sockaddr_pppol2tpv3)`
 // from `linux/if_pppox.h`. The structs are packed, and the kernel selects the
@@ -40,9 +88,12 @@ const SOCKADDR_PPPOL2TPV3_LEN: usize = 46;
 
 /// A connected `PPPoL2TP` socket: the data plane of a PPP pseudowire.
 ///
-/// Dropping the socket detaches the PPP channel from the session; the
-/// session itself stays until it is deleted through netlink or its tunnel
-/// goes away.
+/// The session lives only as long as this socket: when the last descriptor
+/// of the socket is closed, for example by dropping it, the kernel deletes
+/// the session from its tunnel, whether the session was created through
+/// netlink or by [`connect`](Self::connect) itself. The kernel announces no
+/// event for this deletion. A session handle for it should have auto-delete
+/// disabled, or its deletion will report `ENODEV`.
 #[derive(Debug)]
 pub struct PppSocket {
     fd: OwnedFd,
@@ -237,10 +288,23 @@ impl AsRawFd for PppUnit {
 }
 
 /// A PPP channel attached to a [`PppUnit`]; dropping it disconnects the
-/// channel from the unit.
+/// channel from the unit (`PPPIOCDISCONN`), so the channel can be connected
+/// to another unit while its [`PppSocket`] lives on. Closing the descriptor
+/// alone would leave the channel connected.
 #[derive(Debug)]
 pub struct PppChannel {
     fd: OwnedFd,
+}
+
+impl Drop for PppChannel {
+    fn drop(&mut self) {
+        // Best effort: the kernel also disconnects the channel when the
+        // `PppSocket` is released, and a failure here cannot be reported.
+        // SAFETY: the ioctl takes no argument.
+        unsafe {
+            libc::ioctl(self.fd.as_raw_fd(), PPPIOCDISCONN);
+        }
+    }
 }
 
 impl AsFd for PppChannel {
@@ -306,6 +370,53 @@ fn sockaddr_pppol2tp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ioctl_requests_match_the_kernel_headers() {
+        // Values of `linux/ppp-ioctl.h` for each `_IOC` encoding.
+        #[cfg(any(
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "sparc",
+            target_arch = "sparc64",
+        ))]
+        let expected: [u32; 5] = [
+            0x4004_7437,
+            0x8004_7438,
+            0x2000_7439,
+            0x8004_743a,
+            0xc004_743e,
+        ];
+        #[cfg(not(any(
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "sparc",
+            target_arch = "sparc64",
+        )))]
+        let expected: [u32; 5] = [
+            0x8004_7437,
+            0x4004_7438,
+            0x0000_7439,
+            0x4004_743a,
+            0xc004_743e,
+        ];
+        let actual = [
+            PPPIOCGCHAN,
+            PPPIOCATTCHAN,
+            PPPIOCDISCONN,
+            PPPIOCCONNECT,
+            PPPIOCNEWUNIT,
+        ];
+        assert_eq!(actual.map(|v| v as u32), expected);
+    }
 
     #[test]
     fn sockaddr_layouts_match_the_kernel() {

@@ -5,7 +5,7 @@ use std::{
     mem::{size_of, zeroed},
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use crate::{
@@ -65,6 +65,9 @@ pub struct TunnelSocket {
     pinned: AtomicBool,
     /// Peer tunnel identifier of an IP socket, repeated on reconnect.
     peer_conn_id: u32,
+    /// Peer of an IPv4 L2TP/IP socket as connected by this type, since the
+    /// kernel never reports it; `0` when unknown.
+    peer_v4: AtomicU32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +216,7 @@ impl TunnelSocket {
             scope: None,
             pinned: AtomicBool::new(pinned),
             peer_conn_id: 0,
+            peer_v4: AtomicU32::new(0),
         })
     }
 
@@ -267,6 +271,7 @@ impl TunnelSocket {
             scope,
             pinned: AtomicBool::new(pinned),
             peer_conn_id: peer_tunnel_id.0,
+            peer_v4: AtomicU32::new(v4_bits(remote)),
         })
     }
 
@@ -301,7 +306,10 @@ impl TunnelSocket {
     /// `EAFNOSUPPORT`, `ESOCKTNOSUPPORT` or `EPROTONOSUPPORT`. The bound
     /// device, link-local scope and peer connection ID are read back from
     /// the kernel. Build the tunnel configuration from the adopted socket
-    /// with [`TunnelConfig::for_socket`].
+    /// with [`TunnelConfig::for_socket`], except for an IPv4 L2TP/IP socket,
+    /// whose peer the kernel does not report (see
+    /// [`peer_addr_ip`](Self::peer_addr_ip)); describe that one with
+    /// [`TunnelConfig::new`].
     pub fn from_fd(fd: OwnedFd) -> crate::Result<Self> {
         let raw = fd.as_raw_fd();
         let family =
@@ -350,6 +358,7 @@ impl TunnelSocket {
             scope: device,
             pinned: AtomicBool::new(device.is_some() || scoped),
             peer_conn_id,
+            peer_v4: AtomicU32::new(0),
         })
     }
 
@@ -491,6 +500,7 @@ impl TunnelSocket {
             return Err(io::Error::last_os_error().into());
         }
         self.pinned.store(false, Ordering::Relaxed);
+        self.peer_v4.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -591,6 +601,7 @@ impl TunnelSocket {
         if new_remote.is_link_local() {
             self.pinned.store(true, Ordering::Relaxed);
         }
+        self.peer_v4.store(v4_bits(new_remote), Ordering::Relaxed);
         Ok(())
     }
 
@@ -624,11 +635,23 @@ impl TunnelSocket {
 
     /// Returns the current peer address of an IP socket.
     ///
-    /// The kernel reports `ENOTCONN` for an IPv6 socket whose peer
+    /// The kernel never records a peer port for IPv4 L2TP/IP sockets and so
+    /// reports `ENOTCONN` for every one of them through `getpeername`; this
+    /// type therefore remembers the peer it connected to with
+    /// [`TunnelSocket::ip`], [`reconnect_ip`](Self::reconnect_ip) or
+    /// [`disconnect`](Self::disconnect). An IPv4 L2TP/IP socket adopted with
+    /// [`from_fd`](Self::from_fd) has no known peer and fails with
+    /// `ENOTCONN`. For IPv6 the kernel reports `ENOTCONN` only when the peer
     /// connection ID is zero, which [`TunnelSocket::ip`] never produces.
     pub fn peer_addr_ip(&self) -> crate::Result<IpEndpoint> {
         if self.encap != SocketEncap::Ip {
             return Err(crate::Error::EncapsulationMismatch);
+        }
+        if self.family == SocketFamily::V4 {
+            let peer = self.peer_v4.load(Ordering::Relaxed);
+            if peer != 0 {
+                return Ok(IpEndpoint::V4(Ipv4Addr::from(peer)));
+            }
         }
         let name = socket_name(self.fd.as_raw_fd(), true)?;
         self.ip_endpoint(&name)
@@ -1015,6 +1038,15 @@ fn has_link_local_scope(endpoint: &UdpEndpoint) -> bool {
     )
 }
 
+/// The IPv4 address of an endpoint as the `peer_v4` field stores it; `0`
+/// for IPv6.
+fn v4_bits(endpoint: &IpEndpoint) -> u32 {
+    match endpoint {
+        IpEndpoint::V4(addr) => u32::from(*addr),
+        IpEndpoint::V6 { .. } => 0,
+    }
+}
+
 /// Resolves the scope to the interface index at the time of use, so a
 /// re-created interface keeps working.
 fn resolve_scope(scope: Option<&L2tpIfName>) -> crate::Result<u32> {
@@ -1104,6 +1136,7 @@ mod tests {
             scope,
             pinned: AtomicBool::new(false),
             peer_conn_id: 0,
+            peer_v4: AtomicU32::new(0),
         }
     }
 

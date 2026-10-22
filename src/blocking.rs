@@ -129,8 +129,27 @@ impl L2tpHandle {
                         return;
                     }
                     let mut tasks = tokio::task::JoinSet::new();
-                    while let Some(task) = task_rx.recv().await {
-                        tasks.spawn(task(handle.clone()));
+                    loop {
+                        // Reap finished tasks while accepting new ones, so
+                        // the set holds only the work in flight.
+                        let task = if tasks.is_empty() {
+                            task_rx.recv().await
+                        } else {
+                            let recv = task_rx.recv();
+                            futures::pin_mut!(recv);
+                            let join = tasks.join_next();
+                            futures::pin_mut!(join);
+                            match future::select(recv, join).await {
+                                Either::Left((task, _)) => task,
+                                Either::Right(_) => continue,
+                            }
+                        };
+                        match task {
+                            Some(task) => {
+                                tasks.spawn(task(handle.clone()));
+                            }
+                            None => break,
+                        }
                     }
                     // Let deletions queued by dropped handles finish.
                     while tasks.join_next().await.is_some() {}
@@ -383,7 +402,11 @@ impl L2tpHandle {
     /// ends when the subscription's connection closes. It keeps the worker
     /// alive while it exists.
     pub fn events(&self) -> crate::Result<EventIter> {
-        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        // A std channel carries the events, so `next` blocks without
+        // touching any Tokio context; the oneshot tells the forwarder that
+        // the iterator is gone.
+        let (event_tx, event_rx) = mpsc::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<crate::Result<()>>(1);
         self.detach(move |handle| async move {
             let mut events = match handle.events().await {
@@ -398,10 +421,8 @@ impl L2tpHandle {
             }
             // Stop as soon as the iterator is dropped, so the worker never
             // waits on this task at shutdown.
-            let closed = event_tx.closed();
-            futures::pin_mut!(closed);
             loop {
-                match future::select(&mut closed, events.next()).await {
+                match future::select(&mut stop_rx, events.next()).await {
                     Either::Left(_) => break,
                     Either::Right((Some(item), _)) => {
                         if event_tx.send(item).is_err() {
@@ -417,6 +438,7 @@ impl L2tpHandle {
         })??;
         Ok(EventIter {
             receiver: event_rx,
+            _stop: stop_tx,
             _worker: self.clone(),
         })
     }
@@ -424,10 +446,13 @@ impl L2tpHandle {
 
 /// Blocking iterator over kernel notifications; see [`L2tpHandle::events`].
 ///
-/// Dropping it leaves the multicast group.
+/// `next` blocks the calling thread without depending on a Tokio context,
+/// so it also works from `spawn_blocking` or an async task, where it blocks
+/// that task's thread. Dropping the iterator leaves the multicast group.
 #[derive(Debug)]
 pub struct EventIter {
-    receiver: tokio::sync::mpsc::UnboundedReceiver<crate::Result<L2tpEvent>>,
+    receiver: mpsc::Receiver<crate::Result<L2tpEvent>>,
+    _stop: tokio::sync::oneshot::Sender<()>,
     _worker: L2tpHandle,
 }
 
@@ -435,7 +460,7 @@ impl Iterator for EventIter {
     type Item = crate::Result<L2tpEvent>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.receiver.blocking_recv()
+        self.receiver.recv().ok()
     }
 }
 
@@ -497,7 +522,8 @@ impl TunnelHandle {
         self.l2tp.tunnel_stats(self.tunnel_id)
     }
 
-    /// Deletes the tunnel and waits for the kernel to acknowledge it.
+    /// Deletes the tunnel and waits until the kernel has removed it; see
+    /// [`crate::L2tpHandle::delete_tunnel`].
     pub fn delete(mut self) -> crate::Result<()> {
         let Some(inner) = self.inner.take() else {
             return Err(crate::Error::other("the tunnel handle was consumed"));
@@ -522,9 +548,15 @@ impl TunnelHandle {
 
 impl Drop for TunnelHandle {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            // Drop inside the worker runtime so auto-delete can run.
-            self.l2tp.detach(move |_| async move { drop(inner) });
+        // Delete on the worker and await it there, so the worker's shutdown
+        // waits for the deletion instead of abandoning a task the async
+        // handle's own drop would merely spawn.
+        if let Some(inner) = self.inner.take()
+            && inner.auto_delete()
+        {
+            self.l2tp.detach(move |_| async move {
+                let _ = inner.delete().await;
+            });
         }
     }
 }
@@ -604,8 +636,12 @@ impl SessionHandle {
 
 impl Drop for SessionHandle {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            self.l2tp.detach(move |_| async move { drop(inner) });
+        if let Some(inner) = self.inner.take()
+            && inner.auto_delete()
+        {
+            self.l2tp.detach(move |_| async move {
+                let _ = inner.delete().await;
+            });
         }
     }
 }
@@ -648,7 +684,11 @@ mod tests {
             // not need the caller's runtime at all.
             tokio::task::spawn_blocking(|| {
                 let handle = L2tpHandle::new().unwrap();
-                handle.list_tunnels().map(|_| ()).unwrap_err()
+                // Fails as root (no such tunnel) and unprivileged (EPERM).
+                handle
+                    .open_tunnel(TunnelId(u32::MAX))
+                    .map(|_| ())
+                    .unwrap_err()
             })
             .await
             .unwrap()
@@ -678,6 +718,31 @@ mod tests {
         let worker = Arc::downgrade(&handle.worker);
         drop(handle);
         assert!(worker.upgrade().is_none());
+    }
+
+    #[test]
+    fn event_iterator_blocks_without_a_tokio_context() {
+        let handle = L2tpHandle::new().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        tx.send(Err(crate::Error::other("probe"))).unwrap();
+        drop(tx);
+        let mut iter = EventIter {
+            receiver: rx,
+            _stop: stop_tx,
+            _worker: handle,
+        };
+        // Inside an async context a Tokio blocking receive would panic.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (first, second) = runtime
+            .block_on(async { (iter.next().is_some(), iter.next().is_none()) });
+        assert!(first);
+        assert!(second);
+        // Dropping the iterator tells the forwarder to stop.
+        drop(iter);
+        assert!(runtime.block_on(stop_rx).is_err());
     }
 
     #[test]

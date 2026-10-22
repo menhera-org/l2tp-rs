@@ -588,7 +588,7 @@ async fn tunnel_create(
     for _ in 0..attempts {
         let tunnel_id = TunnelId(match args.tunnel_id {
             Some(v) => v,
-            None => random_tunnel_id().map_err(|e| {
+            None => random_tunnel_id(version).map_err(|e| {
                 CliError::L2tp(
                     io::Error::new(
                         e.kind(),
@@ -704,7 +704,8 @@ async fn session_change(
 // L2TPv3 relies on identifiers an off-path attacker cannot guess, so take them
 // from the kernel's random number generator. getrandom(2) needs no /dev node
 // and blocks until the generator is seeded; there is no weaker fallback.
-fn random_tunnel_id() -> io::Result<u32> {
+// L2TPv2 identifiers are 16-bit on the wire, so they stay within 1..=65535.
+fn random_tunnel_id(version: L2tpVersion) -> io::Result<u32> {
     let mut bytes = [0u8; 4];
     let mut filled = 0;
     while filled < bytes.len() {
@@ -728,8 +729,11 @@ fn random_tunnel_id() -> io::Result<u32> {
             }
         }
     }
-    let span = u32::MAX - 999_999;
-    Ok(1_000_000 + (u32::from_ne_bytes(bytes) % span))
+    let random = u32::from_ne_bytes(bytes);
+    Ok(match version {
+        L2tpVersion::V2 => 1 + random % u32::from(u16::MAX),
+        _ => 1_000_000 + random % (u32::MAX - 999_999),
+    })
 }
 
 fn map_pw(v: PwTypeArg) -> PseudowireType {
@@ -1082,9 +1086,20 @@ mod tests {
 
     #[test]
     fn random_tunnel_ids_stay_in_range_and_vary() {
-        let ids: Vec<u32> =
-            (0..32).map(|_| random_tunnel_id().unwrap()).collect();
+        let ids: Vec<u32> = (0..32)
+            .map(|_| random_tunnel_id(L2tpVersion::V3).unwrap())
+            .collect();
         assert!(ids.iter().all(|&id| id >= 1_000_000));
+        assert!(ids.windows(2).any(|w| w[0] != w[1]));
+
+        // L2TPv2 identifiers must fit 16 bits for the PPPoL2TP socket.
+        let ids: Vec<u32> = (0..32)
+            .map(|_| random_tunnel_id(L2tpVersion::V2).unwrap())
+            .collect();
+        assert!(
+            ids.iter()
+                .all(|&id| (1..=u32::from(u16::MAX)).contains(&id))
+        );
         assert!(ids.windows(2).any(|w| w[0] != w[1]));
     }
 }

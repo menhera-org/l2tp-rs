@@ -189,6 +189,11 @@ impl Harness {
             );
         }
         self.ack(&delete, 0);
+        if !matches!(resource, Resource::Session) {
+            // Tunnel deletion then polls until the tunnel is gone.
+            let get = self.next_request(L2tpCmd::TunnelGet).await;
+            self.ack(&get, libc::ENODEV);
+        }
         self.assert_idle().await;
     }
 

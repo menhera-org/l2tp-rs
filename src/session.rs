@@ -126,8 +126,12 @@ pub struct SessionInfo {
     pub peer_session_id: SessionId,
     /// Session pseudowire type.
     pub pseudowire_type: PseudowireType,
-    /// Session L2-specific header type.
-    pub l2spec_type: L2SpecType,
+    /// Session L2-specific sublayer type, when the kernel reports it.
+    ///
+    /// Linux accepts `L2TP_ATTR_L2SPEC_TYPE` on creation but omits it from
+    /// session replies, so this is `None` on current kernels and the value
+    /// given at creation cannot be read back.
+    pub l2spec_type: Option<L2SpecType>,
     /// Local session cookie; empty when none is set.
     pub cookie: Cookie,
     /// Peer session cookie; empty when none is set.

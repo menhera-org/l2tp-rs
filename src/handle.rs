@@ -402,13 +402,38 @@ impl L2tpHandle {
         Ok(out)
     }
 
-    /// Deletes a tunnel.
+    /// Deletes a tunnel and its sessions.
+    ///
+    /// The kernel acknowledges the request and then tears the tunnel down
+    /// on a work queue, during which lookups still find it and creating a
+    /// tunnel with the same identifier fails with `EEXIST`. This therefore
+    /// also waits, for up to about two seconds, until the tunnel is gone.
     pub async fn delete_tunnel(
         &self,
         tunnel_id: TunnelId,
     ) -> crate::Result<()> {
         self.send_ack(netlink::encode_tunnel_delete(tunnel_id))
-            .await
+            .await?;
+        self.wait_tunnel_removed(tunnel_id).await;
+        Ok(())
+    }
+
+    async fn wait_tunnel_removed(&self, tunnel_id: TunnelId) {
+        const POLLS: u32 = 200;
+        const INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(10);
+        for _ in 0..POLLS {
+            // Any failure, normally ENODEV, means the tunnel is no longer
+            // listed.
+            if self.get_tunnel(tunnel_id).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(INTERVAL).await;
+        }
+        log::warn!(
+            "tunnel {tunnel_id} is still listed after its deletion was \
+             acknowledged"
+        );
     }
 
     /// Deletes a session from a tunnel.
@@ -513,10 +538,16 @@ impl L2tpHandle {
     /// Subscribes to the kernel's L2TP notifications.
     ///
     /// The stream reports tunnels and sessions created, modified or deleted
-    /// by any process in the handle's network namespace, including tunnels
-    /// the kernel tears down when a managed socket closes. It uses its own
-    /// netlink connection on the current runtime; dropping it leaves the
-    /// multicast group. Joining needs no privilege.
+    /// through netlink commands by any process in the handle's network
+    /// namespace. The kernel announces nothing for the teardown it performs
+    /// on its own: a tunnel whose managed socket was closed, the sessions
+    /// removed together with a deleted tunnel, or a PPP session whose
+    /// `PPPoL2TP` socket was released. Reconcile with
+    /// [`list_tunnels`](Self::list_tunnels) and
+    /// [`list_all_sessions`](Self::list_all_sessions) to catch those.
+    ///
+    /// The stream uses its own netlink connection on the current runtime;
+    /// dropping it leaves the multicast group. Joining needs no privilege.
     pub async fn events(&self) -> crate::Result<Events> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             io::Error::other("tokio runtime is required for events")
@@ -529,7 +560,13 @@ impl L2tpHandle {
         })?;
         let (mut connection, genl, receiver) =
             open_connection(self.inner.netns.as_ref())?;
-        connection.socket_mut().socket_ref().add_membership(group)?;
+        // The kernel sends these notifications without a sender port and
+        // skips every socket whose own port is 0, so the socket must be
+        // bound before it can receive them; it never sends, so nothing else
+        // would bind it.
+        let socket = connection.socket_mut().socket_mut();
+        socket.bind_auto()?;
+        socket.add_membership(group)?;
         // Requests are never sent on this connection; it only listens.
         drop(genl);
         let task = runtime.spawn(connection);

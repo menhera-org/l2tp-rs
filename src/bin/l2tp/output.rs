@@ -228,7 +228,7 @@ struct SessionInfoJson {
     session_id: u32,
     peer_session_id: u32,
     pseudowire_type: String,
-    l2spec_type: String,
+    l2spec_type: Option<String>,
     cookie: String,
     peer_cookie: String,
     recv_seq: bool,
@@ -306,7 +306,8 @@ fn print_session_text(info: &SessionInfo) {
     println!(
         "  pw_type: {}  l2spec: {}",
         fmt_pw_type(info.pseudowire_type),
-        fmt_l2spec(info.l2spec_type)
+        info.l2spec_type
+            .map_or_else(|| "unknown".to_string(), fmt_l2spec)
     );
     println!(
         "  cookie: {}  peer_cookie: {}",
@@ -372,7 +373,7 @@ fn session_to_json(info: &SessionInfo) -> SessionInfoJson {
         session_id: info.session_id.0,
         peer_session_id: info.peer_session_id.0,
         pseudowire_type: fmt_pw_type(info.pseudowire_type),
-        l2spec_type: fmt_l2spec(info.l2spec_type),
+        l2spec_type: info.l2spec_type.map(fmt_l2spec),
         cookie: info.cookie.to_string(),
         peer_cookie: info.peer_cookie.to_string(),
         recv_seq: info.recv_seq,

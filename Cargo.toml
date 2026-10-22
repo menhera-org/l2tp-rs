@@ -35,7 +35,7 @@ netlink-packet-core    = "0.9"
 netlink-packet-generic = "0.5"
 netlink-proto          = "0.13"
 genetlink              = "0.3"
-tokio                  = { version = "1", features = ["rt", "sync", "net"] }
+tokio                  = { version = "1", features = ["rt", "sync", "net", "time"] }
 libc                   = "0.2"
 log                    = "0.4"
 thiserror              = "2"

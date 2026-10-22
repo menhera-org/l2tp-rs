@@ -197,7 +197,14 @@ socket is connected to it. `PppSocket::connect` attaches to the session and
 yields the descriptor that carries PPP frames; PPP negotiation stays in user
 space, for example in `pppd` with its `pppol2tp <fd>` option. `PppUnit`
 creates a `pppN` interface and `PppUnit::connect_channel` connects the
-channel to it for applications that implement PPP themselves.
+channel to it for applications that implement PPP themselves; dropping the
+returned `PppChannel` disconnects the channel again.
+
+The kernel deletes the session when the last descriptor of its `PPPoL2TP`
+socket is closed, without a netlink event, so the socket's lifetime is the
+session's lifetime. Disable auto-delete on the session handle, or its
+deletion reports `ENODEV`, the kernel's error for a missing tunnel or
+session.
 
 ```rust,no_run
 use l2tp::{L2tpHandle, L2tpVersion, PppSocket, SessionConfig, SessionId, TunnelId};
@@ -225,9 +232,12 @@ async fn main() -> l2tp::Result<()> {
 ## Events
 
 The kernel announces tunnel and session creation, modification and deletion
-on the `l2tp` multicast group, including tunnels it tears down when a managed
-socket closes. `L2tpHandle::events` returns a `Stream` of `L2tpEvent`; the
-blocking handle returns an iterator.
+through netlink commands on the `l2tp` multicast group. It announces nothing
+for teardown it performs itself: a tunnel whose managed socket was closed,
+the sessions removed with a deleted tunnel, or a PPP session whose
+`PPPoL2TP` socket was released. Reconcile with `list_tunnels` and
+`list_all_sessions` to catch those. `L2tpHandle::events` returns a `Stream`
+of `L2tpEvent`; the blocking handle returns an iterator.
 
 ```rust,no_run
 use futures::StreamExt;
@@ -336,6 +346,18 @@ and accepts non-UTF-8 arguments.
 - `L2TP_ATTR_IFNAME` applies to sessions (`SESSION_CREATE`/session lookups), not tunnels.
   Tunnels do not create a netdevice. Sessions can be looked up, modified and
   deleted by interface name.
+- Tunnel deletion is acknowledged before the kernel tears the tunnel down on
+  a work queue. `delete_tunnel` and `TunnelHandle::delete` wait until the
+  tunnel is gone, so its identifier can be reused immediately afterwards.
+- Lookups of a missing tunnel or session fail with `ENODEV`.
+- The kernel never records a peer port for IPv4 L2TP/IP sockets, so
+  `getpeername` reports `ENOTCONN` for them. `TunnelSocket::peer_addr_ip`
+  therefore reports the peer the socket connected to itself, which an IPv4
+  L2TP/IP socket adopted with `from_fd` does not know: describe such a
+  socket with `TunnelConfig::new` instead of `TunnelConfig::for_socket`.
+- The kernel accepts the L2-specific sublayer type (`L2TP_ATTR_L2SPEC_TYPE`)
+  when a session is created but never reports it, so `SessionInfo::l2spec_type`
+  is `None` and the CLI shows `unknown`.
 - The kernel reports the IPv4 UDP checksum setting (`L2TP_ATTR_UDP_CSUM`) only
   for IPv4 sockets. `TunnelInfo` therefore shows `udp_csum: false` for every
   IPv6 tunnel, even when its IPv4-mapped peer receives checksums.
@@ -428,7 +450,9 @@ The crate logs netlink requests and failures through the `log` crate at
 - Interface names are `L2tpIfName` from `netlink-packet-l2tp`; the crate's
   own `IfName` is gone, and `L2tpIfNameExt` adds the OS conversions.
 - `TunnelInfo::proto_version` is `TunnelInfo::version`, an `L2tpVersion`.
-- `SessionInfo` gained `peer_tunnel_id`, `cookie` and `peer_cookie`.
+- `SessionInfo` gained `peer_tunnel_id`, `cookie` and `peer_cookie`, and its
+  `l2spec_type` is an `Option` that is `None` when the kernel does not report
+  the sublayer type, which current kernels never do.
 - `Cookie` is `Copy`, parses from hexadecimal, and is built with `TryFrom` or
   `From<[u8; 4]>`/`From<[u8; 8]>` instead of `try_from_bytes`.
 - `L2tpHandle::new` returns `Error::Io` instead of panicking when the Tokio
