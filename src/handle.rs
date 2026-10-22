@@ -823,8 +823,7 @@ impl L2tpHandle {
                     return Err(err);
                 }
                 log::debug!(
-                    "l2tp: family id changed from {family_id} to \
-                     {refreshed}; retrying"
+                    "l2tp: family id {family_id} became {refreshed}; retrying"
                 );
                 self.send_to_family(payload, flags, refreshed).await
             }
@@ -1313,12 +1312,18 @@ mod tests {
 
     #[tokio::test]
     async fn opening_unknown_objects_fails_without_a_handle() {
+        // ENODEV as root, EPERM unprivileged, or no `l2tp` family at all
+        // where the module is not loaded (CI runners).
+        fn refused(err: &crate::Error) -> bool {
+            err.kind().is_some()
+                || matches!(err, crate::Error::FamilyResolution(_))
+        }
         let handle = L2tpHandle::new().await.unwrap();
         let err = handle.open_tunnel(TunnelId(u32::MAX)).await.unwrap_err();
-        assert!(err.kind().is_some(), "{err:?}");
+        assert!(refused(&err), "{err:?}");
         let name = L2tpIfName::new("l2tp-no-such0").unwrap();
         let err = handle.open_session_by_ifname(&name).await.unwrap_err();
-        assert!(err.kind().is_some(), "{err:?}");
+        assert!(refused(&err), "{err:?}");
     }
 
     #[test]

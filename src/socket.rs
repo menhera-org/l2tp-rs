@@ -1537,17 +1537,23 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, crate::Error::ScopeMismatch { .. }));
 
-        // A scope that names no interface fails before the socket is created.
+        // A scope that names no interface fails before the socket is bound.
+        // The lookup runs on the L2TP/IP socket, so a kernel without
+        // l2tp_ip6 reports its missing protocol instead.
         let missing = L2tpIfName::new("l2tp-no-such0").unwrap();
-        let err = TunnelSocket::ip(
+        match TunnelSocket::ip(
             &IpEndpoint::v6_scoped(link_local, missing),
             &IpEndpoint::v6(link_local),
             None,
             ids.0,
             ids.1,
-        )
-        .unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(libc::ENODEV));
+        ) {
+            Ok(_) => panic!("a missing scope interface cannot be resolved"),
+            Err(crate::Error::Io(e)) if skippable(&e) => {}
+            Err(err) => {
+                assert_eq!(err.raw_os_error(), Some(libc::ENODEV), "{err:?}")
+            }
+        }
     }
 
     #[test]

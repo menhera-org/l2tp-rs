@@ -661,10 +661,14 @@ impl Drop for SessionHandle {
 mod tests {
     use super::*;
 
+    /// ENODEV as root, EPERM unprivileged, or no `l2tp` family at all where
+    /// the module is not loaded (CI runners).
     fn permission_or_missing(err: &crate::Error) {
         let errno = err.raw_os_error();
         assert!(
-            errno == Some(libc::EPERM) || errno == Some(libc::ENODEV),
+            errno == Some(libc::EPERM)
+                || errno == Some(libc::ENODEV)
+                || matches!(err, crate::Error::FamilyResolution(_)),
             "{err:?}"
         );
     }

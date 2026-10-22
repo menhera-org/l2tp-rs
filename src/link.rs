@@ -192,6 +192,19 @@ mod tests {
         // No notification concerns this name, and an idle socket does not
         // block.
         assert_eq!(monitor.registered_index(&name).unwrap(), None);
-        assert!(monitor.as_raw_fd() >= 0);
+        // The fallback lookup resolves names on this very socket, in its
+        // namespace: the kernel hands SIOCGIFINDEX down to the device layer
+        // for netlink sockets too.
+        let lo = L2tpIfName::new("lo").unwrap();
+        assert_eq!(
+            crate::socket::interface_index(monitor.as_raw_fd(), &lo).unwrap(),
+            crate::L2tpIfNameExt::index(&lo).unwrap()
+        );
+        assert_eq!(
+            crate::socket::interface_index(monitor.as_raw_fd(), &name)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENODEV)
+        );
     }
 }
