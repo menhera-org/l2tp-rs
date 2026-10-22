@@ -26,6 +26,6 @@ pub use socket::TunnelSocket;
 pub use stats::{SessionStats, TunnelStats};
 pub use tunnel::{TunnelConfig, TunnelHandle, TunnelInfo};
 pub use types::{
-    Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, PseudowireType,
-    SessionId, TunnelId, UdpEndpoint,
+    Cookie, Encapsulation, IFNAMSIZ, IfName, IfNameError, IpEndpoint,
+    L2SpecType, PseudowireType, SessionId, TunnelId, UdpEndpoint,
 };

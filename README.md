@@ -158,6 +158,11 @@ let scope_id = IfName::new("eth0")?.index()?;
 let local = UdpEndpoint::V6(SocketAddrV6::new(link_local, 1701, 0, scope_id));
 ```
 
+A link-local remote may omit the scope ID once the local endpoint, the
+`device`, or an earlier scoped connect has pinned the socket to an interface.
+Both socket types report a missing scope as `Error::ScopeRequired` before
+the socket is created.
+
 Unmanaged tunnels cannot use link-local endpoints, because the kernel creates
 their socket without an interface scope; `create_unmanaged_tunnel` returns
 `Error::UnmanagedLinkLocal` before contacting the kernel. Re-creating a tunnel
@@ -166,17 +171,27 @@ not watch rtnetlink link events.
 
 ## Interface Names
 
-`IfName` is a checked newtype for Linux interface names. `IfName::new`,
-`str::parse` and `TryFrom<&str>`, `TryFrom<String>` and `TryFrom<&[u8]>`
-validate the name with the kernel's `dev_valid_name()` rules: non-empty, at
-most `IFNAMSIZ - 1` bytes, not `.` or `..`, and no NUL, `/`, `:` or
-whitespace. Read it back with `as_str`, `as_bytes`, `AsRef<str>`, `Display`
-or `String::from`. `IfName::index` and `IfName::from_index` convert between
-names and the kernel's interface indexes.
+`IfName` is a checked, `Copy` value for Linux interface names, stored
+NUL-padded like the kernel's `char ifname[IFNAMSIZ]`. `IfName::new`,
+`str::parse` and the `TryFrom` conversions from `&str`, `String`, `&[u8]`,
+`Vec<u8>`, `&OsStr`, `&CStr` and `[u8; IFNAMSIZ]` validate the name with the
+kernel's `dev_valid_name()` rules: non-empty, at most `IFNAMSIZ - 1` bytes,
+not `.` or `..`, and no NUL, `/`, `:` or whitespace. A rejected name yields
+`Error::InvalidIfName` with an `IfNameError` that names the rule.
 
-The kernel accepts non-UTF-8 names, but `netlink-packet-l2tp` represents
-`L2TP_ATTR_IFNAME` as a `String`, so such names cannot be used with this crate
-and a session listing that contains one fails to decode.
+Names are byte strings and need not be UTF-8. Read one back with `as_bytes`,
+`as_array`, `to_str` (`None` for a non-UTF-8 name), `to_string_lossy`,
+`as_os_str`, `as_c_str`, `Display` (lossy) or the `From<IfName>` conversions
+into `[u8; IFNAMSIZ]`, `Vec<u8>` and `OsString`. `IfName::index` and
+`IfName::from_index` convert between names and the kernel's interface
+indexes. Interface names appear in the public API only as `IfName`; the CLI
+validates `--ifname` and `--device` while parsing and accepts non-UTF-8
+arguments.
+
+`netlink-packet-l2tp` 0.3 carries `L2TP_ATTR_IFNAME` as a `String`. Until a
+release that carries the raw bytes is adopted, creating a session with a
+non-UTF-8 interface name fails with `Error::Netlink`, and a session listing
+that contains such a name fails to decode.
 
 ## Binding Managed Sockets to an Interface
 
@@ -265,10 +280,18 @@ match handle.create_unmanaged_tunnel(cfg).await {
 - `IpEndpoint::V6` is a struct variant with an `addr` and an optional
   interface `scope`; use `IpEndpoint::v6(addr)` or
   `IpEndpoint::v6_scoped(addr, ifname)`. Link-local endpoints without a scope
-  are rejected with `Error::ScopeRequired`, and unmanaged tunnels reject
-  link-local endpoints with `Error::UnmanagedLinkLocal`.
+  are rejected with `Error::ScopeRequired` by `TunnelSocket::ip` and
+  `TunnelSocket::udp`, and unmanaged tunnels reject link-local endpoints
+  with `Error::UnmanagedLinkLocal`.
 - `L2tpHandle::new` returns `Error::Io` instead of panicking when the Tokio
   runtime has no I/O driver.
+- `IfName` is a `Copy` value holding the kernel's NUL-padded
+  `[u8; IFNAMSIZ]` buffer, and names need not be UTF-8. `as_str` is replaced
+  by `to_str`, `to_string_lossy` and `as_bytes`; `AsRef<str>` and
+  `From<IfName> for String` by `AsRef<[u8]>`, `AsRef<OsStr>`, `AsRef<CStr>`
+  and `From<IfName>` for `[u8; IFNAMSIZ]`, `Vec<u8>` and `OsString`.
+- `Error::InvalidIfName` carries an `IfNameError` reason instead of the
+  rejected string.
 - `Error` is `#[non_exhaustive]`. `Error::Netlink` holds a message instead of a
   `netlink-packet-core` type. Malformed kernel replies are reported as
   `Error::UnexpectedReply` instead of a synthetic `KernelError`, and socket

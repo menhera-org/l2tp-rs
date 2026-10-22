@@ -267,7 +267,7 @@ fn print_session_text(info: &SessionInfo) {
         println!("  recv_timeout_ms: none");
     }
     if let Some(ifname) = &info.ifname {
-        println!("  ifname: {}", ifname.as_str());
+        println!("  ifname: {ifname}");
     } else {
         println!("  ifname: none");
     }
@@ -320,7 +320,8 @@ fn session_to_json(info: &SessionInfo) -> SessionInfoJson {
         send_seq: info.send_seq,
         lns_mode: info.lns_mode,
         recv_timeout_ms: info.recv_timeout_ms,
-        ifname: info.ifname.as_ref().map(|v| v.as_str().to_string()),
+        // JSON is UTF-8, so a non-UTF-8 name is shown lossily.
+        ifname: info.ifname.map(|v| v.to_string_lossy().into_owned()),
         using_ipsec: info.using_ipsec,
     }
 }

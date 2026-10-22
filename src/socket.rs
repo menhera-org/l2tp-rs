@@ -4,6 +4,7 @@ use std::{
     mem::{size_of, zeroed},
     net::{Ipv4Addr, Ipv6Addr},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::{Encapsulation, IfName, IpEndpoint, TunnelId, UdpEndpoint};
@@ -23,8 +24,12 @@ pub struct TunnelSocket {
     fd: OwnedFd,
     encap: SocketEncap,
     family: SocketFamily,
-    /// Interface scope of an IP socket, resolved again on every reconnect.
+    /// Interface name that scopes an IP socket, resolved on every reconnect.
     scope: Option<IfName>,
+    /// Whether the kernel has pinned the socket to an interface, through a
+    /// link-local scope or `SO_BINDTODEVICE`. A link-local peer without a
+    /// scope of its own needs that.
+    pinned: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -121,6 +126,14 @@ impl TunnelSocket {
     ///
     /// If `device` is provided, `SO_BINDTODEVICE` is applied before
     /// bind/connect.
+    ///
+    /// A link-local IPv6 endpoint needs an interface, which the kernel takes
+    /// from the [`SocketAddrV6`](std::net::SocketAddrV6) scope ID (see
+    /// [`IfName::index`]) or from `device`. A link-local `remote` may omit
+    /// its scope ID when `local` or `device` already pins the socket to an
+    /// interface. A missing scope is reported as
+    /// [`Error::ScopeRequired`](crate::Error::ScopeRequired) before the
+    /// socket is created.
     pub fn udp(
         local: &UdpEndpoint,
         remote: &UdpEndpoint,
@@ -129,6 +142,11 @@ impl TunnelSocket {
         if local.ip_version() != remote.ip_version() {
             return Err(crate::Error::AddressFamilyMismatch);
         }
+        require_udp_scope(local, device.is_some())?;
+        require_udp_scope(
+            remote,
+            device.is_some() || has_link_local_scope(local),
+        )?;
 
         let family = match local {
             UdpEndpoint::V4(_) => libc::AF_INET,
@@ -147,11 +165,16 @@ impl TunnelSocket {
         let remote_addr = udp_sockaddr(remote);
         connect(fd.as_raw_fd(), &remote_addr)?;
 
+        // Validation above guarantees that a link-local endpoint came with a
+        // scope or a device, each of which pins the socket.
+        let pinned =
+            device.is_some() || local.is_link_local() || remote.is_link_local();
         Ok(Self {
             fd,
             encap: SocketEncap::Udp,
             family: SocketFamily::from_udp(local),
             scope: None,
+            pinned: AtomicBool::new(pinned),
         })
     }
 
@@ -179,9 +202,9 @@ impl TunnelSocket {
             return Err(crate::Error::AddressFamilyMismatch);
         }
         let scope =
-            unified_scope([local.scope(), remote.scope(), device])?.cloned();
-        require_scope(local, scope.as_ref())?;
-        require_scope(remote, scope.as_ref())?;
+            unified_scope([local.scope(), remote.scope(), device])?.copied();
+        require_scope(local, scope.as_ref(), false)?;
+        require_scope(remote, scope.as_ref(), false)?;
         let scope_id = resolve_scope(scope.as_ref())?;
 
         let family = match local {
@@ -201,11 +224,15 @@ impl TunnelSocket {
         let remote_addr = l2tp_sockaddr(remote, 0, scope_id);
         connect(fd.as_raw_fd(), &remote_addr)?;
 
+        // The kernel only pins the socket for a device or a link-local scope.
+        let pinned =
+            device.is_some() || local.is_link_local() || remote.is_link_local();
         Ok(Self {
             fd,
             encap: SocketEncap::Ip,
             family: SocketFamily::from_ip(local),
             scope,
+            pinned: AtomicBool::new(pinned),
         })
     }
 
@@ -271,8 +298,12 @@ impl TunnelSocket {
     }
 
     /// Applies `SO_BINDTODEVICE` on this socket; this requires `CAP_NET_RAW`.
+    ///
+    /// Afterwards a link-local remote may omit its scope on reconnect.
     pub fn bind_to_device(&self, device: &IfName) -> crate::Result<()> {
-        set_bind_to_device(self.fd.as_raw_fd(), device)
+        set_bind_to_device(self.fd.as_raw_fd(), device)?;
+        self.pinned.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Sets `IPV6_DONTFRAG` for this socket.
@@ -298,6 +329,11 @@ impl TunnelSocket {
     }
 
     /// Reconnects a managed UDP tunnel socket to a new remote endpoint.
+    ///
+    /// A link-local `new_remote` needs a scope ID unless the socket is
+    /// already pinned to an interface by its creation, by
+    /// [`bind_to_device`](Self::bind_to_device) or by an earlier scoped
+    /// reconnect.
     pub fn reconnect_udp(&self, new_remote: &UdpEndpoint) -> crate::Result<()> {
         if let SocketEncap::Ip = self.encap {
             return Err(crate::Error::EncapsulationMismatch);
@@ -305,16 +341,22 @@ impl TunnelSocket {
         if self.family.ip_version() != new_remote.ip_version() {
             return Err(crate::Error::AddressFamilyMismatch);
         }
+        require_udp_scope(new_remote, self.pinned.load(Ordering::Relaxed))?;
 
         let remote_addr = udp_sockaddr(new_remote);
-        connect(self.fd.as_raw_fd(), &remote_addr)
+        connect(self.fd.as_raw_fd(), &remote_addr)?;
+        if new_remote.is_link_local() {
+            self.pinned.store(true, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Reconnects a managed IP tunnel socket to a new remote endpoint.
     ///
-    /// A link-local `new_remote` needs an interface scope. The socket's own
-    /// scope is used when `new_remote` has none, and the two must agree
-    /// otherwise. The name is resolved to the interface index on every call.
+    /// A link-local `new_remote` needs an interface scope unless the socket
+    /// is already pinned to an interface. The socket's own scope is used when
+    /// `new_remote` has none, and the two must agree otherwise. The name is
+    /// resolved to the interface index on every call.
     pub fn reconnect_ip(&self, new_remote: &IpEndpoint) -> crate::Result<()> {
         if let SocketEncap::Udp = self.encap {
             return Err(crate::Error::EncapsulationMismatch);
@@ -323,11 +365,15 @@ impl TunnelSocket {
             return Err(crate::Error::AddressFamilyMismatch);
         }
         let scope = unified_scope([new_remote.scope(), self.scope.as_ref()])?;
-        require_scope(new_remote, scope)?;
+        require_scope(new_remote, scope, self.pinned.load(Ordering::Relaxed))?;
         let scope_id = resolve_scope(scope)?;
 
         let remote_addr = l2tp_sockaddr(new_remote, 0, scope_id);
-        connect(self.fd.as_raw_fd(), &remote_addr)
+        connect(self.fd.as_raw_fd(), &remote_addr)?;
+        if new_remote.is_link_local() {
+            self.pinned.store(true, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Returns the current local UDP socket address.
@@ -458,7 +504,7 @@ fn set_socket_bool(
 }
 
 fn set_bind_to_device(fd: RawFd, device: &IfName) -> crate::Result<()> {
-    let bytes = device.as_str().as_bytes();
+    let bytes = device.as_bytes();
     // SAFETY: `bytes` points to readable memory of length `bytes.len()`, and
     // `fd` is assumed to be an open socket descriptor.
     let rc = unsafe {
@@ -509,8 +555,8 @@ fn unified_scope<'a>(
             None => unified = Some(scope),
             Some(expected) if expected != scope => {
                 return Err(crate::Error::ScopeMismatch {
-                    expected: expected.clone(),
-                    found: scope.clone(),
+                    expected: *expected,
+                    found: *scope,
                 });
             }
             Some(_) => {}
@@ -520,19 +566,46 @@ fn unified_scope<'a>(
 }
 
 /// The kernel cannot bind or connect a link-local address without an
-/// interface.
+/// interface, given by a scope or by a socket already pinned to one.
 fn require_scope(
     endpoint: &IpEndpoint,
     scope: Option<&IfName>,
+    pinned: bool,
 ) -> crate::Result<()> {
     match endpoint {
         IpEndpoint::V6 { addr, .. }
-            if addr.is_unicast_link_local() && scope.is_none() =>
+            if addr.is_unicast_link_local() && scope.is_none() && !pinned =>
         {
             Err(crate::Error::ScopeRequired(*addr))
         }
         _ => Ok(()),
     }
+}
+
+/// UDP endpoints carry their scope as the `SocketAddrV6` scope ID.
+fn require_udp_scope(
+    endpoint: &UdpEndpoint,
+    pinned: bool,
+) -> crate::Result<()> {
+    match endpoint {
+        UdpEndpoint::V6(addr)
+            if addr.ip().is_unicast_link_local()
+                && addr.scope_id() == 0
+                && !pinned =>
+        {
+            Err(crate::Error::ScopeRequired(*addr.ip()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Whether binding or connecting `endpoint` pins the socket to an interface.
+fn has_link_local_scope(endpoint: &UdpEndpoint) -> bool {
+    matches!(
+        endpoint,
+        UdpEndpoint::V6(addr)
+            if addr.ip().is_unicast_link_local() && addr.scope_id() != 0
+    )
 }
 
 /// Resolves the scope to the interface index at the time of use, so a
@@ -577,7 +650,10 @@ mod tests {
     use std::{
         io,
         mem::size_of,
-        net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket},
+        net::{
+            Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6,
+            UdpSocket,
+        },
         time::Duration,
     };
 
@@ -640,6 +716,7 @@ mod tests {
                 encap: SocketEncap::Udp,
                 family,
                 scope: None,
+                pinned: AtomicBool::new(false),
             };
             let endpoint = match family {
                 SocketFamily::V4 => UdpEndpoint::V4(SocketAddrV4::new(
@@ -754,8 +831,8 @@ mod tests {
         assert!(matches!(err, crate::Error::ScopeRequired(_)));
 
         let err = TunnelSocket::ip(
-            &IpEndpoint::v6_scoped(link_local, eth0.clone()),
-            &IpEndpoint::v6_scoped(link_local, eth1.clone()),
+            &IpEndpoint::v6_scoped(link_local, eth0),
+            &IpEndpoint::v6_scoped(link_local, eth1),
             None,
             TunnelId(1),
         )
@@ -767,7 +844,7 @@ mod tests {
         ));
 
         let err = TunnelSocket::ip(
-            &IpEndpoint::v6_scoped(link_local, eth0.clone()),
+            &IpEndpoint::v6_scoped(link_local, eth0),
             &IpEndpoint::v6(link_local),
             Some(&eth1),
             TunnelId(1),
@@ -804,7 +881,8 @@ mod tests {
             fd,
             encap: SocketEncap::Ip,
             family: SocketFamily::V6,
-            scope: Some(lo.clone()),
+            scope: Some(lo),
+            pinned: AtomicBool::new(false),
         };
         let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
 
@@ -868,7 +946,7 @@ mod tests {
         let Some((addr, ifname)) = link_local_interface() else {
             return;
         };
-        let local = IpEndpoint::v6_scoped(addr, ifname.clone());
+        let local = IpEndpoint::v6_scoped(addr, ifname);
         // The peer takes its scope from the local endpoint.
         let remote =
             IpEndpoint::v6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x1234));
@@ -894,7 +972,8 @@ mod tests {
             }
             Err(e) => panic!("unexpected link-local socket error: {e:?}"),
         };
-        assert_eq!(sock.scope, Some(ifname.clone()));
+        assert_eq!(sock.scope, Some(ifname));
+        assert!(sock.pinned.load(Ordering::Relaxed));
 
         // SAFETY: zero-initialization is valid for this plain C struct.
         let mut bound: SockaddrL2tpIp6 = unsafe { zeroed() };
@@ -914,6 +993,117 @@ mod tests {
         // Reconnecting resolves the socket's own scope again.
         sock.reconnect_ip(&IpEndpoint::v6(Ipv6Addr::new(
             0xfe80, 0, 0, 0, 0, 0, 0, 0x5678,
+        )))
+        .unwrap();
+    }
+
+    #[test]
+    fn udp_link_local_endpoints_require_a_scope() {
+        let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let any =
+            UdpEndpoint::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
+        let unscoped =
+            UdpEndpoint::V6(SocketAddrV6::new(link_local, 1701, 0, 0));
+        let scoped = UdpEndpoint::V6(SocketAddrV6::new(link_local, 1701, 0, 1));
+        let lo = IfName::new("lo").unwrap();
+
+        // Validation runs before any socket is created.
+        let err = TunnelSocket::udp(&unscoped, &any, None).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::ScopeRequired(addr) if addr == link_local
+        ));
+        let err = TunnelSocket::udp(&any, &unscoped, None).unwrap_err();
+        assert!(matches!(err, crate::Error::ScopeRequired(_)));
+
+        // A device or a scoped local endpoint pins the socket, so the peer
+        // may omit its scope. These attempts reach the kernel, which may
+        // reject them for other reasons here.
+        for (local, remote, device) in [
+            (&unscoped, &any, Some(&lo)),
+            (&any, &unscoped, Some(&lo)),
+            (&scoped, &unscoped, None),
+        ] {
+            match TunnelSocket::udp(local, remote, device) {
+                Ok(_) | Err(crate::Error::Io(_)) => {}
+                Err(e) => panic!("unexpected validation error: {e:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn reconnect_udp_requires_a_scope_on_an_unpinned_socket() {
+        let fd =
+            match socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP) {
+                Ok(fd) => fd,
+                Err(crate::Error::Io(e))
+                    if e.kind() == io::ErrorKind::PermissionDenied =>
+                {
+                    return;
+                }
+                Err(e) => panic!("unexpected socket create error: {e:?}"),
+            };
+        let sock = TunnelSocket {
+            fd,
+            encap: SocketEncap::Udp,
+            family: SocketFamily::V6,
+            scope: None,
+            pinned: AtomicBool::new(false),
+        };
+        let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let err = sock
+            .reconnect_udp(&UdpEndpoint::V6(SocketAddrV6::new(
+                link_local, 1701, 0, 0,
+            )))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::ScopeRequired(addr) if addr == link_local
+        ));
+    }
+
+    #[test]
+    fn udp_link_local_socket_binds_to_the_scoped_interface() {
+        let Some((addr, ifname)) = link_local_interface() else {
+            return;
+        };
+        let index = ifname.index().unwrap();
+        let local = UdpEndpoint::V6(SocketAddrV6::new(addr, 0, 0, index));
+        // The peer takes the interface from the local endpoint.
+        let remote = UdpEndpoint::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x1234),
+            1701,
+            0,
+            0,
+        ));
+        let sock = match TunnelSocket::udp(&local, &remote, None) {
+            Ok(sock) => sock,
+            // No permission or no usable link here.
+            Err(crate::Error::Io(e))
+                if e.kind() == io::ErrorKind::PermissionDenied
+                    || matches!(
+                        e.raw_os_error(),
+                        Some(libc::EADDRNOTAVAIL | libc::ENETUNREACH)
+                    ) =>
+            {
+                return;
+            }
+            Err(e) => panic!("unexpected link-local socket error: {e:?}"),
+        };
+        assert!(sock.pinned.load(Ordering::Relaxed));
+
+        let UdpEndpoint::V6(bound) = sock.local_addr_udp().unwrap() else {
+            panic!("expected an IPv6 local address");
+        };
+        assert_eq!(*bound.ip(), addr);
+        assert_eq!(bound.scope_id(), index);
+
+        // The pinned socket accepts an unscoped link-local peer.
+        sock.reconnect_udp(&UdpEndpoint::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x5678),
+            1701,
+            0,
+            0,
         )))
         .unwrap();
     }
@@ -1040,6 +1230,7 @@ mod tests {
             encap: SocketEncap::Ip,
             family: SocketFamily::V4,
             scope: None,
+            pinned: AtomicBool::new(false),
         };
 
         let err = sock
@@ -1146,6 +1337,7 @@ mod tests {
             encap: SocketEncap::Udp,
             family: SocketFamily::V4,
             scope: None,
+            pinned: AtomicBool::new(false),
         };
 
         let err = sock
@@ -1171,6 +1363,7 @@ mod tests {
             encap: SocketEncap::Ip,
             family: SocketFamily::V4,
             scope: None,
+            pinned: AtomicBool::new(false),
         };
 
         let err = sock

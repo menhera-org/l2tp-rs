@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
+    ffi::OsString,
     fmt, io,
     net::{IpAddr, SocketAddr, SocketAddrV6},
     process::ExitCode,
 };
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{
+    Parser, Subcommand, ValueEnum,
+    builder::{OsStringValueParser, TypedValueParser},
+};
 use l2tp::{
     Cookie, Encapsulation, IfName, IpEndpoint, L2SpecType, L2tpHandle,
     PseudowireType, SessionConfig, SessionId, SessionInfo, SessionModify,
@@ -117,8 +121,8 @@ struct TunnelCreateArgs {
     #[arg(long)]
     remote: String,
 
-    #[arg(long)]
-    device: Option<String>,
+    #[arg(long, value_parser = OsStringValueParser::new().try_map(parse_ifname))]
+    device: Option<IfName>,
 
     /// Disable IPv4 UDP checksums; requires IPv4 endpoints (not mapped IPv6).
     #[arg(long)]
@@ -206,8 +210,14 @@ struct SessionCreateArgs {
     #[arg(long)]
     recv_timeout_ms: Option<u64>,
 
-    #[arg(long)]
-    ifname: Option<String>,
+    /// Interface name, validated with the kernel's rules while parsing.
+    #[arg(long, value_parser = OsStringValueParser::new().try_map(parse_ifname))]
+    ifname: Option<IfName>,
+}
+
+// Interface names are byte strings, so parse them from the raw argument.
+fn parse_ifname(arg: OsString) -> Result<IfName, l2tp::Error> {
+    IfName::try_from(arg.as_os_str())
 }
 
 #[derive(Parser)]
@@ -594,7 +604,6 @@ async fn session_create(
         args.peer_cookie.as_deref().unwrap_or(""),
         "peer-cookie",
     )?;
-    let ifname = args.ifname.as_deref().map(IfName::new).transpose()?;
 
     let config = SessionConfig {
         tunnel_id: TunnelId(args.tunnel_id),
@@ -608,7 +617,7 @@ async fn session_create(
         send_seq: args.send_seq,
         lns_mode: args.lns_mode,
         recv_timeout_ms: args.recv_timeout_ms,
-        ifname,
+        ifname: args.ifname,
     };
 
     let mut session = handle.create_session(config).await?;
@@ -803,6 +812,73 @@ mod tests {
             assert!(err.to_string().contains("--no-udp-csum"));
             assert!(err.to_string().contains("IPv4-mapped"));
         }
+    }
+
+    #[test]
+    fn interface_name_arguments_are_validated_while_parsing() {
+        let base = [
+            "l2tp",
+            "session",
+            "create",
+            "--tunnel-id",
+            "1",
+            "--session-id",
+            "2",
+            "--peer-session-id",
+            "3",
+            "--ifname",
+        ];
+        let err = Cli::try_parse_from(base.iter().chain(["eth:0"].iter()))
+            .err()
+            .expect("an invalid name must be rejected");
+        assert!(err.to_string().contains("invalid interface name"), "{err}");
+        let Cli {
+            cmd:
+                Cmd::Session(SessionArgs {
+                    cmd: SessionCmd::Create(args),
+                }),
+            ..
+        } = Cli::try_parse_from(base.iter().chain(["l2tpeth0"].iter()))
+            .unwrap()
+        else {
+            panic!("expected session create");
+        };
+        assert_eq!(args.ifname.unwrap().to_str(), Some("l2tpeth0"));
+
+        // Names are byte strings, so arguments need not be UTF-8.
+        let raw =
+            std::os::unix::ffi::OsStringExt::from_vec(b"eth\xff0".to_vec());
+        let argv: Vec<OsString> = base
+            .iter()
+            .map(OsString::from)
+            .chain(std::iter::once(raw))
+            .collect();
+        let Cli {
+            cmd:
+                Cmd::Session(SessionArgs {
+                    cmd: SessionCmd::Create(args),
+                }),
+            ..
+        } = Cli::try_parse_from(argv).unwrap()
+        else {
+            panic!("expected session create");
+        };
+        assert_eq!(args.ifname.unwrap().as_bytes(), b"eth\xff0");
+
+        let err = Cli::try_parse_from([
+            "l2tp",
+            "tunnel",
+            "create",
+            "--peer-tunnel-id",
+            "2",
+            "--remote",
+            "127.0.0.1:1701",
+            "--device",
+            "a b",
+        ])
+        .err()
+        .expect("an invalid device must be rejected");
+        assert!(err.to_string().contains("invalid interface name"), "{err}");
     }
 
     #[test]

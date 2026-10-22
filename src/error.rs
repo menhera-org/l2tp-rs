@@ -2,7 +2,7 @@
 
 use std::{io, net::Ipv6Addr};
 
-use crate::IfName;
+use crate::{IfName, IfNameError};
 
 /// Errors returned by this crate.
 #[derive(Debug, thiserror::Error)]
@@ -26,7 +26,7 @@ pub enum Error {
 
     /// Interface name validation failed.
     #[error("invalid interface name: {0}")]
-    InvalidIfName(String),
+    InvalidIfName(#[from] IfNameError),
 
     /// Cookie validation failed because the byte length is invalid.
     #[error("invalid cookie length {0}: must be 0, 4, or 8")]

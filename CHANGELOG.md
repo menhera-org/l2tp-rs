@@ -17,6 +17,15 @@
 - `IpEndpoint::V6` is a struct variant with an `addr` and an optional
   interface `scope`. Construct it with `IpEndpoint::v6` or
   `IpEndpoint::v6_scoped`.
+- `IfName` is a `Copy` value holding the kernel's NUL-padded
+  `[u8; IFNAMSIZ]` buffer. Names are byte strings and need not be UTF-8, so
+  `as_str` is replaced by `to_str`, `to_string_lossy` and `as_bytes`, and
+  `AsRef<str>` and `From<IfName> for String` by `AsRef<[u8]>`,
+  `AsRef<OsStr>`, `AsRef<CStr>` and `From<IfName>` for `[u8; IFNAMSIZ]`,
+  `Vec<u8>` and `OsString`.
+- `Error::InvalidIfName` carries an `IfNameError` that says why the name was
+  rejected, instead of the rejected string. Interface names appear in the
+  public API only as `IfName`.
 - `Error` is `#[non_exhaustive]`. `Error::Netlink` holds a message instead of a
   `netlink-packet-core` type. Malformed kernel replies are
   `Error::UnexpectedReply`, operations on a socket of the wrong encapsulation
@@ -67,9 +76,10 @@
   runtime was built without its I/O driver.
 - Link-local IPv6 endpoints are rejected early where the kernel cannot use
   them: `Error::ScopeRequired` for a managed socket without an interface
-  scope, and `Error::UnmanagedLinkLocal` for unmanaged tunnels, whose
-  kernel-created socket has no scope. Previously the kernel returned a bare
-  `EINVAL`.
+  scope (an `IfName` for IP endpoints, a `SocketAddrV6` scope ID or `device`
+  for UDP endpoints), and `Error::UnmanagedLinkLocal` for unmanaged tunnels,
+  whose kernel-created socket has no scope. Previously the kernel returned a
+  bare `EINVAL`.
 
 ### Added
 
@@ -80,13 +90,19 @@
   (`Error::ScopeMismatch`). `IfName::index` and `IfName::from_index` convert
   between names and indexes, for example to build `SocketAddrV6` scope IDs
   for UDP endpoints.
-- `IfName` implements `FromStr`, `TryFrom<&str>`, `TryFrom<String>`,
-  `TryFrom<&[u8]>`, `AsRef<str>`, `From<IfName> for String`, `Hash` and
-  `Ord`, and has `as_bytes`. Non-UTF-8 names remain unsupported because
-  `netlink-packet-l2tp` carries names as `String`.
+- `IfName` implements `FromStr`, `TryFrom` for `&str`, `String`, `&[u8]`,
+  `Vec<u8>`, `&OsStr`, `&CStr` and `[u8; IFNAMSIZ]`, `AsRef` for `[u8]`,
+  `OsStr` and `CStr`, `From<IfName>` for `[u8; IFNAMSIZ]`, `Vec<u8>` and
+  `OsString`, `Hash` and `Ord`, and has `as_bytes`, `as_array`, `to_str`,
+  `to_string_lossy`, `as_os_str`, `as_c_str` and `MAX_LEN`. The crate
+  exports `IFNAMSIZ`. The CLI accepts non-UTF-8 `--ifname` and `--device`
+  arguments.
+- Known limitation: `netlink-packet-l2tp` 0.3 carries `L2TP_ATTR_IFNAME` as
+  a `String`, so creating a session with a non-UTF-8 interface name fails
+  with `Error::Netlink` and a listing containing one fails to decode. The
+  next `netlink-packet-l2tp` release carries the raw bytes.
 - `IpEndpoint::v6`, `IpEndpoint::scope`, `IpEndpoint::is_link_local` and
   `UdpEndpoint::is_link_local`.
-
 - `TunnelHandle::delete` and `SessionHandle::delete`, which wait for the
   kernel's acknowledgement and keep running if the caller is cancelled.
 - `Error::kind()` and `Error::raw_os_error()`, so callers can match kernel

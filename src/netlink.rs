@@ -19,6 +19,24 @@ fn message(cmd: L2tpCmd, attributes: Vec<L2tpAttribute>) -> L2tpMessage {
     L2tpMessage { cmd, attributes }
 }
 
+// netlink-packet-l2tp 0.3 carries `L2TP_ATTR_IFNAME` as a `String`. Its next
+// release carries the kernel's `[u8; IFNAMSIZ]` instead; then these two
+// helpers become `L2tpAttribute::IfName(*name.as_array())` and
+// `IfName::try_from(*array)`, and non-UTF-8 names work end to end.
+fn ifname_attribute(name: &IfName) -> crate::Result<L2tpAttribute> {
+    let utf8 = name.to_str().ok_or_else(|| {
+        crate::Error::Netlink(format!(
+            "netlink-packet-l2tp 0.3 cannot carry the non-UTF-8 interface \
+             name {name:?}"
+        ))
+    })?;
+    L2tpAttribute::if_name(utf8).map_err(crate::Error::netlink)
+}
+
+fn ifname_from_attribute(name: &str) -> crate::Result<IfName> {
+    IfName::new(name)
+}
+
 pub(crate) fn encode_tunnel_create(
     config: &TunnelConfig,
     fd: Option<RawFd>,
@@ -153,10 +171,7 @@ pub(crate) fn encode_session_create(
         attrs.push(L2tpAttribute::RecvTimeout(timeout));
     }
     if let Some(ifname) = &config.ifname {
-        attrs.push(
-            L2tpAttribute::if_name(ifname.as_str())
-                .map_err(crate::Error::netlink)?,
-        );
+        attrs.push(ifname_attribute(ifname)?);
     }
 
     Ok(message(L2tpCmd::SessionCreate, attrs))
@@ -371,7 +386,9 @@ pub(crate) fn decode_session_info(
             L2tpAttribute::SendSeq(v) => send_seq = *v != 0,
             L2tpAttribute::LnsMode(v) => lns_mode = *v != 0,
             L2tpAttribute::RecvTimeout(v) => recv_timeout_ms = Some(*v),
-            L2tpAttribute::IfName(v) => ifname = Some(IfName::new(v.clone())?),
+            L2tpAttribute::IfName(v) => {
+                ifname = Some(ifname_from_attribute(v)?)
+            }
             L2tpAttribute::UsingIpsec(v) => using_ipsec = *v != 0,
             _ => {}
         }
@@ -749,12 +766,26 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_ifname_is_rejected_at_the_attribute_boundary() {
+        // netlink-packet-l2tp 0.3 carries names as `String`.
+        let mut cfg =
+            SessionConfig::eth(TunnelId(1), SessionId(2), SessionId(3));
+        cfg.ifname = Some(IfName::new(b"eth\xff0").unwrap());
+        assert!(matches!(
+            encode_session_create(&cfg),
+            Err(crate::Error::Netlink(message)) if message.contains("non-UTF-8")
+        ));
+        cfg.ifname = Some(IfName::new("eth0").unwrap());
+        assert_wire_round_trip(encode_session_create(&cfg).unwrap());
+    }
+
+    #[test]
     fn unmanaged_tunnels_reject_link_local_endpoints() {
         let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
         let eth0 = IfName::new("eth0").unwrap();
         let configs = [
             Encapsulation::Ip {
-                local: IpEndpoint::v6_scoped(link_local, eth0.clone()),
+                local: IpEndpoint::v6_scoped(link_local, eth0),
                 remote: IpEndpoint::v6(Ipv6Addr::LOCALHOST),
             },
             Encapsulation::Ip {
@@ -1044,7 +1075,7 @@ mod tests {
         assert!(!info.send_seq);
         assert!(info.lns_mode);
         assert_eq!(info.recv_timeout_ms, Some(3000));
-        assert_eq!(info.ifname.unwrap().as_str(), "sess0");
+        assert_eq!(info.ifname.unwrap().to_str(), Some("sess0"));
         assert!(info.using_ipsec);
     }
 
