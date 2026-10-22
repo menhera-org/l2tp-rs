@@ -19,6 +19,15 @@ pub enum Error {
     #[error("netlink error: {0}")]
     Netlink(String),
 
+    /// An interface name breaks the kernel's `dev_valid_name()` rules.
+    ///
+    /// Returned by
+    /// [`L2tpIfNameExt::from_name`](crate::L2tpIfNameExt::from_name) and by
+    /// the CLI's name arguments; the message names the rule that was
+    /// broken.
+    #[error("{0}")]
+    InvalidIfName(String),
+
     /// The kernel sent a well-formed reply that this crate cannot use.
     #[error("unexpected kernel reply: {0}")]
     UnexpectedReply(String),

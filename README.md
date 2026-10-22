@@ -298,11 +298,13 @@ NUL-padded `char ifname[IFNAMSIZ]` buffer and applies the kernel's
 `:` or whitespace. Construct one with `L2tpIfName::new`, `str::parse` or
 `TryFrom`, read it back with `as_bytes`, `as_array`, `to_str`,
 `to_string_lossy` or `Display`, and convert it with the `L2tpIfNameExt`
-extension trait: `index` and `from_index` map names to the kernel's
-interface indexes, and `as_os_str` yields an `OsStr`. Names are byte strings
-and need not be UTF-8. A rejected name is reported as `Error::Netlink`; the
-CLI validates `--ifname` and `--device` while parsing and accepts non-UTF-8
-arguments.
+extension trait: `from_name` validates a string or bytes and reports a
+rejected name as `Error::InvalidIfName`, `index` and `from_index`
+map names to the kernel's interface indexes, and `as_os_str` yields an
+`OsStr`. Names are byte strings and need not be UTF-8. The upstream
+constructors return `netlink_packet_core::DecodeError`, which converts into
+`Error::Netlink`. The CLI validates `--ifname` and `--device` while parsing
+and accepts non-UTF-8 arguments.
 
 ## Sockets
 
@@ -317,6 +319,12 @@ arguments.
 - `set_tos`, `set_hop_limit`, `set_mark`, `set_pmtu_discovery` and
   `set_ipv6_dontfrag` cover the common options of tunnel traffic;
   `bind_to_device` applies `SO_BINDTODEVICE`, which needs `CAP_NET_RAW`.
+- `disconnect` issues `connect(AF_UNSPEC)`: the kernel forgets the peer,
+  the source address it selected and `SO_BINDTODEVICE`, while an L2TP/IP
+  socket's connection ID stays bound. Bind the device again if needed, then
+  `reconnect_ip` or `reconnect_udp` to have the source address selected
+  afresh, for example after the addresses of the underlying interface
+  changed.
 - `local_addr_udp`, `peer_addr_udp`, `local_addr_ip` and `peer_addr_ip`
   report the current addresses.
 - The kernel delivers L2TP control messages on the tunnel socket.

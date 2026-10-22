@@ -15,8 +15,8 @@ use clap::{
 use futures::StreamExt;
 use l2tp::{
     Cookie, Encapsulation, IpEndpoint, L2SpecType, L2tpHandle, L2tpIfName,
-    L2tpVersion, PseudowireType, SessionConfig, SessionId, SessionInfo,
-    SessionModify, TunnelConfig, TunnelId, UdpEndpoint,
+    L2tpIfNameExt, L2tpVersion, PseudowireType, SessionConfig, SessionId,
+    SessionInfo, SessionModify, TunnelConfig, TunnelId, UdpEndpoint,
 };
 
 use crate::output::Output;
@@ -90,7 +90,7 @@ type IfNameParser = TryMapValueParser<
 
 // Interface names are byte strings, so parse them from the raw argument.
 fn parse_ifname(arg: OsString) -> Result<L2tpIfName, l2tp::Error> {
-    Ok(L2tpIfName::new(arg.as_bytes())?)
+    L2tpIfName::from_name(arg.as_bytes())
 }
 
 fn ifname_parser() -> IfNameParser {

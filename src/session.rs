@@ -319,6 +319,25 @@ mod tests {
         assert_eq!(config.cookie.to_string(), "deadbeef");
         assert_eq!(config.ifname.unwrap().to_str().unwrap(), "l2tpeth0");
         assert!(!config.recv_seq);
+
+        // Names also arrive as byte sequences, bounded by the kernel buffer.
+        let bytes: SessionConfig = serde_json::from_str(
+            r#"{"tunnel_id": 1, "session_id": 2, "peer_session_id": 3,
+                "pseudowire_type": "Eth", "ifname": [101, 116, 104, 255]}"#,
+        )
+        .unwrap();
+        assert_eq!(bytes.ifname.unwrap().as_bytes(), b"eth\xff");
+        let overlong = serde_json::from_str::<SessionConfig>(
+            r#"{"tunnel_id": 1, "session_id": 2, "peer_session_id": 3,
+                "pseudowire_type": "Eth",
+                "ifname": [97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97, 97,
+                           97, 97, 97, 97, 97]}"#,
+        )
+        .unwrap_err();
+        assert!(
+            overlong.to_string().contains("invalid length"),
+            "{overlong}"
+        );
         let modify: SessionModify =
             serde_json::from_str(r#"{"send_seq": true}"#).unwrap();
         assert_eq!(modify.send_seq, Some(true));

@@ -88,6 +88,27 @@ fn privileged_bind_to_device_on_loopback() {
     socket
         .bind_to_device(&device)
         .unwrap_or_else(|e| panic!("SO_BINDTODEVICE failed: {e}"));
+    // Disconnecting clears SO_BINDTODEVICE; binding again restores it.
+    socket
+        .disconnect()
+        .unwrap_or_else(|e| panic!("disconnect failed: {e}"));
+    assert!(socket.peer_addr_udp().is_err());
+    let unbound = TunnelSocket::from_fd(
+        socket
+            .try_clone_fd()
+            .unwrap_or_else(|e| panic!("dup failed: {e}")),
+    )
+    .unwrap_or_else(|e| panic!("from_fd failed: {e}"));
+    assert!(
+        unbound.local_addr_udp().is_ok(),
+        "the local address survives the disconnect"
+    );
+    socket
+        .bind_to_device(&device)
+        .unwrap_or_else(|e| panic!("SO_BINDTODEVICE failed again: {e}"));
+    socket
+        .reconnect_udp(&remote)
+        .unwrap_or_else(|e| panic!("reconnect failed: {e}"));
     // An adopted descriptor reads the bound device back.
     let adopted = TunnelSocket::from_fd(socket.into_fd())
         .unwrap_or_else(|e| panic!("from_fd failed: {e}"));

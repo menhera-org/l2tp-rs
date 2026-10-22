@@ -462,6 +462,38 @@ impl TunnelSocket {
         Ok(())
     }
 
+    /// Disconnects the socket from its peer with `connect(AF_UNSPEC)`.
+    ///
+    /// The kernel drops the peer address, the source address it selected and
+    /// `SO_BINDTODEVICE`, so the socket is no longer pinned to an interface.
+    /// The connection ID of an L2TP/IP socket stays bound and the tunnel keeps
+    /// receiving, but the kernel also forgets the local address, so the next
+    /// [`reconnect_ip`](Self::reconnect_ip) selects the source address afresh,
+    /// for example after the interface's addresses changed. Apply
+    /// [`bind_to_device`](Self::bind_to_device) again before reconnecting if
+    /// the socket must stay on its device. A UDP socket keeps an explicitly
+    /// bound address and port, but a port the kernel chose is replaced on
+    /// [`reconnect_udp`](Self::reconnect_udp).
+    pub fn disconnect(&self) -> crate::Result<()> {
+        // SAFETY: an all-zero sockaddr is a valid value; only its family is
+        // read for `AF_UNSPEC`, and the length passed is the struct's size.
+        let mut addr: libc::sockaddr = unsafe { std::mem::zeroed() };
+        addr.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
+        // SAFETY: `addr` is initialized, `fd` is an open socket descriptor.
+        let rc = unsafe {
+            libc::connect(
+                self.fd.as_raw_fd(),
+                &addr,
+                size_of::<libc::sockaddr>() as libc::socklen_t,
+            )
+        };
+        if rc == -1 {
+            return Err(io::Error::last_os_error().into());
+        }
+        self.pinned.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Sets `IPV6_DONTFRAG` for this socket.
     pub fn set_ipv6_dontfrag(&self, dontfrag: bool) -> crate::Result<()> {
         set_socket_bool(
@@ -1530,6 +1562,33 @@ mod tests {
         // Descriptors that are not datagram sockets are refused.
         let file: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
         assert!(TunnelSocket::from_fd(file).is_err());
+    }
+
+    #[test]
+    fn disconnect_clears_the_peer_and_allows_a_reconnect() {
+        let Some((sock, receiver)) = connected_v4_pair() else {
+            return;
+        };
+        let receiver_addr = as_v4(receiver.local_addr().unwrap());
+        assert_eq!(
+            sock.peer_addr_udp().unwrap(),
+            UdpEndpoint::V4(receiver_addr)
+        );
+        sock.pinned.store(true, Ordering::Relaxed);
+
+        sock.disconnect().unwrap();
+        assert!(!sock.pinned.load(Ordering::Relaxed));
+        let err = sock.peer_addr_udp().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN), "{err:?}");
+        // Disconnecting twice is harmless.
+        sock.disconnect().unwrap();
+
+        sock.reconnect_udp(&UdpEndpoint::V4(receiver_addr)).unwrap();
+        assert_eq!(
+            sock.peer_addr_udp().unwrap(),
+            UdpEndpoint::V4(receiver_addr)
+        );
+        assert!(!sock.pinned.load(Ordering::Relaxed));
     }
 
     #[test]

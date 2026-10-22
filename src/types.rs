@@ -264,9 +264,19 @@ mod sealed {
 ///
 /// Interface names are byte strings validated with the kernel's
 /// `dev_valid_name()` rules; see [`L2tpIfName`] for its constructors and
-/// accessors. A rejected name is reported as
-/// [`Error::Netlink`](crate::Error::Netlink).
+/// accessors. Their `netlink_packet_core::DecodeError` converts into
+/// [`Error::Netlink`](crate::Error::Netlink); [`from_name`](Self::from_name)
+/// reports a rejected name as
+/// [`Error::InvalidIfName`](crate::Error::InvalidIfName) instead.
 pub trait L2tpIfNameExt: sealed::Sealed + Sized {
+    /// Validates `name`, given as a string or bytes (for an `OsStr`, its
+    /// `as_bytes()`), with the kernel's rules.
+    ///
+    /// This is [`L2tpIfName::new`] with this crate's error type: a rejected
+    /// name is [`Error::InvalidIfName`](crate::Error::InvalidIfName), whose
+    /// message names the broken rule.
+    fn from_name(name: impl AsRef<[u8]>) -> crate::Result<Self>;
+
     /// Resolves the name to the interface's current index with
     /// `if_nametoindex(3)`.
     ///
@@ -288,6 +298,11 @@ pub trait L2tpIfNameExt: sealed::Sealed + Sized {
 }
 
 impl L2tpIfNameExt for L2tpIfName {
+    fn from_name(name: impl AsRef<[u8]>) -> crate::Result<Self> {
+        Self::new(name)
+            .map_err(|err| crate::Error::InvalidIfName(err.to_string()))
+    }
+
     fn index(&self) -> crate::Result<u32> {
         // SAFETY: the array is NUL-terminated by construction (the name is at
         // most 15 of its 16 bytes) and outlives the call.
@@ -365,8 +380,16 @@ pub(crate) mod ifname_serde {
             self,
             mut seq: A,
         ) -> Result<L2tpIfName, A::Error> {
+            // A valid name fits the kernel buffer, so stop collecting as
+            // soon as the sequence is too long for one.
             let mut bytes = Vec::with_capacity(IFNAMSIZ);
             while let Some(byte) = seq.next_element::<u8>()? {
+                if bytes.len() == IFNAMSIZ {
+                    return Err(serde::de::Error::invalid_length(
+                        bytes.len() + 1,
+                        &self,
+                    ));
+                }
                 bytes.push(byte);
             }
             L2tpIfName::new(bytes).map_err(serde::de::Error::custom)
@@ -860,6 +883,28 @@ mod tests {
         let err = crate::Error::from(err);
         assert!(matches!(err, crate::Error::Netlink(_)), "{err:?}");
         assert!(err.to_string().contains("invalid interface name"));
+    }
+
+    #[test]
+    fn from_name_reports_invalid_names_with_the_crate_error() {
+        assert_eq!(
+            L2tpIfName::from_name("eth0").unwrap(),
+            L2tpIfName::new("eth0").unwrap()
+        );
+        assert_eq!(
+            L2tpIfName::from_name(OsStr::new("eth0").as_bytes()).unwrap(),
+            L2tpIfName::new("eth0").unwrap()
+        );
+        assert_eq!(
+            L2tpIfName::from_name(b"eth\xff0".as_slice()).unwrap(),
+            L2tpIfName::new(b"eth\xff0").unwrap()
+        );
+        for invalid in ["", "this-interface-name-is-way-too-long", "eth 0"] {
+            let err = L2tpIfName::from_name(invalid).unwrap_err();
+            assert!(matches!(err, crate::Error::InvalidIfName(_)), "{err:?}");
+            assert!(err.to_string().starts_with("invalid interface name"));
+            assert!(err.raw_os_error().is_none());
+        }
     }
 
     #[test]

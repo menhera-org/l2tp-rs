@@ -9,10 +9,11 @@ these.
 
 - Interface names are `L2tpIfName` from `netlink-packet-l2tp` 0.4, which this
   crate re-exports. The crate's own `IfName` and `IfNameError` are gone;
-  `L2tpIfNameExt` adds `index`, `from_index` and `as_os_str`. Names are byte
-  strings and need not be UTF-8, including in the netlink attributes. A
-  rejected name is reported as `Error::Netlink`, into which
-  `netlink_packet_core::DecodeError` converts.
+  `L2tpIfNameExt` adds `from_name`, `index`, `from_index` and `as_os_str`.
+  Names are byte strings and need not be UTF-8, including in the netlink
+  attributes. `IfName::new(s)` becomes `L2tpIfName::from_name(s)`, which
+  reports a rejected name as `Error::InvalidIfName`, and `as_str()` becomes
+  `to_str()` (fallible) or `to_string_lossy()`.
 - `TunnelInfo::proto_version` is `TunnelInfo::version`, an `L2tpVersion`.
 - `TunnelSocket::ip` takes the peer tunnel identifier, so the kernel records
   the peer connection ID.
@@ -37,8 +38,12 @@ these.
   `open_session_by_ifname`, with auto-delete disabled.
 - Managed sockets: `TunnelSocket::for_config`, `TunnelSocket::from_fd` and
   `TunnelConfig::for_socket` for sockets prepared elsewhere; `set_tos`,
-  `set_hop_limit`, `set_mark` and `set_pmtu_discovery`; `peer_addr_udp`,
-  `local_addr_ip` and `peer_addr_ip`; `AsFd`, `try_clone_fd` and `into_fd`.
+  `set_hop_limit`, `set_mark` and `set_pmtu_discovery`; `disconnect`
+  (`connect(AF_UNSPEC)`, so a reconnect selects the source address afresh);
+  `peer_addr_udp`, `local_addr_ip` and `peer_addr_ip`; `AsFd`,
+  `try_clone_fd` and `into_fd`.
+- `L2tpIfNameExt::from_name` validates a name with this crate's error type,
+  `Error::InvalidIfName`.
 - Blocking API: `l2tp::blocking::L2tpHandle`, `TunnelHandle`,
   `SessionHandle` and `EventIter`, backed by a dedicated thread and runtime
   so they work from `tokio::task::spawn_blocking` and other runtimes.
