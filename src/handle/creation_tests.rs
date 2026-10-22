@@ -160,6 +160,23 @@ impl Harness {
         );
     }
 
+    fn tunnel_reply(&mut self, request: &Message, version: L2tpVersion) {
+        let mut message = L2tpMessage::new(L2tpCmd::TunnelGet);
+        message.attributes = vec![
+            L2tpAttribute::ConnId(101),
+            L2tpAttribute::PeerConnId(102),
+            L2tpAttribute::ProtoVersion(version.number()),
+            L2tpAttribute::EncapType(netlink_packet_l2tp::L2tpEncapType::Udp),
+            L2tpAttribute::IpSaddr(std::net::Ipv4Addr::LOCALHOST),
+            L2tpAttribute::IpDaddr(std::net::Ipv4Addr::LOCALHOST),
+            L2tpAttribute::UdpSport(1701),
+            L2tpAttribute::UdpDport(1702),
+        ];
+        let mut genl = GenlMessage::from_payload(message);
+        genl.set_resolved_family_id(1234);
+        self.reply(request, Message::from(genl));
+    }
+
     async fn session_lookup(&mut self, fail: bool) {
         let get = self.next_request(L2tpCmd::SessionGet).await;
         if fail {
@@ -395,6 +412,115 @@ async fn failed_cancelled_creates_do_not_delete_existing_resources() {
             cancelled_create(resource, before_send, libc::EEXIST).await;
         }
     }
+}
+
+#[tokio::test]
+async fn v2_session_creation_rejects_oversized_ids_before_create() {
+    for (local, peer, invalid) in [
+        (0x1_0000, 202, 0x1_0000),
+        (201, 0x1_0000, 0x1_0000),
+        (u32::MAX, u32::MAX, u32::MAX),
+    ] {
+        let mut harness = Harness::new();
+        let handle = harness.handle.clone();
+        let creation = tokio::spawn(async move {
+            handle
+                .create_session(SessionConfig::ppp(
+                    TunnelId(101),
+                    SessionId(local),
+                    SessionId(peer),
+                ))
+                .await
+        });
+        let get = harness.next_request(L2tpCmd::TunnelGet).await;
+        harness.tunnel_reply(&get, L2tpVersion::V2);
+        // No CREATE or DELETE may be sent for an invalid V2 configuration.
+        harness.assert_idle().await;
+        assert!(matches!(
+            creation.await.unwrap(),
+            Err(crate::Error::V2IdTooLarge(id)) if id == invalid
+        ));
+    }
+}
+
+#[tokio::test]
+async fn session_creation_preserves_ids_valid_for_the_parent_version() {
+    for (local, peer) in [
+        (u16::MAX as u32, u16::MAX as u32),
+        (u32::MAX, 202),
+        (201, u32::MAX),
+    ] {
+        let mut harness = Harness::new();
+        let handle = harness.handle.clone();
+        let creation = tokio::spawn(async move {
+            handle
+                .create_session(SessionConfig::ppp(
+                    TunnelId(101),
+                    SessionId(local),
+                    SessionId(peer),
+                ))
+                .await
+        });
+        // IDs that fit V2 need no extra lookup. Larger IDs require V3.
+        if local > u16::MAX as u32 || peer > u16::MAX as u32 {
+            let get = harness.next_request(L2tpCmd::TunnelGet).await;
+            harness.tunnel_reply(&get, L2tpVersion::V3);
+        }
+        let create = harness.next_request(L2tpCmd::SessionCreate).await;
+        assert!(
+            payload(&create)
+                .attributes
+                .contains(&L2tpAttribute::SessionId(local))
+        );
+        assert!(
+            payload(&create)
+                .attributes
+                .contains(&L2tpAttribute::PeerSessionId(peer))
+        );
+        harness.ack(&create, 0);
+        let get = harness.next_request(L2tpCmd::SessionGet).await;
+        let mut message = L2tpMessage::new(L2tpCmd::SessionGet);
+        message.attributes = vec![
+            L2tpAttribute::ConnId(101),
+            L2tpAttribute::PeerConnId(102),
+            L2tpAttribute::SessionId(local),
+            L2tpAttribute::PeerSessionId(peer),
+            L2tpAttribute::PwType(L2tpPwType::Ppp),
+        ];
+        let mut genl = GenlMessage::from_payload(message);
+        genl.set_resolved_family_id(1234);
+        harness.reply(&get, Message::from(genl));
+        for _ in 0..8 {
+            harness.step().await;
+        }
+        let mut session = creation.await.unwrap().unwrap();
+        assert_eq!(session.session_id(), SessionId(local));
+        session.set_auto_delete(false);
+        drop(session);
+        harness.assert_idle().await;
+    }
+}
+
+#[tokio::test]
+async fn session_creation_stops_when_parent_version_lookup_fails() {
+    let mut harness = Harness::new();
+    let handle = harness.handle.clone();
+    let creation = tokio::spawn(async move {
+        handle
+            .create_session(SessionConfig::ppp(
+                TunnelId(101),
+                SessionId(0x1_0000),
+                SessionId(202),
+            ))
+            .await
+    });
+    let get = harness.next_request(L2tpCmd::TunnelGet).await;
+    harness.ack(&get, libc::ENODEV);
+    harness.assert_idle().await;
+    assert_eq!(
+        creation.await.unwrap().unwrap_err().raw_os_error(),
+        Some(libc::ENODEV)
+    );
 }
 
 #[tokio::test]

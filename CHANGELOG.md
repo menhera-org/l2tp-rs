@@ -2,9 +2,6 @@
 
 ## 0.4.0
 
-0.3.0 was never published; its changes, listed below, ship together with
-these.
-
 ### Breaking changes
 
 - Interface names are `L2tpIfName` from `netlink-packet-l2tp` 0.4, which this
@@ -116,7 +113,7 @@ these.
   kernel sends no event for the teardown it performs itself (closed managed
   sockets, sessions of a deleted tunnel, released `PPPoL2TP` sockets).
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-10-22)
 
 ### Breaking changes
 

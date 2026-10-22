@@ -50,6 +50,9 @@ pub enum L2tpEvent {
 /// Messages that are not
 /// L2TP notifications are skipped; a notification that fails to decode is
 /// reported as an error and the stream continues.
+/// If the receive buffer overruns, an [`Error::Io`](crate::Error::Io) with
+/// OS error `ENOBUFS` reports that notifications were lost. Query current
+/// tunnel and session state to resynchronize; the stream continues afterward.
 #[derive(Debug)]
 pub struct Events {
     receiver: UnboundedReceiver<(NetlinkMessage<RawGenlMessage>, SocketAddr)>,
@@ -109,6 +112,11 @@ pub(crate) fn decode(
     message: NetlinkMessage<RawGenlMessage>,
     family_id: u16,
 ) -> crate::Result<Option<L2tpEvent>> {
+    // netlink-proto translates receive-buffer ENOBUFS into this control
+    // message, whose type is NLMSG_OVERRUN rather than the L2TP family ID.
+    if matches!(message.payload, NetlinkPayload::Overrun(_)) {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOBUFS).into());
+    }
     if message.header.message_type != family_id {
         return Ok(None);
     }
@@ -145,7 +153,8 @@ pub(crate) fn decode(
 mod tests {
     use std::net::Ipv4Addr;
 
-    use netlink_packet_core::{DoneMessage, NetlinkHeader};
+    use futures::StreamExt;
+    use netlink_packet_core::{DoneMessage, NLMSG_OVERRUN, NetlinkHeader};
     use netlink_packet_generic::GenlMessage;
     use netlink_packet_l2tp::{L2tpAttribute, L2tpEncapType, L2tpPwType};
 
@@ -233,5 +242,49 @@ mod tests {
         let foreign =
             notification(FAMILY_ID + 1, L2tpCmd::TunnelCreate, vec![]);
         assert_eq!(decode(foreign, FAMILY_ID).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn stream_reports_overruns_and_continues_with_notifications() {
+        let (sender, receiver) = futures::channel::mpsc::unbounded();
+        let connection = tokio::spawn(std::future::pending());
+        let mut events = Events::new(receiver, connection, FAMILY_ID);
+        let mut header = NetlinkHeader::default();
+        header.message_type = NLMSG_OVERRUN;
+        sender
+            .unbounded_send((
+                NetlinkMessage::new(
+                    header,
+                    NetlinkPayload::Overrun(Vec::new()),
+                ),
+                SocketAddr::new(0, 0),
+            ))
+            .unwrap();
+        sender
+            .unbounded_send((
+                notification(
+                    FAMILY_ID,
+                    L2tpCmd::TunnelCreate,
+                    vec![
+                        L2tpAttribute::ConnId(1),
+                        L2tpAttribute::PeerConnId(2),
+                        L2tpAttribute::ProtoVersion(3),
+                        L2tpAttribute::EncapType(L2tpEncapType::Ip),
+                        L2tpAttribute::IpSaddr(Ipv4Addr::LOCALHOST),
+                        L2tpAttribute::IpDaddr(Ipv4Addr::LOCALHOST),
+                    ],
+                ),
+                SocketAddr::new(0, 0),
+            ))
+            .unwrap();
+        drop(sender);
+
+        let error = events.next().await.unwrap().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS));
+        assert!(matches!(
+            events.next().await.unwrap().unwrap(),
+            L2tpEvent::TunnelCreated(info) if info.tunnel_id == TunnelId(1)
+        ));
+        assert!(events.next().await.is_none());
     }
 }

@@ -16,9 +16,9 @@ use netlink_proto::{
 };
 
 use crate::{
-    Events, L2tpIfName, NetNs, SessionConfig, SessionHandle, SessionId,
-    SessionInfo, SessionModify, SessionStats, TunnelConfig, TunnelHandle,
-    TunnelId, TunnelInfo, TunnelSocket, TunnelStats,
+    Events, L2tpIfName, L2tpVersion, NetNs, SessionConfig, SessionHandle,
+    SessionId, SessionInfo, SessionModify, SessionStats, TunnelConfig,
+    TunnelHandle, TunnelId, TunnelInfo, TunnelSocket, TunnelStats,
     netlink::{self, SessionRef},
 };
 
@@ -243,6 +243,11 @@ impl L2tpHandle {
 
     /// Creates a session in an existing tunnel.
     ///
+    /// Session identifiers above `65535` are rejected with
+    /// [`Error::V2IdTooLarge`](crate::Error::V2IdTooLarge) when the parent
+    /// tunnel uses L2TPv2. Such identifiers require a parent-tunnel lookup
+    /// before creation; L2TPv3 accepts the full 32-bit range.
+    ///
     /// Once started inside a Tokio runtime, creation continues through the
     /// kernel's acknowledgement and follow-up lookup even if the caller cancels
     /// this future. An unclaimed session is dropped with auto-delete enabled.
@@ -254,6 +259,17 @@ impl L2tpHandle {
         let message = netlink::encode_session_create(&config)?;
         let handle = self.clone();
         run_creation(async move {
+            // The kernel stores 32-bit session IDs even for V2, whose wire
+            // format truncates them to 16 bits. Only query the parent when an
+            // ID is outside the range shared by both protocol versions.
+            if let Some(id) = [config.session_id, config.peer_session_id]
+                .into_iter()
+                .find(|id| u16::try_from(id.0).is_err())
+                && handle.get_tunnel(config.tunnel_id).await?.version
+                    == L2tpVersion::V2
+            {
+                return Err(crate::Error::V2IdTooLarge(id.0));
+            }
             handle.send_ack(message).await?;
             handle.get_created_session(config).await
         })

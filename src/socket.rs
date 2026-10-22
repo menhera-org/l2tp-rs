@@ -737,7 +737,8 @@ impl TunnelSocket {
     }
 
     /// Returns the current local address of an IP socket. A link-local
-    /// address carries the socket's scope name when one is known.
+    /// address carries its current interface name, resolved in the socket's
+    /// network namespace.
     pub fn local_addr_ip(&self) -> crate::Result<IpEndpoint> {
         if self.encap != SocketEncap::Ip {
             return Err(crate::Error::EncapsulationMismatch);
@@ -795,12 +796,17 @@ impl TunnelSocket {
                 l2tp_sockaddr_in(name)?.l2tp_addr.s_addr.to_ne_bytes(),
             )),
             SocketFamily::V6 => {
-                let addr = l2tp_sockaddr_in6(name)?;
-                let addr = Ipv6Addr::from(addr.l2tp_addr.s6_addr);
+                let sa = l2tp_sockaddr_in6(name)?;
+                let addr = Ipv6Addr::from(sa.l2tp_addr.s6_addr);
                 IpEndpoint::V6 {
                     addr,
-                    scope: if addr.is_unicast_link_local() {
-                        self.scope
+                    scope: if addr.is_unicast_link_local()
+                        && sa.l2tp_scope_id != 0
+                    {
+                        Some(interface_name(
+                            self.fd.as_raw_fd(),
+                            sa.l2tp_scope_id,
+                        )?)
                     } else {
                         None
                     },
@@ -1199,6 +1205,26 @@ fn interface_index(fd: RawFd, name: &L2tpIfName) -> crate::Result<u32> {
     u32::try_from(index).map_err(|_| errno(libc::ENODEV))
 }
 
+/// Resolves an interface index in the socket's network namespace, including
+/// a scope acquired after construction through reconnect or device binding.
+fn interface_name(fd: RawFd, index: u32) -> crate::Result<L2tpIfName> {
+    // SAFETY: an all-zero `ifreq` is a valid value.
+    let mut request: libc::ifreq = unsafe { zeroed() };
+    request.ifr_ifru.ifru_ifindex =
+        i32::try_from(index).map_err(|_| errno(libc::ENODEV))?;
+    #[allow(clippy::unnecessary_cast)]
+    let code = libc::SIOCGIFNAME as libc::Ioctl;
+    // SAFETY: `request` is initialized with the index, and the ioctl writes
+    // a NUL-terminated interface name into the same struct.
+    let rc = unsafe { libc::ioctl(fd, code, &mut request) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(L2tpIfName::try_from(
+        request.ifr_name.map(|byte| byte as u8),
+    )?)
+}
+
 fn l2tp_sockaddr(
     endpoint: &IpEndpoint,
     conn_id: u32,
@@ -1293,9 +1319,14 @@ mod tests {
             return;
         };
         let lo = L2tpIfName::new("lo").unwrap();
+        let index = interface_index(fd.as_raw_fd(), &lo).unwrap();
+        assert_eq!(index, lo.index().unwrap());
+        assert_eq!(interface_name(fd.as_raw_fd(), index).unwrap(), lo);
         assert_eq!(
-            interface_index(fd.as_raw_fd(), &lo).unwrap(),
-            lo.index().unwrap()
+            interface_name(fd.as_raw_fd(), 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENODEV)
         );
         let missing = L2tpIfName::new("l2tp-no-such0").unwrap();
         let err = interface_index(fd.as_raw_fd(), &missing).unwrap_err();
@@ -1663,6 +1694,42 @@ mod tests {
         assert!(adopted.link().pinned);
         assert_eq!(adopted.conn_id(), Some(tunnel_id.0));
         assert_eq!(adopted.peer_conn_id, Some(peer_tunnel_id.0));
+    }
+
+    #[test]
+    fn reconnect_ip_preserves_a_new_link_local_scope_in_address_getters() {
+        let Some((addr, ifname)) = link_local_interface() else {
+            return;
+        };
+        let tunnel_id = TunnelId(0x4c32_5300 ^ std::process::id());
+        let peer_tunnel_id = TunnelId(tunnel_id.0 ^ 1);
+        let sock = match TunnelSocket::ip(
+            &IpEndpoint::v6(Ipv6Addr::UNSPECIFIED),
+            &IpEndpoint::v6(Ipv6Addr::LOCALHOST),
+            None,
+            tunnel_id,
+            peer_tunnel_id,
+        ) {
+            Ok(sock) => sock,
+            Err(crate::Error::Io(e)) if skippable(&e) => return,
+            Err(e) => panic!("unexpected IP socket error: {e:?}"),
+        };
+        assert_eq!(sock.scope, None);
+        sock.disconnect().unwrap();
+
+        let endpoint = IpEndpoint::v6_scoped(addr, ifname);
+        sock.reconnect_ip(&endpoint).unwrap();
+        assert_eq!(sock.local_addr_ip().unwrap(), endpoint);
+        assert_eq!(sock.peer_addr_ip().unwrap(), endpoint);
+
+        // Reconstructing the configuration must preserve the newly acquired
+        // scope, so the same endpoints can create a socket after this closes.
+        let config =
+            TunnelConfig::for_socket(tunnel_id, peer_tunnel_id, &sock).unwrap();
+        drop(sock);
+        let recreated = TunnelSocket::for_config(&config, None).unwrap();
+        assert_eq!(recreated.local_addr_ip().unwrap(), endpoint);
+        assert_eq!(recreated.peer_addr_ip().unwrap(), endpoint);
     }
 
     #[test]

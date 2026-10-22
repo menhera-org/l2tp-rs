@@ -264,28 +264,44 @@ fn privileged_events_report_tunnel_lifecycle() {
             .unwrap_or_else(|e| panic!("events failed: {e}"));
         let (config, tunnel) =
             create_unmanaged(&handle, || udp_loopback(L2tpVersion::V3)).await;
-        let created = tokio::time::timeout(Duration::from_secs(5), events.next())
-            .await
-            .expect("a creation event arrives")
-            .expect("the stream is open")
-            .expect("the event decodes");
-        assert!(matches!(
-            created,
-            L2tpEvent::TunnelCreated(info) if info.tunnel_id == config.tunnel_id()
-        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events
+                    .next()
+                    .await
+                    .expect("the stream is open")
+                    .expect("the event decodes");
+                if matches!(
+                    event,
+                    L2tpEvent::TunnelCreated(info) if info.tunnel_id == config.tunnel_id()
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a creation event for this tunnel arrives");
         tunnel
             .delete()
             .await
             .unwrap_or_else(|e| panic!("delete failed: {e}"));
-        let deleted = tokio::time::timeout(Duration::from_secs(5), events.next())
-            .await
-            .expect("a deletion event arrives")
-            .expect("the stream is open")
-            .expect("the event decodes");
-        assert!(matches!(
-            deleted,
-            L2tpEvent::TunnelDeleted(info) if info.tunnel_id == config.tunnel_id()
-        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events
+                    .next()
+                    .await
+                    .expect("the stream is open")
+                    .expect("the event decodes");
+                if matches!(
+                    event,
+                    L2tpEvent::TunnelDeleted(info) if info.tunnel_id == config.tunnel_id()
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a deletion event for this tunnel arrives");
     });
 }
 
@@ -519,16 +535,17 @@ fn privileged_cli_tunnel_survives_process_exit() {
         ])
         .output()
         .expect("run l2tp tunnel create");
+    // A failed create (including EEXIST) gives us no ownership of this ID.
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     runtime().block_on(async {
         let handle = L2tpHandle::new().await.unwrap();
         let info = handle.get_tunnel(TunnelId(id)).await;
-        // Clean up before asserting, including when creation returned an error.
+        // Clean up our tunnel before asserting that the lookup succeeded.
         let cleanup = handle.delete_tunnel(TunnelId(id)).await;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
         assert_eq!(
             info.expect("tunnel must survive CLI exit").tunnel_id,
             TunnelId(id)

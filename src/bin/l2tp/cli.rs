@@ -271,10 +271,26 @@ struct SessionRefArgs {
     ifname: Option<L2tpIfName>,
 }
 
+// Preserve the original selector in mutations: looking up IDs first can
+// target a replacement session when another controller reuses those IDs.
 #[derive(Clone, Copy)]
 enum SessionRef {
     Ids(TunnelId, SessionId),
     IfName(L2tpIfName),
+}
+
+impl fmt::Display for SessionRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ids(tunnel_id, session_id) => {
+                write!(f, "session {session_id} in tunnel {tunnel_id}")
+            }
+            Self::IfName(ifname) => {
+                // Names can contain terminal controls or invalid UTF-8.
+                write!(f, "session on interface {:?}", ifname.as_os_str())
+            }
+        }
+    }
 }
 
 impl SessionRefArgs {
@@ -486,14 +502,16 @@ async fn run_session(
     match cmd {
         SessionCmd::Create(args) => session_create(args, handle, out).await,
         SessionCmd::Delete(args) => {
-            let info = get_session(handle, args.session.resolve()?).await?;
-            handle
-                .delete_session(info.tunnel_id, info.session_id)
-                .await?;
-            out.success(&format!(
-                "deleted session {} in tunnel {}",
-                info.session_id, info.tunnel_id
-            ));
+            let session = args.session.resolve()?;
+            match session {
+                SessionRef::Ids(tunnel_id, session_id) => {
+                    handle.delete_session(tunnel_id, session_id).await?;
+                }
+                SessionRef::IfName(ifname) => {
+                    handle.delete_session_by_ifname(&ifname).await?;
+                }
+            }
+            out.success(&format!("deleted {session}"));
             Ok(())
         }
         SessionCmd::Change(args) => session_change(args, handle, out).await,
@@ -693,14 +711,15 @@ async fn session_change(
         return Ok(());
     }
 
-    let info = get_session(handle, session).await?;
-    handle
-        .modify_session(info.tunnel_id, info.session_id, modify)
-        .await?;
-    out.success(&format!(
-        "updated session {} in tunnel {}",
-        info.session_id, info.tunnel_id
-    ));
+    match session {
+        SessionRef::Ids(tunnel_id, session_id) => {
+            handle.modify_session(tunnel_id, session_id, modify).await?;
+        }
+        SessionRef::IfName(ifname) => {
+            handle.modify_session_by_ifname(&ifname, modify).await?;
+        }
+    }
+    out.success(&format!("updated {session}"));
     Ok(())
 }
 
@@ -1085,6 +1104,22 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn session_name_status_messages_escape_terminal_controls() {
+        for raw in [
+            &b"\x1b[2Jeth0"[..],
+            &b"\x1b]52;;YQ==\x07"[..],
+            &b"eth\x9b0"[..],
+            &b"eth\xff0"[..],
+        ] {
+            let session = SessionRef::IfName(L2tpIfName::new(raw).unwrap());
+            let message = format!("deleted {session}");
+            assert!(!message.chars().any(char::is_control), "{message:?}");
+            assert!(!message.contains('\u{fffd}'), "{message:?}");
+            assert!(message.contains('\\'), "{message:?}");
+        }
     }
 
     #[test]
