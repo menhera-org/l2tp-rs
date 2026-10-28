@@ -28,9 +28,17 @@ pub struct SessionConfig {
     #[cfg_attr(feature = "serde", serde(default))]
     pub l2spec_type: L2SpecType,
     /// Local session cookie. Ignored by the kernel for L2TPv2.
+    ///
+    /// 0, 4 or 8 bytes when built here; a kernel report may carry any length
+    /// up to 8 (`l2tp_netlink.c`), which this crate decodes but never sends:
+    /// creating a session with a cookie copied from a [`SessionInfo`] that
+    /// fails [`Cookie::is_rfc3931`] is refused with
+    /// [`Error::InvalidCookieLength`](crate::Error::InvalidCookieLength)
+    /// before any request is sent.
     #[cfg_attr(feature = "serde", serde(default))]
     pub cookie: Cookie,
-    /// Peer session cookie. Ignored by the kernel for L2TPv2.
+    /// Peer session cookie. Ignored by the kernel for L2TPv2. Restricted
+    /// like [`cookie`](Self::cookie).
     #[cfg_attr(feature = "serde", serde(default))]
     pub peer_cookie: Cookie,
     /// Enable receive sequence checking.
@@ -137,8 +145,14 @@ pub struct SessionInfo {
     /// given at creation cannot be read back.
     pub l2spec_type: Option<L2SpecType>,
     /// Local session cookie; empty when none is set.
+    ///
+    /// 0, 4 or 8 bytes when built here; a kernel report may carry any length
+    /// up to 8 (`l2tp_netlink.c`), which this crate decodes but never sends.
+    /// [`Cookie::is_rfc3931`] tells a session created elsewhere with another
+    /// length.
     pub cookie: Cookie,
-    /// Peer session cookie; empty when none is set.
+    /// Peer session cookie; empty when none is set. Reported like
+    /// [`cookie`](Self::cookie).
     pub peer_cookie: Cookie,
     /// Receive sequence checking state.
     pub recv_seq: bool,

@@ -18,16 +18,14 @@ use netlink_proto::{
     Connection,
     sys::{AsyncSocket, SocketAddr},
 };
-use netlink_sys::{Socket, protocols::NETLINK_GENERIC};
-use tokio::io::unix::AsyncFd;
 
 use crate::{
-    BoundedEvents, Events, L2tpIfName, L2tpIfNameExt, L2tpVersion, NetNs,
-    PseudowireType, SessionConfig, SessionHandle, SessionId, SessionInfo,
-    SessionModify, SessionStats, TunnelConfig, TunnelHandle, TunnelId,
-    TunnelInfo, TunnelSocket, TunnelStats,
+    BoundedEvents, EventSocket, Events, L2tpIfName, L2tpIfNameExt, L2tpVersion,
+    NetNs, PseudowireType, SessionConfig, SessionHandle, SessionId,
+    SessionInfo, SessionModify, SessionStats, TunnelConfig, TunnelHandle,
+    TunnelId, TunnelInfo, TunnelSocket, TunnelStats,
     link::LinkMonitor,
-    netlink::{self, SessionRef},
+    netlink::{self, KernelMessage, SessionRef},
     netns::Owner,
 };
 
@@ -797,39 +795,28 @@ impl L2tpHandle {
     ///
     /// No task is spawned; the stream must be polled inside a Tokio runtime
     /// with I/O enabled, and creating it outside one fails with
-    /// [`Error::Io`](crate::Error::Io).
+    /// [`Error::Io`](crate::Error::Io). It is
+    /// [`event_socket`](Self::event_socket) registered with
+    /// [`BoundedEvents::from_socket`].
     pub async fn events_bounded(&self) -> crate::Result<BoundedEvents> {
-        tokio::runtime::Handle::try_current().map_err(|_| {
-            io::Error::other("tokio runtime is required for events")
-        })?;
-        let (socket, family_id) = self.event_socket().await?;
-        socket.set_non_blocking(true)?;
-        // `AsyncFd` panics instead of failing without an I/O driver. `new`
-        // is deprecated for wrappers that do not own their descriptor, but
-        // `Socket` does, and `register` would require tokio 1.53.
-        #[allow(deprecated)]
-        let socket = std::panic::catch_unwind(move || AsyncFd::new(socket))
-            .map_err(|_| {
-            io::Error::other(
-                "tokio runtime with I/O enabled is required for events",
-            )
-        })??;
-        Ok(BoundedEvents::new(socket, family_id))
+        BoundedEvents::from_socket(self.event_socket().await?)
     }
 
-    /// A blocking socket in the handle's original namespace, subscribed to
-    /// the L2TP notifications, and the family identifier to decode them.
-    pub(crate) async fn event_socket(&self) -> crate::Result<(Socket, u16)> {
+    /// Opens an [`EventSocket`] in the handle's original namespace: the
+    /// socket of [`events_bounded`](Self::events_bounded), not yet
+    /// registered with any runtime, so it can be read with
+    /// [`EventSocket::try_next`] or handed to an event loop on another
+    /// thread.
+    ///
+    /// Opening it from another namespace requires permission to enter the
+    /// handle's original namespace. The subscription is bound to the family
+    /// and group identifiers of the loaded `l2tp_netlink` module; if the
+    /// module is reloaded, open a new one.
+    pub async fn event_socket(&self) -> crate::Result<EventSocket> {
         let (family_id, group) = self.events_family().await?;
-        let socket =
-            self.inner.netns.run_in(move || -> io::Result<Socket> {
-                let mut socket = Socket::new(NETLINK_GENERIC)?;
-                // Bound for the same reason as in `events`.
-                socket.bind_auto()?;
-                socket.add_membership(group)?;
-                Ok(socket)
-            })??;
-        Ok((socket, family_id))
+        self.inner
+            .netns
+            .run_in(move || EventSocket::new(family_id, group))?
     }
 
     /// The family identifier and its notification group.
@@ -908,7 +895,9 @@ impl L2tpHandle {
     ) -> crate::Result<Vec<GenlMessage<L2tpMessage>>> {
         let cmd = payload.cmd;
         log::debug!("l2tp: sending {cmd:?} with flags {flags:#06x}");
-        let mut genl = GenlMessage::from_payload(payload);
+        // Replies are parsed as `KernelMessage`, which keeps cookies of
+        // lengths `netlink-packet-l2tp` would refuse.
+        let mut genl = GenlMessage::from_payload(KernelMessage(payload));
         genl.set_resolved_family_id(family_id);
 
         let mut request = NetlinkMessage::from(genl);
@@ -921,7 +910,17 @@ impl L2tpHandle {
         match collect_responses(&mut stream, flags).await {
             Ok(replies) => {
                 log::trace!("l2tp: {cmd:?} returned {} replies", replies.len());
-                Ok(replies)
+                Ok(replies
+                    .into_iter()
+                    .map(|reply| {
+                        let family_id = reply.family_id();
+                        GenlMessage::new(
+                            reply.header,
+                            reply.payload.0,
+                            family_id,
+                        )
+                    })
+                    .collect())
             }
             Err(err) => {
                 log::debug!("l2tp: {cmd:?} failed: {err}");
@@ -931,14 +930,14 @@ impl L2tpHandle {
     }
 }
 
-async fn collect_responses<S>(
+async fn collect_responses<S, F>(
     stream: S,
     flags: u16,
-) -> crate::Result<Vec<GenlMessage<L2tpMessage>>>
+) -> crate::Result<Vec<GenlMessage<F>>>
 where
     S: Stream<
         Item = Result<
-            NetlinkMessage<GenlMessage<L2tpMessage>>,
+            NetlinkMessage<GenlMessage<F>>,
             netlink_packet_core::DecodeError,
         >,
     >,
@@ -1384,6 +1383,14 @@ mod tests {
                 futures::poll!(events.next()),
                 std::task::Poll::Ready(None | Some(Err(_)))
             )),
+            Err(crate::Error::FamilyResolution(_)) => {}
+            Err(err) => panic!("unexpected error: {err:?}"),
+        }
+        match handle.event_socket().await {
+            // Reading neither blocks nor fails, as above.
+            Ok(mut socket) => {
+                assert!(!matches!(socket.try_next(), Some(Err(_))));
+            }
             Err(crate::Error::FamilyResolution(_)) => {}
             Err(err) => panic!("unexpected error: {err:?}"),
         }

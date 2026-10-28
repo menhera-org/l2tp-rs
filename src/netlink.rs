@@ -2,6 +2,11 @@
 
 use std::os::fd::RawFd;
 
+use netlink_packet_core::{
+    DecodeError, Emitable, ErrorContext, NLA_TYPE_MASK, NlasIterator,
+    Parseable, ParseableParametrized,
+};
+use netlink_packet_generic::{GenlFamily, GenlHeader};
 use netlink_packet_l2tp::{
     L2tpAttribute, L2tpCmd, L2tpEncapType, L2tpMessage, L2tpPwType,
     L2tpStatsAttribute,
@@ -39,6 +44,68 @@ impl SessionRef {
 // here.
 fn message(cmd: L2tpCmd, attributes: Vec<L2tpAttribute>) -> L2tpMessage {
     L2tpMessage { cmd, attributes }
+}
+
+const L2TP_ATTR_COOKIE: u16 = 15;
+const L2TP_ATTR_PEER_COOKIE: u16 = 16;
+
+/// An [`L2tpMessage`] parsed as the kernel may send it.
+///
+/// `netlink-packet-l2tp` parses cookies of 0, 4 or 8 bytes only, which would
+/// fail a whole reply or dump on a session created elsewhere with another
+/// length; the kernel stores and reports any length up to 8
+/// (`l2tp_netlink.c`). This parser keeps such a cookie as reported. Replies
+/// are never emitted again, so the unchecked attribute goes nowhere but
+/// [`decode_session_info`].
+#[derive(Debug, Clone)]
+pub(crate) struct KernelMessage(pub(crate) L2tpMessage);
+
+impl GenlFamily for KernelMessage {
+    fn family_name() -> &'static str {
+        L2tpMessage::family_name()
+    }
+
+    fn version(&self) -> u8 {
+        self.0.version()
+    }
+
+    fn command(&self) -> u8 {
+        self.0.command()
+    }
+}
+
+impl Emitable for KernelMessage {
+    fn buffer_len(&self) -> usize {
+        self.0.buffer_len()
+    }
+
+    fn emit(&self, buffer: &mut [u8]) {
+        self.0.emit(buffer)
+    }
+}
+
+impl ParseableParametrized<[u8], GenlHeader> for KernelMessage {
+    fn parse_with_param(
+        buf: &[u8],
+        header: GenlHeader,
+    ) -> Result<Self, DecodeError> {
+        let mut attributes = Vec::new();
+        for nla in NlasIterator::new(buf) {
+            let nla = nla.context("failed to parse l2tp netlink attributes")?;
+            let value = nla.value();
+            let attribute = match nla.kind() & NLA_TYPE_MASK {
+                L2TP_ATTR_COOKIE if value.len() <= 8 => {
+                    L2tpAttribute::Cookie(value.to_vec())
+                }
+                L2TP_ATTR_PEER_COOKIE if value.len() <= 8 => {
+                    L2tpAttribute::PeerCookie(value.to_vec())
+                }
+                _ => L2tpAttribute::parse(&nla)?,
+            };
+            attributes.push(attribute);
+        }
+        Ok(Self(message(header.cmd.into(), attributes)))
+    }
 }
 
 pub(crate) fn encode_tunnel_create(
@@ -163,6 +230,13 @@ pub(crate) fn encode_tunnel_get_dump() -> L2tpMessage {
 pub(crate) fn encode_session_create(
     config: &SessionConfig,
 ) -> crate::Result<L2tpMessage> {
+    // Only a cookie copied from a kernel report can break RFC 3931; never
+    // send one back.
+    for cookie in [config.cookie, config.peer_cookie] {
+        if !cookie.is_rfc3931() {
+            return Err(crate::Error::InvalidCookieLength(cookie.len()));
+        }
+    }
     let mut attrs = vec![
         L2tpAttribute::ConnId(config.tunnel_id.0),
         L2tpAttribute::SessionId(config.session_id.0),
@@ -384,11 +458,10 @@ pub(crate) fn decode_session_info(
             L2tpAttribute::L2SpecType(v) => {
                 l2spec_type = Some(from_l2tp_l2spec(*v))
             }
-            L2tpAttribute::Cookie(v) => {
-                cookie = Cookie::try_from(v.as_slice())?
-            }
+            // A session created elsewhere may carry any length up to 8.
+            L2tpAttribute::Cookie(v) => cookie = Cookie::from_kernel(v)?,
             L2tpAttribute::PeerCookie(v) => {
-                peer_cookie = Cookie::try_from(v.as_slice())?
+                peer_cookie = Cookie::from_kernel(v)?
             }
             L2tpAttribute::RecvSeq(v) => recv_seq = *v != 0,
             L2tpAttribute::SendSeq(v) => send_seq = *v != 0,
@@ -1152,6 +1225,86 @@ mod tests {
         assert_eq!(info.recv_timeout_ms, Some(3000));
         assert_eq!(info.ifname.unwrap().to_str().unwrap(), "sess0");
         assert!(info.using_ipsec);
+    }
+
+    #[test]
+    fn decode_session_info_accepts_any_cookie_length_the_kernel_holds() {
+        for len in [1, 2, 7] {
+            let bytes: Vec<u8> = (1..=len).collect();
+            let attrs = vec![
+                L2tpAttribute::ConnId(7),
+                L2tpAttribute::PeerConnId(70),
+                L2tpAttribute::SessionId(8),
+                L2tpAttribute::PeerSessionId(9),
+                L2tpAttribute::PwType(L2tpPwType::Eth),
+                L2tpAttribute::Cookie(bytes.clone()),
+                L2tpAttribute::PeerCookie(bytes.clone()),
+            ];
+            let info = decode_session_info(&attrs).unwrap();
+            assert_eq!(info.cookie.as_bytes(), bytes.as_slice());
+            assert_eq!(info.peer_cookie.as_bytes(), bytes.as_slice());
+            assert!(!info.cookie.is_rfc3931());
+
+            // Re-creating the session from the report is refused before
+            // anything is encoded.
+            let mut cfg =
+                SessionConfig::eth(TunnelId(7), SessionId(8), SessionId(9));
+            cfg.cookie = info.cookie;
+            assert!(matches!(
+                encode_session_create(&cfg),
+                Err(crate::Error::InvalidCookieLength(n)) if n == bytes.len()
+            ));
+            cfg.cookie = Cookie::none();
+            cfg.peer_cookie = info.peer_cookie;
+            assert!(matches!(
+                encode_session_create(&cfg),
+                Err(crate::Error::InvalidCookieLength(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn kernel_replies_keep_cookies_upstream_parsing_refuses() {
+        use netlink_packet_core::{NLA_HEADER_SIZE, emit_u16};
+
+        // Emitting checks cookie lengths, so these are written by hand.
+        fn nla(kind: u16, value: &[u8]) -> Vec<u8> {
+            let mut raw = vec![0; NLA_HEADER_SIZE];
+            emit_u16(&mut raw[..2], (NLA_HEADER_SIZE + value.len()) as u16)
+                .unwrap();
+            emit_u16(&mut raw[2..], kind).unwrap();
+            raw.extend_from_slice(value);
+            raw.resize(raw.len().next_multiple_of(4), 0);
+            raw
+        }
+        let session_id = [L2tpAttribute::SessionId(8)];
+        let mut session_id_nla = vec![0; session_id.as_slice().buffer_len()];
+        session_id.as_slice().emit(&mut session_id_nla);
+        let header = GenlHeader { cmd: 8, version: 1 };
+
+        for len in [1, 2, 7] {
+            let cookie: Vec<u8> = (1..=len).collect();
+            let buf = [
+                nla(L2TP_ATTR_COOKIE, &cookie),
+                session_id_nla.clone(),
+                nla(L2TP_ATTR_PEER_COOKIE, &cookie),
+            ]
+            .concat();
+            assert!(L2tpMessage::parse_with_param(&buf, header).is_err());
+            let parsed = KernelMessage::parse_with_param(&buf, header).unwrap();
+            assert_eq!(parsed.0.cmd, L2tpCmd::SessionGet);
+            assert_eq!(
+                parsed.0.attributes,
+                [
+                    L2tpAttribute::Cookie(cookie.clone()),
+                    L2tpAttribute::SessionId(8),
+                    L2tpAttribute::PeerCookie(cookie.clone()),
+                ]
+            );
+        }
+        // Beyond the kernel's own limit the upstream error stands.
+        let buf = nla(L2TP_ATTR_COOKIE, &[0; 9]);
+        assert!(KernelMessage::parse_with_param(&buf, header).is_err());
     }
 
     #[test]

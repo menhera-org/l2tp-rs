@@ -12,12 +12,21 @@ use std::{
 };
 
 use futures::StreamExt;
+use genetlink::message::RawGenlMessage;
 use l2tp::{
-    Cookie, Encapsulation, IpEndpoint, L2SpecType, L2tpEvent, L2tpHandle,
-    L2tpIfName, L2tpIfNameExt, L2tpVersion, NetNs, PppSocket, PppUnit,
-    PseudowireType, SessionConfig, SessionHandle, SessionId, SessionModify,
-    TunnelConfig, TunnelHandle, TunnelId, TunnelSocket, UdpEndpoint, blocking,
+    Cookie, Encapsulation, EventSocket, IpEndpoint, L2SpecType, L2tpEvent,
+    L2tpHandle, L2tpIfName, L2tpIfNameExt, L2tpVersion, NetNs, PppSocket,
+    PppUnit, PseudowireType, SessionConfig, SessionHandle, SessionId,
+    SessionModify, TunnelConfig, TunnelHandle, TunnelId, TunnelSocket,
+    UdpEndpoint, blocking,
 };
+use netlink_packet_core::{
+    Emitable, NLM_F_ACK, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage,
+    NetlinkPayload,
+};
+use netlink_packet_generic::GenlHeader;
+use netlink_packet_l2tp::{L2tpAttribute, L2tpMessage, L2tpPwType};
+use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_GENERIC};
 
 static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -67,6 +76,19 @@ fn udp_loopback(version: L2tpVersion) -> TunnelConfig {
     )
     .unwrap_or_else(|e| panic!("TunnelConfig::new failed: {e}"))
     .with_version(version)
+}
+
+fn ip_loopback() -> TunnelConfig {
+    let base = next_id_base();
+    TunnelConfig::new(
+        TunnelId(base),
+        TunnelId(base.wrapping_add(1)),
+        Encapsulation::Ip {
+            local: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+            remote: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+        },
+    )
+    .unwrap_or_else(|e| panic!("TunnelConfig::new failed: {e}"))
 }
 
 /// Creates an unmanaged tunnel, retrying the random identifiers on EEXIST.
@@ -166,19 +188,7 @@ fn privileged_session_lifecycle_over_genl() {
         let handle = L2tpHandle::new()
             .await
             .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
-        let (config, mut tunnel) = create_unmanaged(&handle, || {
-            let base = next_id_base();
-            TunnelConfig::new(
-                TunnelId(base),
-                TunnelId(base.wrapping_add(1)),
-                Encapsulation::Ip {
-                    local: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
-                    remote: IpEndpoint::V4(Ipv4Addr::LOCALHOST),
-                },
-            )
-            .unwrap_or_else(|e| panic!("TunnelConfig::new failed: {e}"))
-        })
-        .await;
+        let (config, mut tunnel) = create_unmanaged(&handle, ip_loopback).await;
         tunnel.set_auto_delete(false);
         let tunnel_id = config.tunnel_id();
         let session_id = SessionId(tunnel_id.0.wrapping_add(2));
@@ -388,6 +398,186 @@ fn privileged_bounded_events_report_overflow_and_continue() {
         .await
         .expect("events arrive after the overflow");
     });
+}
+
+/// Resolves the `l2tp` family and its notification group without this crate,
+/// as a caller with its own netlink code would.
+async fn resolve_l2tp_family() -> (u16, u32) {
+    let (connection, genl, _) = genetlink::new_connection()
+        .unwrap_or_else(|e| panic!("genetlink connection failed: {e}"));
+    tokio::spawn(connection);
+    let family = genl
+        .resolve_family::<L2tpMessage>()
+        .await
+        .unwrap_or_else(|e| panic!("resolve_family failed: {e}"));
+    (family.id, family.multicast_groups["l2tp"])
+}
+
+/// Sends `SESSION_CREATE` with a cookie of any length, as another program
+/// could. This crate refuses non-RFC lengths, `netlink-packet-l2tp` will not
+/// emit them and iproute2 takes 8 or 16 hexadecimal digits only, so the
+/// attribute is written by hand.
+fn create_foreign_session(
+    family_id: u16,
+    attributes: &[L2tpAttribute],
+    cookie: &[u8],
+) {
+    let mut payload = vec![0; attributes.buffer_len()];
+    attributes.emit(&mut payload);
+    // L2TP_ATTR_COOKIE: length, type, value, padding.
+    payload.extend_from_slice(&((4 + cookie.len()) as u16).to_ne_bytes());
+    payload.extend_from_slice(&15u16.to_ne_bytes());
+    payload.extend_from_slice(cookie);
+    payload.resize(payload.len().next_multiple_of(4), 0);
+
+    // L2TP_CMD_SESSION_CREATE, version 1.
+    let raw = RawGenlMessage::new(
+        GenlHeader { cmd: 5, version: 1 },
+        payload,
+        family_id,
+    );
+    let mut request = NetlinkMessage::new(
+        NetlinkHeader::default(),
+        NetlinkPayload::InnerMessage(raw),
+    );
+    request.header.flags = NLM_F_REQUEST | NLM_F_ACK;
+    request.finalize();
+    let mut buf = vec![0; request.buffer_len()];
+    request.serialize(&mut buf);
+
+    let socket = Socket::new(NETLINK_GENERIC)
+        .unwrap_or_else(|e| panic!("netlink socket failed: {e}"));
+    socket
+        .send_to(&buf, &SocketAddr::new(0, 0), 0)
+        .unwrap_or_else(|e| panic!("SESSION_CREATE send failed: {e}"));
+    let (reply, _) = socket
+        .recv_from_full()
+        .unwrap_or_else(|e| panic!("SESSION_CREATE reply failed: {e}"));
+    let reply = NetlinkMessage::<RawGenlMessage>::deserialize(&reply)
+        .unwrap_or_else(|e| panic!("undecodable reply: {e}"));
+    match reply.payload {
+        NetlinkPayload::Error(err) => {
+            assert!(err.code.is_none(), "SESSION_CREATE failed: {err}")
+        }
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp_eth support"]
+fn privileged_foreign_odd_length_cookies_are_reported_never_sent() {
+    runtime().block_on(async {
+        let handle = L2tpHandle::new()
+            .await
+            .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
+        let (config, _tunnel) = create_unmanaged(&handle, ip_loopback).await;
+        let tunnel_id = config.tunnel_id();
+        let session_id = SessionId(tunnel_id.0.wrapping_add(2));
+        let peer_session_id = SessionId(tunnel_id.0.wrapping_add(3));
+        let (family_id, _) = resolve_l2tp_family().await;
+        create_foreign_session(
+            family_id,
+            &[
+                L2tpAttribute::ConnId(tunnel_id.0),
+                L2tpAttribute::SessionId(session_id.0),
+                L2tpAttribute::PeerSessionId(peer_session_id.0),
+                L2tpAttribute::PwType(L2tpPwType::Eth),
+            ],
+            &[1, 2],
+        );
+
+        let info = handle
+            .get_session(tunnel_id, session_id)
+            .await
+            .unwrap_or_else(|e| panic!("get_session failed: {e}"));
+        assert_eq!(info.cookie.as_bytes(), &[1, 2]);
+        assert!(!info.cookie.is_rfc3931());
+        let listed = handle
+            .list_sessions(tunnel_id)
+            .await
+            .unwrap_or_else(|e| panic!("list_sessions failed: {e}"));
+        assert!(
+            listed
+                .iter()
+                .any(|s| s.session_id == session_id && s.cookie == info.cookie)
+        );
+        handle
+            .list_all_sessions()
+            .await
+            .unwrap_or_else(|e| panic!("list_all_sessions failed: {e}"));
+
+        // Re-creating it from the report is refused before any request.
+        let mut again = SessionConfig::eth(
+            tunnel_id,
+            SessionId(tunnel_id.0.wrapping_add(4)),
+            peer_session_id,
+        );
+        again.cookie = info.cookie;
+        assert!(matches!(
+            handle.create_session(again).await,
+            Err(l2tp::Error::InvalidCookieLength(2))
+        ));
+        handle
+            .delete_session(tunnel_id, session_id)
+            .await
+            .unwrap_or_else(|e| panic!("delete_session failed: {e}"));
+    });
+}
+
+#[test]
+#[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp_eth support"]
+fn privileged_event_socket_reads_without_a_runtime() {
+    let rt = runtime();
+    let (family_id, group_id) = rt.block_on(resolve_l2tp_family());
+    let mut socket = EventSocket::new(family_id, group_id)
+        .unwrap_or_else(|e| panic!("EventSocket::new failed: {e}"));
+    // Nothing happened yet in this namespace.
+    while let Some(item) = socket.try_next() {
+        item.unwrap_or_else(|e| panic!("a queued notification failed: {e}"));
+    }
+
+    let session_id = rt.block_on(async {
+        let handle = L2tpHandle::new()
+            .await
+            .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
+        let (config, _tunnel) = create_unmanaged(&handle, ip_loopback).await;
+        let tunnel_id = config.tunnel_id();
+        let session_id = SessionId(tunnel_id.0.wrapping_add(2));
+        handle
+            .create_session(SessionConfig::eth(
+                tunnel_id,
+                session_id,
+                SessionId(tunnel_id.0.wrapping_add(3)),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("create_session failed: {e}"))
+            .delete()
+            .await
+            .unwrap_or_else(|e| panic!("delete failed: {e}"));
+        session_id
+    });
+
+    // Read from this thread, outside the runtime, without blocking.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match socket.try_next() {
+            Some(Ok(L2tpEvent::SessionDeleted(info)))
+                if info.session_id == session_id =>
+            {
+                break;
+            }
+            Some(item) => {
+                item.unwrap_or_else(|e| panic!("notification failed: {e}"));
+            }
+            None => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the deletion is announced"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 /// A PPP session on a fresh unmanaged tunnel, with the `PPPoL2TP` socket

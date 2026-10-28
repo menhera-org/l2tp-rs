@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.4.4 (2026-10-28)
+
+### Added
+
+- `TunnelSocket::tunnel_id` and `TunnelSocket::peer_tunnel_id` report the
+  connection IDs of an L2TP/IP socket, `None` for UDP. For an adopted socket
+  `tunnel_id` is what the kernel reported through `getsockname`;
+  `peer_tunnel_id` is `None` for an adopted IPv4 L2TP/IP socket until
+  `from_fd_with_peer` supplies it. Neither makes a syscall.
+- `EventSocket`, a non-blocking socket joined to the `l2tp` multicast group
+  that needs no runtime. It can be used from any thread and registered with
+  an event loop wherever the caller likes. `try_next` returns what can be
+  read without blocking, with the guarantees of `BoundedEvents`.
+  `EventSocket::new` opens one from a family and group ID resolved without
+  a handle; `L2tpHandle::event_socket` and `blocking::L2tpHandle::event_socket`
+  open one in the handle's namespace.
+- `BoundedEvents::from_socket` registers an `EventSocket` with the current
+  Tokio runtime. `events_bounded` and `blocking::BoundedEventIter` are built
+  on `EventSocket`, unchanged in behaviour.
+- `Cookie::is_rfc3931` tells whether a cookie is 0, 4 or 8 bytes long.
+
+### Changed
+
+- Session queries, dumps and events no longer fail on a session created
+  elsewhere with a cookie of a length other than 0, 4 or 8 bytes. The
+  kernel accepts any length up to 8, and such a cookie is now reported as
+  it is in `SessionInfo`. Replies are parsed with lengths
+  `netlink-packet-l2tp` 0.4.0 refuses.
+- Session creation refuses a cookie that is not 0, 4 or 8 bytes with
+  `Error::InvalidCookieLength` before any request is sent. Before this, no
+  constructor could produce one; the check guards cookies copied from a
+  `SessionInfo`. Every public way of building a `Cookie`, including
+  deserialization, still accepts 0, 4 or 8 bytes only.
+
 ## 0.4.3 (2026-10-28)
 
 ### Added

@@ -3,7 +3,8 @@
 use std::{
     collections::VecDeque,
     io,
-    os::fd::{AsFd, BorrowedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd},
+    panic::AssertUnwindSafe,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -11,8 +12,8 @@ use std::{
 use futures::{Stream, channel::mpsc::UnboundedReceiver};
 use genetlink::message::RawGenlMessage;
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
-use netlink_packet_l2tp::{L2tpCmd, L2tpMessage};
-use netlink_sys::{Socket, SocketAddr};
+use netlink_packet_l2tp::L2tpCmd;
+use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_GENERIC};
 use tokio::io::unix::AsyncFd;
 
 use crate::{SessionInfo, TunnelInfo, netlink};
@@ -139,18 +140,40 @@ impl Drop for Events {
 /// notifications from the kernel are skipped, and a notification that fails
 /// to decode is reported as an error. Dropping the stream leaves the
 /// multicast group.
+///
+/// It reads an [`EventSocket`]; [`from_socket`](Self::from_socket) builds
+/// one from a socket opened elsewhere.
 #[derive(Debug)]
 pub struct BoundedEvents {
-    socket: AsyncFd<Socket>,
-    pending: Pending,
+    socket: AsyncFd<EventSocket>,
 }
 
 impl BoundedEvents {
-    pub(crate) fn new(socket: AsyncFd<Socket>, family_id: u16) -> Self {
-        Self {
-            socket,
-            pending: Pending::new(family_id),
-        }
+    /// Registers `socket` with the current Tokio runtime's reactor.
+    ///
+    /// Fails with [`Error::Io`](crate::Error::Io) outside a Tokio runtime
+    /// or in one without I/O enabled, as
+    /// [`L2tpHandle::events_bounded`](crate::L2tpHandle::events_bounded)
+    /// does; the socket is closed with the error. The stream must be polled
+    /// on that runtime.
+    pub fn from_socket(socket: EventSocket) -> crate::Result<Self> {
+        tokio::runtime::Handle::try_current().map_err(|_| {
+            io::Error::other("tokio runtime is required for events")
+        })?;
+        // `AsyncFd` panics instead of failing without an I/O driver. `new`
+        // is deprecated for wrappers that do not own their descriptor, but
+        // `EventSocket` does, and `register` would require tokio 1.53. The
+        // socket is dropped by the panic, so no broken state is observed.
+        #[allow(deprecated)]
+        let socket = std::panic::catch_unwind(AssertUnwindSafe(move || {
+            AsyncFd::new(socket)
+        }))
+        .map_err(|_| {
+            io::Error::other(
+                "tokio runtime with I/O enabled is required for events",
+            )
+        })??;
+        Ok(Self { socket })
     }
 }
 
@@ -163,20 +186,28 @@ impl Stream for BoundedEvents {
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
-            if let Some(item) = this.pending.next() {
+            // The rest of a datagram is returned without waiting for
+            // readiness.
+            if let Some(item) = this.socket.get_mut().pending.next() {
                 return Poll::Ready(Some(item));
             }
-            let mut guard = match this.socket.poll_read_ready(cx) {
+            let mut guard = match this.socket.poll_read_ready_mut(cx) {
                 Poll::Ready(Ok(guard)) => guard,
                 Poll::Ready(Err(err)) => {
                     return Poll::Ready(Some(Err(err.into())));
                 }
                 Poll::Pending => return Poll::Pending,
             };
-            if let Ok(received) =
-                guard.try_io(|socket| socket.get_ref().recv_from_full())
-            {
-                this.pending.receive(received);
+            // A `WouldBlock` clears the readiness, so the next poll waits.
+            if let Ok(item) = guard.try_io(|socket| {
+                socket
+                    .get_mut()
+                    .try_next()
+                    .ok_or_else(|| io::ErrorKind::WouldBlock.into())
+            }) {
+                return Poll::Ready(Some(
+                    item.unwrap_or_else(|e| Err(e.into())),
+                ));
             }
         }
     }
@@ -185,6 +216,104 @@ impl Stream for BoundedEvents {
 impl AsFd for BoundedEvents {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.socket.get_ref().as_fd()
+    }
+}
+
+/// A non-blocking socket joined to the `l2tp` multicast group, with no task
+/// and no queue: notifications wait in its receive buffer, which `SO_RCVBUF`
+/// or `SO_RCVBUFFORCE` on [`as_fd`](AsFd::as_fd) sizes, until
+/// [`try_next`](Self::try_next) reads them.
+///
+/// It needs no runtime, can be moved to and used from any thread, and is
+/// registered with an event loop where and when the caller likes, for
+/// example with [`BoundedEvents::from_socket`] or by polling its descriptor
+/// for readability. Open one with
+/// [`L2tpHandle::event_socket`](crate::L2tpHandle::event_socket),
+/// [`blocking::L2tpHandle::event_socket`](crate::blocking::L2tpHandle::event_socket),
+/// or [`new`](Self::new) from identifiers resolved without a handle.
+///
+/// It keeps the guarantees of [`BoundedEvents`]:
+/// - only messages the kernel sent are decoded, as told by the sender address
+///   `recvmsg` reports, never by the forgeable header port;
+/// - `NETLINK_NO_ENOBUFS` is never set, so a full receive buffer is reported as
+///   an [`Error::Io`](crate::Error::Io) with OS error `ENOBUFS`, ahead of the
+///   notifications still queued, and the subscription continues;
+/// - dropping the socket leaves the multicast group;
+/// - notifications are advisory and may describe another network namespace; see
+///   [`L2tpEvent`].
+#[derive(Debug)]
+pub struct EventSocket {
+    socket: Socket,
+    pending: Pending,
+}
+
+impl EventSocket {
+    /// Opens a socket in the calling thread's network namespace and joins
+    /// it to the multicast group `group_id` of the generic-netlink family
+    /// `family_id`, the `l2tp` family and its `l2tp` group as resolved by
+    /// the caller (`CTRL_CMD_GETFAMILY`). No request is sent. Joining needs
+    /// no privilege.
+    ///
+    /// The identifiers belong to the loaded `l2tp_netlink` module; if it is
+    /// reloaded, resolve them again and open a new socket.
+    pub fn new(family_id: u16, group_id: u32) -> crate::Result<Self> {
+        let mut socket = Socket::new(NETLINK_GENERIC)?;
+        // The kernel sends these notifications without a sender port and
+        // skips every socket whose own port is 0, so the socket must be
+        // bound before it can receive them; it never sends, so nothing else
+        // would bind it.
+        socket.bind_auto()?;
+        socket.add_membership(group_id)?;
+        socket.set_non_blocking(true)?;
+        Ok(Self::from_parts(socket, family_id))
+    }
+
+    fn from_parts(socket: Socket, family_id: u16) -> Self {
+        Self {
+            socket,
+            pending: Pending::new(family_id),
+        }
+    }
+
+    /// Returns the next notification already received or receivable
+    /// without blocking, or `None` when nothing is waiting.
+    ///
+    /// Messages the kernel did not send are skipped, a full receive buffer
+    /// is reported as `ENOBUFS` ahead of the notifications still queued, and
+    /// a message that fails to decode is reported as an error; the
+    /// subscription continues after every error.
+    pub fn try_next(&mut self) -> Option<crate::Result<L2tpEvent>> {
+        loop {
+            if let Some(item) = self.pending.next() {
+                return Some(item);
+            }
+            match self.socket.recv_from_full() {
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    return None;
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                received => self.pending.receive(received),
+            }
+        }
+    }
+
+    /// Makes the socket block, so [`try_next`](Self::try_next) waits for a
+    /// notification instead of returning `None`.
+    pub(crate) fn into_blocking(self) -> io::Result<Self> {
+        self.socket.set_non_blocking(false)?;
+        Ok(self)
+    }
+}
+
+impl AsFd for EventSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.socket.as_fd()
+    }
+}
+
+impl AsRawFd for EventSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
     }
 }
 
@@ -256,9 +385,10 @@ pub(crate) fn decode(
     let NetlinkPayload::InnerMessage(raw) = message.payload else {
         return Ok(None);
     };
-    let genl = raw.parse_into_genlmsg::<L2tpMessage>()?;
-    let attrs = &genl.payload.attributes;
-    let event = match genl.payload.cmd {
+    // Parsed like replies, so a cookie of any length the kernel holds decodes.
+    let genl = raw.parse_into_genlmsg::<netlink::KernelMessage>()?;
+    let attrs = &genl.payload.0.attributes;
+    let event = match genl.payload.0.cmd {
         L2tpCmd::TunnelCreate => {
             L2tpEvent::TunnelCreated(netlink::decode_tunnel_info(attrs)?)
         }
@@ -289,7 +419,9 @@ mod tests {
     use futures::StreamExt;
     use netlink_packet_core::{DoneMessage, NLMSG_OVERRUN, NetlinkHeader};
     use netlink_packet_generic::GenlMessage;
-    use netlink_packet_l2tp::{L2tpAttribute, L2tpEncapType, L2tpPwType};
+    use netlink_packet_l2tp::{
+        L2tpAttribute, L2tpEncapType, L2tpMessage, L2tpPwType,
+    };
 
     use super::*;
     use crate::{SessionId, TunnelId};
@@ -439,6 +571,64 @@ mod tests {
         let error = pending.next().unwrap().unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS));
         assert!(pending.next().is_none());
+    }
+
+    /// An event socket joined to no group, so nothing arrives on its own.
+    fn quiet_socket() -> EventSocket {
+        let mut socket = Socket::new(NETLINK_GENERIC).unwrap();
+        socket.bind_auto().unwrap();
+        socket.set_non_blocking(true).unwrap();
+        EventSocket::from_parts(socket, FAMILY_ID)
+    }
+
+    #[test]
+    fn event_socket_returns_none_when_nothing_is_queued() {
+        let mut socket = quiet_socket();
+        assert!(socket.try_next().is_none());
+
+        // A user-space sender is skipped through the receive path too, even
+        // with a forged header port of zero.
+        let forger = Socket::new(NETLINK_GENERIC).unwrap();
+        let mut target = SocketAddr::new(0, 0);
+        socket.socket.get_address(&mut target).unwrap();
+        let forged = datagram(vec![notification(
+            FAMILY_ID,
+            L2tpCmd::TunnelCreate,
+            vec![],
+        )]);
+        match forger.send_to(&forged, &target, 0) {
+            Ok(_) => assert!(socket.try_next().is_none()),
+            // Unicasting to another socket needs CAP_NET_ADMIN.
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(e) => panic!("unexpected send error: {e}"),
+        }
+    }
+
+    #[test]
+    fn bounded_events_need_a_runtime_with_io() {
+        let err = BoundedEvents::from_socket(quiet_socket()).unwrap_err();
+        assert!(
+            err.to_string().contains("tokio runtime is required"),
+            "{err}"
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(async { BoundedEvents::from_socket(quiet_socket()) })
+            .unwrap_err();
+        assert!(err.to_string().contains("I/O enabled"), "{err}");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut events =
+                BoundedEvents::from_socket(quiet_socket()).unwrap();
+            assert!(futures::poll!(events.next()).is_pending());
+        });
     }
 
     #[tokio::test]

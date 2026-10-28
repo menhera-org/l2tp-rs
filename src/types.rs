@@ -102,13 +102,23 @@ impl TryFrom<u8> for L2tpVersion {
     }
 }
 
-/// Session cookie, 0, 4 or 8 bytes (`L2TP_ATTR_COOKIE`).
+/// Session cookie (`L2TP_ATTR_COOKIE`): 0, 4 or 8 bytes when built here; a
+/// kernel report may carry any length up to 8 (`l2tp_netlink.c`), which this
+/// crate decodes but never sends.
 ///
 /// Construct one with [`Cookie::none`], the `TryFrom` conversions from
 /// `&[u8]` and `Vec<u8>`, the `From` conversions from `[u8; 4]` and
-/// `[u8; 8]`, or by parsing a hexadecimal string. `Display` prints the bytes
-/// as lowercase hexadecimal. With the `serde` feature a cookie is a
-/// hexadecimal string in human-readable formats and bytes otherwise.
+/// `[u8; 8]`, or by parsing a hexadecimal string; all of them keep to the
+/// lengths of RFC 3931. Only a cookie read from the kernel, in a
+/// [`SessionInfo`](crate::SessionInfo) or an [`L2tpEvent`](crate::L2tpEvent),
+/// can have another length, which [`is_rfc3931`](Self::is_rfc3931) tells;
+/// [`create_session`](crate::L2tpHandle::create_session) refuses it.
+///
+/// `Display` prints the bytes as lowercase hexadecimal. With the `serde`
+/// feature a cookie is a hexadecimal string in human-readable formats and
+/// bytes otherwise. Serialization writes the actual length, so a reported
+/// non-conforming cookie can be shown, but deserializing it back fails, like
+/// every public constructor.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Cookie {
     bytes: [u8; 8],
@@ -121,12 +131,26 @@ impl Cookie {
         Self::default()
     }
 
+    /// A cookie the kernel reported: any length up to 8, the kernel's limit.
+    pub(crate) fn from_kernel(b: &[u8]) -> crate::Result<Self> {
+        if b.len() > 8 {
+            return Err(crate::Error::InvalidCookieLength(b.len()));
+        }
+        let mut bytes = [0; 8];
+        bytes[..b.len()].copy_from_slice(b);
+        Ok(Self {
+            bytes,
+            len: b.len() as u8,
+        })
+    }
+
     /// Returns the raw cookie bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..usize::from(self.len)]
     }
 
-    /// Returns the cookie length in bytes: 0, 4 or 8.
+    /// Returns the cookie length in bytes: 0, 4 or 8, or up to 8 for a
+    /// cookie the kernel reported.
     pub fn len(&self) -> usize {
         usize::from(self.len)
     }
@@ -135,6 +159,13 @@ impl Cookie {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Returns whether the length is one RFC 3931 allows: 0 (no cookie), 4
+    /// or 8 bytes. Always true except for a cookie the kernel reported for a
+    /// session created elsewhere.
+    pub fn is_rfc3931(&self) -> bool {
+        matches!(self.len, 0 | 4 | 8)
+    }
 }
 
 impl TryFrom<&[u8]> for Cookie {
@@ -142,14 +173,7 @@ impl TryFrom<&[u8]> for Cookie {
 
     fn try_from(b: &[u8]) -> crate::Result<Self> {
         match b.len() {
-            0 | 4 | 8 => {
-                let mut bytes = [0; 8];
-                bytes[..b.len()].copy_from_slice(b);
-                Ok(Self {
-                    bytes,
-                    len: b.len() as u8,
-                })
-            }
+            0 | 4 | 8 => Self::from_kernel(b),
             n => Err(crate::Error::InvalidCookieLength(n)),
         }
     }
@@ -912,6 +936,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn public_constructors_build_rfc_lengths_only() {
+        let bytes: Vec<u8> = (1..=9).collect();
+        for len in 0..=9 {
+            let rfc = matches!(len, 0 | 4 | 8);
+            let hex: String =
+                bytes[..len].iter().map(|b| format!("{b:02x}")).collect();
+            for result in [
+                Cookie::try_from(&bytes[..len]),
+                Cookie::try_from(bytes[..len].to_vec()),
+                hex.parse::<Cookie>(),
+            ] {
+                match result {
+                    Ok(cookie) => {
+                        assert!(rfc, "{len} bytes were accepted");
+                        assert_eq!(cookie.as_bytes(), &bytes[..len]);
+                        assert!(cookie.is_rfc3931());
+                    }
+                    Err(crate::Error::InvalidCookieLength(n)) => {
+                        assert!(!rfc, "{len} bytes were refused");
+                        assert_eq!(n, len);
+                    }
+                    Err(e) => panic!("unexpected error: {e:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kernel_cookies_take_any_length_up_to_eight() {
+        let bytes: Vec<u8> = (1..=9).collect();
+        for len in 0..=8 {
+            let cookie = Cookie::from_kernel(&bytes[..len]).unwrap();
+            assert_eq!(cookie.as_bytes(), &bytes[..len]);
+            assert_eq!(cookie.len(), len);
+            assert_eq!(cookie.is_rfc3931(), matches!(len, 0 | 4 | 8));
+            assert_eq!(cookie.to_string().len(), 2 * len);
+        }
+        assert!(matches!(
+            Cookie::from_kernel(&bytes),
+            Err(crate::Error::InvalidCookieLength(9))
+        ));
+    }
+
+    #[test]
     fn cookie_accepts_valid_lengths() {
         let c0 = Cookie::try_from(&[][..]).unwrap();
         let c4 = Cookie::try_from(vec![1, 2, 3, 4]).unwrap();
@@ -1052,8 +1120,37 @@ mod tests {
             decoded
         }
 
-        for cookie in [Cookie::none(), Cookie::from([1, 2, 3, 4])] {
-            assert_eq!(round_trip(&cookie), cookie);
+        // Serialization writes the actual length of a reported cookie, but
+        // only RFC 3931 lengths deserialize, as a byte string or a sequence.
+        let bytes: Vec<u8> = (1..=9).collect();
+        for len in 0..=9 {
+            let rfc = matches!(len, 0 | 4 | 8);
+            let wire = &bytes[..len];
+            let postcard_wire = postcard::to_allocvec(wire).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<Cookie>(&postcard_wire).is_ok(),
+                rfc
+            );
+            for value in [
+                ciborium::Value::Bytes(wire.to_vec()),
+                ciborium::Value::serialized(&wire).unwrap(),
+            ] {
+                let mut cbor = Vec::new();
+                ciborium::into_writer(&value, &mut cbor).unwrap();
+                assert_eq!(
+                    ciborium::from_reader::<Cookie, _>(cbor.as_slice()).is_ok(),
+                    rfc
+                );
+            }
+            if let Ok(cookie) = Cookie::from_kernel(wire) {
+                assert_eq!(
+                    postcard::to_allocvec(&cookie).unwrap(),
+                    postcard_wire
+                );
+                if rfc {
+                    assert_eq!(round_trip(&cookie), cookie);
+                }
+            }
         }
         let raw = L2tpIfName::new(b"eth\xff0").unwrap();
         for endpoint in [
@@ -1168,6 +1265,19 @@ mod tests {
             cookie
         );
         assert!(serde_json::from_str::<Cookie>("\"abc\"").is_err());
+        let bytes: Vec<u8> = (1..=9).collect();
+        for len in 0..=9 {
+            let json: String = std::iter::once("\"".to_string())
+                .chain(bytes[..len].iter().map(|b| format!("{b:02x}")))
+                .chain(std::iter::once("\"".to_string()))
+                .collect();
+            let parsed = serde_json::from_str::<Cookie>(&json);
+            assert_eq!(parsed.is_ok(), matches!(len, 0 | 4 | 8), "{json}");
+            // A reported cookie of any length is shown as it is.
+            if let Ok(cookie) = Cookie::from_kernel(&bytes[..len]) {
+                assert_eq!(serde_json::to_string(&cookie).unwrap(), json);
+            }
+        }
 
         let udp = Encapsulation::Udp {
             local: UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),

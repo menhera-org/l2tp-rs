@@ -302,6 +302,14 @@ with `SO_RCVBUF` through `AsFd`, and an overflow is reported once as
 `ENOBUFS`, after which the stream continues. Resynchronize with the queries
 above when that happens. The blocking handle offers both as well.
 
+`EventSocket` is the runtime-free form of that socket: non-blocking,
+usable from any thread, and registered with an event loop only when the
+caller decides. `event_socket` on either handle opens one; `EventSocket::new`
+opens one in the calling thread's namespace from a family and group ID the
+caller resolved itself, without a handle. `try_next` returns what can be
+read without blocking, and `BoundedEvents::from_socket` turns the socket into
+a stream on the current Tokio runtime.
+
 ## Blocking API
 
 `l2tp::blocking::L2tpHandle` mirrors the async handle with blocking methods.
@@ -389,9 +397,14 @@ device for its whole life; see [Kernel Semantics Notes](#kernel-semantics-notes)
 - `TunnelSocket::from_fd` adopts a bound and connected datagram socket
   prepared elsewhere, for example with `socket2` or through socket
   activation, and `TunnelConfig::for_socket` describes such a socket. The
-  socket's addresses, bound device, link-local scope and peer connection ID
-  are read back from the kernel. A descriptor that is not such a socket is
-  closed together with the error.
+  socket's addresses, bound device, link-local scope and connection ID are
+  read back from the kernel, as is the peer connection ID of an IPv6
+  L2TP/IP socket; supply the IPv4 one with `from_fd_with_peer`. A
+  descriptor that is not such a socket is closed together with the error.
+- `tunnel_id` and `peer_tunnel_id` report the connection IDs of an L2TP/IP
+  socket, so an adopted descriptor can be checked against the tunnel it is
+  meant to carry. For an adopted socket `tunnel_id` is what the kernel
+  reported; `peer_tunnel_id` is `None` where the kernel does not report it.
 - `set_tos`, `set_hop_limit`, `set_mark`, `set_pmtu_discovery` and
   `set_ipv6_dontfrag` cover the common options of tunnel traffic;
   `bind_to_device` applies `SO_BINDTODEVICE` and `bind_to_device_index`
@@ -456,6 +469,12 @@ device for its whole life; see [Kernel Semantics Notes](#kernel-semantics-notes)
   therefore reports the peer the socket connected to itself, which an IPv4
   L2TP/IP socket adopted with `from_fd` does not know: describe such a
   socket with `TunnelConfig::new` instead of `TunnelConfig::for_socket`.
+- RFC 3931 cookies are 4 or 8 bytes, but the kernel accepts and reports any
+  length up to 8. A `Cookie` built here is 0, 4 or 8 bytes. One reported for
+  a session created elsewhere keeps its length, so queries and dumps still
+  succeed, and `Cookie::is_rfc3931` tells it apart. Such a cookie is never
+  sent back: `create_session` refuses it with `Error::InvalidCookieLength`.
+  It serializes as it is but does not deserialize.
 - The kernel accepts the L2-specific sublayer type (`L2TP_ATTR_L2SPEC_TYPE`)
   when a session is created but never reports it, so `SessionInfo::l2spec_type`
   is `None` and the CLI shows `unknown`.

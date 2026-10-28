@@ -544,6 +544,27 @@ impl TunnelSocket {
         self.conn_id
     }
 
+    /// The connection ID an L2TP/IP socket is bound with, which is the local
+    /// tunnel ID; `None` for a UDP socket.
+    ///
+    /// For an adopted socket this is what [`from_fd`](Self::from_fd) read
+    /// back with `getsockname`, the kernel's value rather than one supplied
+    /// by the caller. No syscall is made here.
+    pub fn tunnel_id(&self) -> Option<TunnelId> {
+        self.conn_id.map(TunnelId)
+    }
+
+    /// The peer tunnel ID repeated on [`reconnect_ip`](Self::reconnect_ip).
+    ///
+    /// Known for L2TP/IP sockets created here and for adopted IPv6 ones.
+    /// `None` for an adopted IPv4 L2TP/IP socket, whose peer connection ID
+    /// the kernel does not report, unless it was adopted with
+    /// [`from_fd_with_peer`](Self::from_fd_with_peer); always `None` for UDP.
+    /// No syscall is made here.
+    pub fn peer_tunnel_id(&self) -> Option<TunnelId> {
+        self.peer_conn_id.map(TunnelId)
+    }
+
     /// The cached connection state; a poisoned lock still holds valid data.
     fn link(&self) -> MutexGuard<'_, Link> {
         self.link.lock().unwrap_or_else(PoisonError::into_inner)
@@ -1985,17 +2006,18 @@ mod tests {
                     Err(crate::Error::Io(e)) if skippable(&e) => continue,
                     Err(e) => panic!("unexpected IP socket error: {e:?}"),
                 };
-                assert_eq!(socket.conn_id(), Some(tunnel_id.0));
+                assert_eq!(socket.tunnel_id(), Some(tunnel_id));
+                assert_eq!(socket.peer_tunnel_id(), Some(peer_tunnel_id));
                 let adopted = TunnelSocket::from_fd(socket.into_fd()).unwrap();
-                assert_eq!(adopted.conn_id(), Some(tunnel_id.0));
+                assert_eq!(adopted.tunnel_id(), Some(tunnel_id));
                 if endpoint.ip_version() == 4 {
-                    assert_eq!(adopted.peer_conn_id, None);
+                    assert_eq!(adopted.peer_tunnel_id(), None);
                     assert!(matches!(
                         adopted.reconnect_ip(&endpoint),
                         Err(crate::Error::UnknownPeerConnId)
                     ));
                 } else {
-                    assert_eq!(adopted.peer_conn_id, Some(peer_tunnel_id.0));
+                    assert_eq!(adopted.peer_tunnel_id(), Some(peer_tunnel_id));
                     adopted.reconnect_ip(&endpoint).unwrap();
                 }
 
@@ -2004,8 +2026,8 @@ mod tests {
                     peer_tunnel_id,
                 )
                 .unwrap();
-                assert_eq!(adopted.conn_id(), Some(tunnel_id.0));
-                assert_eq!(adopted.peer_conn_id, Some(peer_tunnel_id.0));
+                assert_eq!(adopted.tunnel_id(), Some(tunnel_id));
+                assert_eq!(adopted.peer_tunnel_id(), Some(peer_tunnel_id));
                 adopted.disconnect().unwrap();
                 adopted.reconnect_ip(&endpoint).unwrap();
                 if endpoint.ip_version() == 6 && peer_tunnel_id.0 == 0 {
@@ -2018,9 +2040,12 @@ mod tests {
                 }
                 let read_back =
                     TunnelSocket::from_fd(adopted.into_fd()).unwrap();
-                assert_eq!(read_back.conn_id(), Some(tunnel_id.0));
+                assert_eq!(read_back.tunnel_id(), Some(tunnel_id));
                 if endpoint.ip_version() == 6 {
-                    assert_eq!(read_back.peer_conn_id, Some(peer_tunnel_id.0));
+                    assert_eq!(
+                        read_back.peer_tunnel_id(),
+                        Some(peer_tunnel_id)
+                    );
                 }
             }
         }
@@ -2054,6 +2079,8 @@ mod tests {
                 Err(crate::Error::Io(e)) if skippable(&e) => continue,
                 Err(e) => panic!("unexpected IP socket error: {e:?}"),
             };
+            assert_eq!(sock.tunnel_id(), Some(tunnel_id));
+            assert_eq!(sock.peer_tunnel_id(), Some(peer_tunnel_id));
             assert_eq!(sock.local_addr_ip().unwrap(), local);
             let err = sock.peer_addr_ip().unwrap_err();
             assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN), "{err:?}");
@@ -2090,6 +2117,8 @@ mod tests {
             Err(crate::Error::Io(e)) if skippable(&e) => return,
             Err(e) => panic!("unexpected UDP socket error: {e:?}"),
         };
+        assert_eq!(sock.tunnel_id(), None);
+        assert_eq!(sock.peer_tunnel_id(), None);
         let local = sock.local_addr_udp().unwrap();
         assert!(matches!(
             local,
@@ -2253,8 +2282,8 @@ mod tests {
         let adopted = TunnelSocket::from_fd(sock.into_fd()).unwrap();
         assert_eq!(adopted.encap, SocketEncap::Udp);
         assert_eq!(adopted.family, SocketFamily::V4);
-        assert_eq!(adopted.conn_id(), None);
-        assert_eq!(adopted.peer_conn_id, None);
+        assert_eq!(adopted.tunnel_id(), None);
+        assert_eq!(adopted.peer_tunnel_id(), None);
         assert!(!adopted.link().pinned);
 
         let config =
@@ -2284,7 +2313,9 @@ mod tests {
         let Some((socket, _receiver)) = connected_v4_pair() else {
             return;
         };
-        assert_eq!(socket.conn_id(), None);
+        // A socket from `udp` has no connection IDs.
+        assert_eq!(socket.tunnel_id(), None);
+        assert_eq!(socket.peer_tunnel_id(), None);
         assert!(matches!(
             TunnelSocket::from_fd_with_peer(socket.into_fd(), TunnelId(73)),
             Err(crate::Error::EncapsulationMismatch)

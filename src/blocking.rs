@@ -18,7 +18,6 @@
 
 use std::{
     future::Future,
-    io,
     os::fd::{AsFd, BorrowedFd},
     pin::Pin,
     sync::{Arc, Mutex, mpsc},
@@ -29,12 +28,11 @@ use futures::{
     StreamExt,
     future::{self, Either},
 };
-use netlink_sys::Socket;
 
 use crate::{
-    IpEndpoint, L2tpEvent, L2tpIfName, NetNs, SessionConfig, SessionId,
-    SessionInfo, SessionModify, SessionStats, TunnelConfig, TunnelId,
-    TunnelInfo, TunnelSocket, TunnelStats, UdpEndpoint, event::Pending,
+    EventSocket, IpEndpoint, L2tpEvent, L2tpIfName, NetNs, SessionConfig,
+    SessionId, SessionInfo, SessionModify, SessionStats, TunnelConfig,
+    TunnelId, TunnelInfo, TunnelSocket, TunnelStats, UdpEndpoint,
 };
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -452,12 +450,15 @@ impl L2tpHandle {
     /// and the iterator; see [`crate::L2tpHandle::events_bounded`] and
     /// [`BoundedEventIter`].
     pub fn events_bounded(&self) -> crate::Result<BoundedEventIter> {
-        let (socket, family_id) =
-            self.call(|handle| async move { handle.event_socket().await })?;
-        Ok(BoundedEventIter {
-            socket,
-            pending: Pending::new(family_id),
-        })
+        let socket = self.event_socket()?.into_blocking()?;
+        Ok(BoundedEventIter { socket })
+    }
+
+    /// Opens a non-blocking [`EventSocket`] in the handle's original
+    /// namespace; see [`crate::L2tpHandle::event_socket`]. The socket needs
+    /// neither the worker nor a Tokio context and outlives the handle.
+    pub fn event_socket(&self) -> crate::Result<EventSocket> {
+        self.call(|handle| async move { handle.event_socket().await })
     }
 }
 
@@ -471,23 +472,15 @@ impl L2tpHandle {
 /// the multicast group.
 #[derive(Debug)]
 pub struct BoundedEventIter {
-    socket: Socket,
-    pending: Pending,
+    /// Made blocking, so `try_next` waits rather than returning `None`.
+    socket: EventSocket,
 }
 
 impl Iterator for BoundedEventIter {
     type Item = crate::Result<L2tpEvent>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(item) = self.pending.next() {
-                return Some(item);
-            }
-            match self.socket.recv_from_full() {
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                received => self.pending.receive(received),
-            }
-        }
+        self.socket.try_next()
     }
 }
 
@@ -825,6 +818,19 @@ mod tests {
             Ok(events) => {
                 drop(handle);
                 drop(events);
+            }
+            Err(crate::Error::FamilyResolution(_)) => {}
+            Err(err) => panic!("unexpected error: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn event_socket_outlives_the_handle_without_blocking() {
+        let handle = L2tpHandle::new().unwrap();
+        match handle.event_socket() {
+            Ok(mut socket) => {
+                drop(handle);
+                assert!(!matches!(socket.try_next(), Some(Err(_))));
             }
             Err(crate::Error::FamilyResolution(_)) => {}
             Err(err) => panic!("unexpected error: {err:?}"),
