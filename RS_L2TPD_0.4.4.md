@@ -68,7 +68,7 @@ value, not a cache of the caller's input.
 - an adopted IPv4 socket gives `peer_tunnel_id() == None` until
   `from_fd_with_peer`.
 
-## 2. Cookies of every length the kernel accepts
+## 2. Foreign cookies of every length the kernel accepts, none produced
 
 **Need.** The kernel accepts a cookie of 0 to 8 bytes, any length in that
 range, and reports what it stored:
@@ -83,26 +83,60 @@ session dump. rs-l2tpd must dump the namespace's sessions to verify a stored
 name before deleting by it, and to check staging names. One foreign session
 with an odd-length cookie would block both.
 
+**The rule.** Permit foreign non-conforming lengths; never produce one.
+- **Permit:** a cookie the kernel reports for a session someone else created
+  may have any length from 0 to 8, and decoding it must succeed, so that
+  queries and dumps work in a namespace that holds such a session.
+- **Never produce:** this crate never creates a session with a cookie that RFC
+  3931 does not allow, which means 0 (none), 4 or 8 bytes. That holds even when
+  the caller passes in a cookie it took from a kernel report.
+
 **Change:**
-- `Cookie::try_from` and the hexadecimal parser accept any length from 0 to 8.
-  Lengths above 8 keep failing with `InvalidCookieLength`, the kernel's own
-  limit.
-- Update the docs ("0, 4 or 8 bytes") and `len`'s doc. Say that RFC 3931 uses
-  4 or 8 bytes and that the kernel takes anything up to 8.
-- `Display`, `serde` and `as_bytes` follow the length as they do now; check
-  that the serde forms round-trip odd lengths.
-- Decoding a kernel report must never fail on a cookie the kernel can hold.
+- **Constructors stay as they are:** `Cookie::none`, `TryFrom<&[u8]>`,
+  `TryFrom<Vec<u8>>`, `From<[u8; 4]>`, `From<[u8; 8]>`, the hexadecimal parser
+  and `serde` deserialisation keep accepting 0, 4 or 8 bytes only. Every other
+  length fails with `InvalidCookieLength`, as today. No public way of building
+  a `Cookie` yields another length.
+- **Decoding widens:** add a crate-private constructor, for example
+  `Cookie::from_kernel(&[u8]) -> crate::Result<Cookie>`, that accepts 0 to 8
+  bytes and fails only above 8, the kernel's own limit. Use it in
+  `decode_session_info` (`netlink.rs`, the `L2tpAttribute::Cookie` and
+  `PeerCookie` arms) and wherever else a cookie is decoded from the kernel. So
+  only `SessionInfo` and events can hold a non-conforming cookie.
+- **Creation refuses:** `encode_session_create` (and so `create_session` on
+  both handles) checks that `cookie` and `peer_cookie` are 0, 4 or 8 bytes, and
+  fails with `InvalidCookieLength` before anything is sent otherwise. This
+  closes the one path a reported cookie could take back to the kernel: copying
+  a foreign `SessionInfo`'s cookies into a `SessionConfig`.
+- **Inspection:** add `Cookie::is_rfc3931(&self) -> bool` (true for 0, 4 and 8
+  bytes) so callers can tell a foreign non-conforming cookie apart.
+  - `Display`, `as_bytes`, `len` and `serde` serialisation report the actual
+    length.
+  - Serialising a non-conforming cookie is allowed, since a report may be
+    shown, but deserialising one back fails, like every public constructor.
+    Document that asymmetry.
+- **Docs:** say "0, 4 or 8 bytes when built here; a kernel report may carry
+  any length up to 8 (`l2tp_netlink.c`), which this crate decodes but never
+  sends" on `Cookie`, `SessionInfo` and `SessionConfig`.
 
 **Tests:**
-- every length 0–9 through `TryFrom<&[u8]>`, the parser and serde (9 must
-  fail);
-- `decode_session_info` with 1-, 2- and 7-byte cookies;
-- one live case: create a session with a 2-byte cookie, then `get_session`
-  and `list_sessions` both succeed and report it.
+- every length 0–9 through `TryFrom<&[u8]>`, the parser and deserialisation:
+  only 0, 4 and 8 succeed;
+- `from_kernel` with lengths 0–9: 0–8 succeed, 9 fails;
+- `decode_session_info` with 1-, 2- and 7-byte cookies succeeds and reports
+  them with `is_rfc3931() == false`;
+- `create_session` with a `SessionConfig` whose cookie came from such a
+  report fails with `InvalidCookieLength`, and no request reaches the kernel
+  (a unit test on `encode_session_create`);
+- one live case: a session created with a 2-byte cookie by `ip l2tp add
+  session ... cookie 0102` (outside this crate, as a foreign object). Then
+  `get_session` and `list_sessions` both succeed and report it, and re-creating
+  it from the reported `SessionInfo` is refused.
 
-Note for the CHANGELOG: this widens what is accepted on creation too. That is
-deliberate, since the kernel accepts it; a caller that wants RFC lengths only
-checks `len()` itself. rs-l2tpd's configuration keeps requiring 4 or 8 bytes.
+Note for the CHANGELOG, under `### Changed`: session queries and dumps no
+longer fail on a session with a non-RFC cookie length, and session creation
+now refuses one explicitly. Before this, creation could not receive one,
+because no constructor produced it; the new check guards the decoded path.
 
 ## 3. A bounded event socket that does not need a runtime when opened
 
@@ -184,7 +218,9 @@ Report:
 
 rs-l2tpd then pins 0.4.4 and removes its three workarounds:
 - the `Debug` parsing in `src/kernel/linux/socket.rs`;
-- the cookie limits on its kernel `SessionInfo`;
+- the cookie limits on its kernel `SessionInfo`, which will then hold the
+  reported cookie as `l2tp` decodes it; a foreign non-conforming cookie can
+  only make a session fail to match, never be created;
 - the raw `l2tp` group socket in `src/kernel/linux/l2tp.rs`.
 
 After that, `docs/dependencies.md` and `docs/architecture.md` are updated
