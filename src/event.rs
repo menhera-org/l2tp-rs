@@ -51,9 +51,9 @@ pub enum L2tpEvent {
 ///
 /// Notifications are advisory and may describe another network namespace;
 /// see [`L2tpEvent`]. Dropping the stream leaves the multicast group.
-/// Messages that are not
-/// L2TP notifications are skipped; a notification that fails to decode is
-/// reported as an error and the stream continues.
+/// Messages that are not L2TP notifications from the kernel are skipped; a
+/// notification that fails to decode is reported as an error and the stream
+/// continues.
 /// If the receive buffer overruns, an [`Error::Io`](crate::Error::Io) with
 /// OS error `ENOBUFS` reports that notifications were lost. Query current
 /// tunnel and session state to resynchronize; the stream continues afterward.
@@ -90,7 +90,12 @@ impl Stream for Events {
     ) -> Poll<Option<Self::Item>> {
         loop {
             match Pin::new(&mut self.receiver).poll_next(cx) {
-                Poll::Ready(Some((message, _))) => {
+                Poll::Ready(Some((message, source))) => {
+                    // The header port can be forged; only recvmsg's sender
+                    // address identifies a kernel notification.
+                    if source.port_number() != 0 {
+                        continue;
+                    }
                     match decode(message, self.family_id) {
                         Ok(Some(event)) => return Poll::Ready(Some(Ok(event))),
                         Ok(None) => continue,
@@ -246,6 +251,23 @@ mod tests {
         let foreign =
             notification(FAMILY_ID + 1, L2tpCmd::TunnelCreate, vec![]);
         assert_eq!(decode(foreign, FAMILY_ID).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn stream_ignores_non_kernel_senders() {
+        let (sender, receiver) = futures::channel::mpsc::unbounded();
+        let connection = tokio::spawn(std::future::pending());
+        let mut events = Events::new(receiver, connection, FAMILY_ID);
+        // A forged header port of zero must not disguise a user-space
+        // sender. This payload would otherwise fail L2TP decoding.
+        sender
+            .unbounded_send((
+                notification(FAMILY_ID, L2tpCmd::TunnelCreate, vec![]),
+                SocketAddr::new(31337, 0),
+            ))
+            .unwrap();
+        drop(sender);
+        assert!(events.next().await.is_none());
     }
 
     #[tokio::test]

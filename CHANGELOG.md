@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `Events` skips messages not sent by the kernel. Another local process could
+  unicast forged notifications to the event socket; the sender address from
+  `recvmsg` is checked, not the forgeable header port.
+
 ## 0.4.2 (2026-10-28)
 
 ### Added
