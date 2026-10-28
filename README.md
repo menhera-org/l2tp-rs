@@ -22,6 +22,8 @@ separate crate.
 - `CAP_NET_ADMIN` (or root) for every L2TP netlink command, including `get`
   and `list`; the kernel marks them all `GENL_UNS_ADMIN_PERM`. Subscribing to
   notifications needs no privilege.
+- Nothing of the filesystem but `/dev/ppp` for PPP units; `/proc` need not be
+  mounted.
 
 ## Installation
 
@@ -326,8 +328,11 @@ the L2TP subsystem of that namespace. Entering a namespace needs
 an inherited container namespace, for future event connections. Opening an
 event connection from a different namespace enters that original namespace;
 opening it from the same namespace needs no additional privileges.
-Handle and PPP object creation retain descriptors opened through
-`/proc/thread-self/ns/net`, so that path must be accessible.
+`/proc` is not required. A handle remembers which namespace its sockets live
+in by their kernel cookie (`SO_NETNS_COOKIE`, Linux 5.14+); when `/proc` is
+readable it also keeps a descriptor, so that later sockets can be opened from
+a thread in another namespace. Without it, open event connections from a
+thread in the handle's namespace, or create the handle with `new_in`.
 The kernel's cross-namespace multicast behavior described under
 [Events](#events) still applies.
 
@@ -578,7 +583,8 @@ Standard tests:
 cargo test
 ```
 
-Privileged tests (require root/CAP_NET_ADMIN and matching kernel modules):
+Privileged tests (require root/CAP_NET_ADMIN and matching kernel modules; the
+namespace tests also need CAP_SYS_ADMIN and `unshare(1)`):
 
 ```bash
 cargo test --test privileged -- --ignored

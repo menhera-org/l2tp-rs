@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 (2026-10-28)
+
+### Fixed
+
+- `L2tpHandle::new`, `PppSocket::connect` and `PppUnit::new` no longer need
+  `/proc`; namespace identity comes from `SO_NETNS_COOKIE` (Linux 5.14+).
+  A handle keeps a namespace descriptor only when `/proc` is readable; without
+  one, opening further sockets from a thread in another namespace fails with
+  an `Unsupported` I/O error instead of entering the handle's namespace.
+- `NetNs::current` falls back to `PIDFD_GET_NET_NAMESPACE` (Linux 6.11+) when
+  `/proc` is unavailable.
+
 ## 0.4.0 (2026-10-22)
 
 ### Breaking changes

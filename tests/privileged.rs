@@ -3,7 +3,9 @@
 #![cfg(target_os = "linux")]
 
 use std::{
+    io::{BufRead, BufReader},
     net::{Ipv4Addr, SocketAddrV4},
+    process::{Command, Stdio},
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -11,9 +13,9 @@ use std::{
 use futures::StreamExt;
 use l2tp::{
     Cookie, Encapsulation, IpEndpoint, L2SpecType, L2tpEvent, L2tpHandle,
-    L2tpIfName, L2tpIfNameExt, L2tpVersion, PppSocket, PppUnit, PseudowireType,
-    SessionConfig, SessionHandle, SessionId, SessionModify, TunnelConfig,
-    TunnelHandle, TunnelId, TunnelSocket, UdpEndpoint, blocking,
+    L2tpIfName, L2tpIfNameExt, L2tpVersion, NetNs, PppSocket, PppUnit,
+    PseudowireType, SessionConfig, SessionHandle, SessionId, SessionModify,
+    TunnelConfig, TunnelHandle, TunnelId, TunnelSocket, UdpEndpoint, blocking,
 };
 
 static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -525,6 +527,143 @@ fn privileged_managed_ip_sockets_report_their_peer() {
             local
         );
         drop(socket);
+    }
+}
+
+/// Set in the re-executed test binary that runs without procfs.
+const NO_PROC_CHILD: &str = "L2TP_TEST_NO_PROC_CHILD";
+
+#[test]
+#[ignore = "requires CAP_SYS_ADMIN and CAP_NET_ADMIN/root, unshare(1) and \
+            kernel l2tp_ip and l2tp_eth support"]
+fn privileged_works_without_procfs() {
+    if std::env::var_os(NO_PROC_CHILD).is_some() {
+        return without_procfs();
+    }
+    // A private mount namespace with an empty tmpfs over /proc; the child
+    // reports through its exit status.
+    let exe = std::env::current_exe().unwrap_or_else(|e| panic!("{e}"));
+    let status = Command::new("unshare")
+        .args([
+            "-m",
+            "sh",
+            "-c",
+            "mount -t tmpfs none /proc && exec \"$0\" \"$@\"",
+        ])
+        .arg(exe)
+        .args(["--exact", "privileged_works_without_procfs", "--ignored"])
+        .env(NO_PROC_CHILD, "1")
+        .status();
+    match status {
+        Ok(status) => assert!(status.success(), "the child failed: {status}"),
+        Err(e) => eprintln!("skipped: cannot run unshare: {e}"),
+    }
+}
+
+fn without_procfs() {
+    assert!(
+        !std::path::Path::new("/proc/thread-self").exists(),
+        "procfs is still visible"
+    );
+    runtime().block_on(async {
+        let handle = L2tpHandle::new()
+            .await
+            .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
+        handle
+            .list_tunnels()
+            .await
+            .unwrap_or_else(|e| panic!("list_tunnels failed: {e}"));
+        let id = next_id_base();
+        let local = IpEndpoint::V4(Ipv4Addr::LOCALHOST);
+        let socket = TunnelSocket::ip(
+            &local,
+            &local,
+            None,
+            TunnelId(id),
+            TunnelId(id.wrapping_add(1)),
+        )
+        .unwrap_or_else(|e| panic!("create an L2TP/IP socket: {e}"));
+        let config = TunnelConfig::for_socket(
+            TunnelId(id),
+            TunnelId(id.wrapping_add(1)),
+            &socket,
+        )
+        .unwrap_or_else(|e| panic!("describe the socket: {e}"));
+        let tunnel = handle
+            .create_tunnel(config, socket)
+            .await
+            .unwrap_or_else(|e| panic!("create_tunnel failed: {e}"));
+        let session = handle
+            .create_session(SessionConfig::eth(
+                TunnelId(id),
+                SessionId(id.wrapping_add(2)),
+                SessionId(id.wrapping_add(3)),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("create_session failed: {e}"));
+        assert!(session.ifindex().is_some());
+        let events = handle
+            .events()
+            .await
+            .unwrap_or_else(|e| panic!("events failed: {e}"));
+        drop(events);
+        drop(session);
+        drop(tunnel);
+    });
+}
+
+#[test]
+#[ignore = "requires CAP_SYS_ADMIN and CAP_NET_ADMIN/root, unshare(1) and \
+            kernel l2tp generic-netlink support"]
+fn privileged_new_in_controls_another_namespace() {
+    let child = Command::new("unshare")
+        .args(["-n", "sh", "-c", "echo ready && exec sleep 60"])
+        .stdout(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => return eprintln!("skipped: cannot run unshare: {e}"),
+    };
+    // The line comes after unshare(2), so the namespace is the new one.
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let result = std::panic::catch_unwind(|| {
+        assert_eq!(line, "ready\n", "unshare -n failed");
+        let netns = NetNs::open(format!("/proc/{}/ns/net", child.id()))
+            .unwrap_or_else(|e| panic!("open the namespace: {e}"));
+        runtime().block_on(async {
+            let outer = L2tpHandle::new()
+                .await
+                .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
+            let inner = L2tpHandle::new_in(&netns)
+                .await
+                .unwrap_or_else(|e| panic!("L2tpHandle::new_in failed: {e}"));
+            // Opened from this thread, in another namespace: setns.
+            let events = inner
+                .events()
+                .await
+                .unwrap_or_else(|e| panic!("events failed: {e}"));
+            let (config, tunnel) =
+                create_unmanaged(&outer, || udp_loopback(L2tpVersion::V3))
+                    .await;
+            let listed = inner
+                .list_tunnels()
+                .await
+                .unwrap_or_else(|e| panic!("list_tunnels failed: {e}"));
+            tunnel.delete().await.unwrap_or_else(|e| panic!("{e}"));
+            assert!(
+                listed.iter().all(|t| t.tunnel_id != config.tunnel_id()),
+                "the other namespace sees this tunnel"
+            );
+            drop(events);
+        });
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
     }
 }
 

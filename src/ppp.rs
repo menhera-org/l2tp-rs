@@ -20,7 +20,7 @@ use std::{
     },
 };
 
-use crate::{L2tpIfName, L2tpVersion, NetNs, SessionId, TunnelId};
+use crate::{L2tpIfName, L2tpVersion, SessionId, TunnelId, netns::Owner};
 
 const PX_PROTO_OL2TP: libc::c_int = 1;
 
@@ -97,7 +97,7 @@ const SOCKADDR_PPPOL2TPV3_LEN: usize = 46;
 #[derive(Debug)]
 pub struct PppSocket {
     fd: OwnedFd,
-    netns: NetNs,
+    owner: Owner,
 }
 
 impl PppSocket {
@@ -128,7 +128,6 @@ impl PppSocket {
             session_id,
             peer_session_id,
         )?;
-        let netns = NetNs::current()?;
         // SAFETY: plain socket creation; the descriptor is owned exactly once.
         let raw = unsafe {
             libc::socket(
@@ -143,6 +142,7 @@ impl PppSocket {
         // SAFETY: `raw` is a freshly created descriptor.
         let fd =
             unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+        let owner = Owner::here(Some(fd.as_fd()))?;
         // SAFETY: `address` is a fully initialized sockaddr buffer of the
         // length passed, and `fd` is an open socket.
         let rc = unsafe {
@@ -155,7 +155,7 @@ impl PppSocket {
         if rc == -1 {
             return Err(io::Error::last_os_error().into());
         }
-        Ok(Self { fd, netns })
+        Ok(Self { fd, owner })
     }
 
     /// Returns the PPP channel index (`PPPIOCGCHAN`), as `pppd` and
@@ -200,7 +200,7 @@ impl AsRawFd for PppSocket {
 #[derive(Debug)]
 pub struct PppUnit {
     fd: OwnedFd,
-    netns: NetNs,
+    owner: Owner,
     index: i32,
     ifname: L2tpIfName,
 }
@@ -218,7 +218,8 @@ impl PppUnit {
     }
 
     fn create(requested: i32) -> crate::Result<Self> {
-        let netns = NetNs::current()?;
+        // `/dev/ppp` is no socket; a scratch socket names the namespace.
+        let owner = Owner::here(None)?;
         let fd: OwnedFd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -235,7 +236,7 @@ impl PppUnit {
         let ifname = L2tpIfName::new(format!("ppp{index}"))?;
         Ok(Self {
             fd,
-            netns,
+            owner,
             index,
             ifname,
         })
@@ -267,7 +268,10 @@ impl PppUnit {
         &self,
         socket: &PppSocket,
     ) -> crate::Result<PppChannel> {
-        if !self.netns.same_as(&socket.netns)? {
+        // When identities are unknown the kernel still refuses a foreign
+        // unit with ENXIO: `ppp_connect_channel` looks it up in the
+        // channel's namespace (`drivers/net/ppp/ppp_generic.c`).
+        if self.owner.same_as(&socket.owner) == Some(false) {
             return Err(crate::Error::NamespaceMismatch);
         }
         let mut channel: libc::c_int = socket.channel_index()?;
@@ -275,7 +279,7 @@ impl PppUnit {
         // PPPIOCATTCHAN looks up the channel in the calling thread's
         // namespace; PPPIOCCONNECT then looks up the unit in the channel's
         // namespace. Keep both lookups with the objects that own these IDs.
-        self.netns.run_if_needed(move || {
+        self.owner.run_in(move || {
             let fd: OwnedFd = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -398,31 +402,30 @@ mod tests {
     use super::*;
 
     fn fake_ppp_objects(
-        unit_netns: NetNs,
-        socket_netns: NetNs,
+        unit_owner: Owner,
+        socket_owner: Owner,
     ) -> (PppUnit, PppSocket) {
         (
             PppUnit {
                 fd: std::fs::File::open("/dev/null").unwrap().into(),
-                netns: unit_netns,
+                owner: unit_owner,
                 index: 0,
                 ifname: L2tpIfName::new("ppp0").unwrap(),
             },
             PppSocket {
                 fd: std::fs::File::open("/dev/null").unwrap().into(),
-                netns: socket_netns,
+                owner: socket_owner,
             },
         )
     }
 
     #[test]
     fn channel_attachment_rejects_namespace_mismatch_before_ioctl() {
-        // A different file supplies distinct identity metadata without
-        // creating a namespace or invoking the PPP subsystem. The data
-        // descriptors would fail PPPIOCGCHAN with ENOTTY if reached.
-        let different = NetNs::from(std::fs::File::open("/dev/null").unwrap());
+        // A made-up cookie stands for another namespace without creating
+        // one or invoking the PPP subsystem. The data descriptors would
+        // fail PPPIOCGCHAN with ENOTTY if reached.
         let (unit, socket) =
-            fake_ppp_objects(NetNs::current().unwrap(), different);
+            fake_ppp_objects(Owner::here(None).unwrap(), Owner::with_id(0));
         assert!(matches!(
             unit.connect_channel(&socket),
             Err(crate::Error::NamespaceMismatch)
@@ -431,11 +434,11 @@ mod tests {
 
     #[test]
     fn channel_attachment_accepts_matching_namespace_identity() {
-        // Independently opened descriptors for one namespace must compare
+        // Independently read identities of one namespace must compare
         // equal, allowing the channel ioctl to report the fake data fd.
         let (unit, socket) = fake_ppp_objects(
-            NetNs::current().unwrap(),
-            NetNs::current().unwrap(),
+            Owner::here(None).unwrap(),
+            Owner::here(None).unwrap(),
         );
         assert_eq!(
             unit.connect_channel(&socket).unwrap_err().raw_os_error(),

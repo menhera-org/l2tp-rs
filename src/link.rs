@@ -19,7 +19,7 @@ use std::{
 use netlink_packet_core::{NetlinkBuffer, NlasIterator};
 use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_ROUTE};
 
-use crate::{L2tpIfName, NetNs};
+use crate::{L2tpIfName, netns::Owner};
 
 const RTM_NEWLINK: u16 = 16;
 const RTNLGRP_LINK: u32 = 1;
@@ -35,8 +35,8 @@ pub(crate) struct LinkMonitor {
 
 impl LinkMonitor {
     /// Joins `RTNLGRP_LINK` in `netns`, which needs no privilege.
-    pub(crate) fn open(netns: &NetNs) -> io::Result<Self> {
-        let socket = netns.run_if_needed(|| -> io::Result<Socket> {
+    pub(crate) fn open(netns: &Owner) -> io::Result<Self> {
+        let socket = netns.run_in(|| -> io::Result<Socket> {
             let mut socket = Socket::new(NETLINK_ROUTE)?;
             socket.bind(&SocketAddr::new(0, 1 << (RTNLGRP_LINK - 1)))?;
             socket.set_non_blocking(true)?;
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn monitors_open_without_privileges_and_report_nothing_when_idle() {
-        let monitor = LinkMonitor::open(&NetNs::current().unwrap()).unwrap();
+        let monitor = LinkMonitor::open(&Owner::here(None).unwrap()).unwrap();
         let name = L2tpIfName::new("l2tp-no-such0").unwrap();
         // No notification concerns this name, and an idle socket does not
         // block.

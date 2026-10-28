@@ -2,7 +2,7 @@
 
 use std::{
     fmt, io,
-    os::fd::AsRawFd,
+    os::fd::{AsFd, AsRawFd},
     sync::{Arc, PoisonError},
 };
 
@@ -26,6 +26,7 @@ use crate::{
     TunnelSocket, TunnelStats,
     link::LinkMonitor,
     netlink::{self, SessionRef},
+    netns::Owner,
 };
 
 /// Name of the generic-netlink multicast group the kernel announces L2TP
@@ -47,7 +48,7 @@ struct L2tpInner {
     /// identifier (the `l2tp_netlink` module was reloaded).
     family: std::sync::Mutex<Option<FamilyInfo>>,
     /// Namespace the connection was opened in, for further connections.
-    netns: NetNs,
+    netns: Owner,
 }
 
 impl L2tpInner {
@@ -78,7 +79,7 @@ impl fmt::Debug for L2tpHandle {
 
 /// Opens a generic-netlink connection in its owning namespace.
 fn open_connection(
-    netns: &NetNs,
+    netns: &Owner,
 ) -> crate::Result<(Connection<RawGenlMessage>, GenetlinkHandle, Unsolicited)> {
     fn open()
     -> io::Result<(Connection<RawGenlMessage>, GenetlinkHandle, Unsolicited)>
@@ -97,7 +98,7 @@ fn open_connection(
     // a container. Otherwise create the socket on a temporary namespace
     // thread and register it with this runtime's I/O driver.
     let runtime = tokio::runtime::Handle::current();
-    Ok(netns.run_if_needed(move || {
+    Ok(netns.run_in(move || {
         let _guard = runtime.enter();
         open()
     })??)
@@ -108,8 +109,11 @@ impl L2tpHandle {
     ///
     /// The calling thread's network namespace is retained, including when
     /// inherited from a container. Further event connections use that same
-    /// namespace; opening them from another namespace requires the
-    /// privileges needed by `setns(2)`.
+    /// namespace; opening them from a thread in another namespace requires
+    /// the privileges needed by `setns(2)` and a descriptor of the namespace,
+    /// which is kept only when `/proc` was readable here. Without one, that
+    /// fails with an [`Unsupported`](io::ErrorKind::Unsupported) I/O error;
+    /// use [`new_in`](Self::new_in) instead. `/proc` is not needed otherwise.
     ///
     /// This must be awaited while running inside a Tokio runtime with I/O
     /// enabled, because the internal Generic Netlink connection task is
@@ -142,11 +146,13 @@ impl L2tpHandle {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             io::Error::other("tokio runtime is required for L2tpHandle")
         })?;
-        let netns = match netns {
-            Some(netns) => netns,
-            None => NetNs::current()?,
+        let mut netns = match netns {
+            Some(netns) => Owner::of(netns),
+            None => Owner::here(None)?,
         };
         let (mut connection, genl, _unsolicited) = open_connection(&netns)?;
+        // The identity is that of the socket actually created.
+        netns.identify(connection.socket_mut().socket_mut().as_fd())?;
         connection.set_forward_ack(true);
         connection.set_forward_done(true);
         runtime.spawn(connection);
@@ -384,7 +390,7 @@ impl L2tpHandle {
     /// while the interface still bears that name.
     fn index_by_name(&self, ifname: &L2tpIfName) -> Option<u32> {
         let name = *ifname;
-        match self.inner.netns.run_if_needed(move || name.index()) {
+        match self.inner.netns.run_in(move || name.index()) {
             Ok(Ok(index)) => Some(index),
             Ok(Err(err)) => {
                 log::debug!("l2tp: cannot resolve {ifname:?}: {err}");
@@ -1061,7 +1067,7 @@ mod tests {
                     id: TEST_FAMILY_ID,
                     events_group: None,
                 })),
-                netns: NetNs::current().unwrap(),
+                netns: Owner::here(None).unwrap(),
             }),
         }
     }
@@ -1335,7 +1341,8 @@ mod tests {
         runtime.block_on(async {
             let netns = NetNs::current().unwrap();
             let handle = L2tpHandle::new_in(&netns).await.unwrap();
-            assert!(handle.inner.netns.same_as(&netns).unwrap());
+            let here = Owner::here(None).unwrap();
+            assert_eq!(handle.inner.netns.same_as(&here), Some(true));
         });
     }
 }

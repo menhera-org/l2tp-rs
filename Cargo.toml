@@ -1,6 +1,6 @@
 [package]
 name = "l2tp"
-version = "0.4.0"
+version = "0.4.1"
 authors = ["metastable-void <mori@menhera.ad.jp>"]
 edition = "2024"
 rust-version = "1.89"
