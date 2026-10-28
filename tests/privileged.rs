@@ -5,7 +5,7 @@
 use std::{
     io::{BufRead, BufReader},
     net::{Ipv4Addr, SocketAddrV4},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     process::{Command, Stdio},
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -321,6 +321,75 @@ fn privileged_events_report_tunnel_lifecycle() {
     });
 }
 
+#[test]
+#[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp generic-netlink support"]
+fn privileged_bounded_events_report_overflow_and_continue() {
+    runtime().block_on(async {
+        let handle = L2tpHandle::new()
+            .await
+            .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
+        let mut events = handle
+            .events_bounded()
+            .await
+            .unwrap_or_else(|e| panic!("events_bounded failed: {e}"));
+        // The kernel raises this to its minimum receive buffer.
+        let size: libc::c_int = 0;
+        let rc = unsafe {
+            libc::setsockopt(
+                events.as_fd().as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&size as *const libc::c_int).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_RCVBUF: {}", std::io::Error::last_os_error());
+        // Notifications nobody reads overflow it.
+        for _ in 0..32 {
+            let (_, tunnel) =
+                create_unmanaged(&handle, || udp_loopback(L2tpVersion::V3))
+                    .await;
+            tunnel
+                .delete()
+                .await
+                .unwrap_or_else(|e| panic!("delete failed: {e}"));
+        }
+        let error = events
+            .next()
+            .await
+            .expect("the stream does not end")
+            .expect_err("the loss is reported first");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS), "{error}");
+        // The kernel delivers again once the queued notifications are read.
+        while let Ok(item) =
+            tokio::time::timeout(Duration::from_millis(200), events.next())
+                .await
+        {
+            item.expect("the stream does not end")
+                .expect("the queued notifications decode");
+        }
+        let (config, _tunnel) =
+            create_unmanaged(&handle, || udp_loopback(L2tpVersion::V3)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events
+                    .next()
+                    .await
+                    .expect("the stream does not end")
+                    .expect("the event decodes");
+                if matches!(
+                    event,
+                    L2tpEvent::TunnelCreated(info) if info.tunnel_id == config.tunnel_id()
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("events arrive after the overflow");
+    });
+}
+
 /// A PPP session on a fresh unmanaged tunnel, with the `PPPoL2TP` socket
 /// attached to it. The session handle has auto-delete disabled, because the
 /// kernel deletes the session together with the socket.
@@ -439,6 +508,9 @@ fn privileged_ppp_unit_connects_and_disconnects_a_channel() {
 fn privileged_blocking_api_manages_a_tunnel() {
     let handle = blocking::L2tpHandle::new()
         .unwrap_or_else(|e| panic!("blocking::L2tpHandle::new failed: {e}"));
+    let mut events = handle
+        .events_bounded()
+        .unwrap_or_else(|e| panic!("events_bounded failed: {e}"));
     let mut created = None;
     for _ in 0..16 {
         let config = udp_loopback(L2tpVersion::V3);
@@ -452,6 +524,11 @@ fn privileged_blocking_api_manages_a_tunnel() {
         }
     }
     let (config, tunnel) = created.expect("a unique tunnel id");
+    // The notification was queued before the creation was acknowledged.
+    assert!(events.any(|event| matches!(
+        event,
+        Ok(L2tpEvent::TunnelCreated(info)) if info.tunnel_id == config.tunnel_id()
+    )));
     let info = tunnel.get().unwrap_or_else(|e| panic!("get failed: {e}"));
     assert_eq!(info.tunnel_id, config.tunnel_id());
     assert!(

@@ -295,6 +295,13 @@ async fn main() -> l2tp::Result<()> {
 }
 ```
 
+`events` drains the socket into an unbounded queue, so a slow consumer
+costs memory instead of losing notifications. `events_bounded` reads the
+socket directly instead: notifications wait in its receive buffer, sized
+with `SO_RCVBUF` through `AsFd`, and an overflow is reported once as
+`ENOBUFS`, after which the stream continues. Resynchronize with the queries
+above when that happens. The blocking handle offers both as well.
+
 ## Blocking API
 
 `l2tp::blocking::L2tpHandle` mirrors the async handle with blocking methods.

@@ -18,12 +18,14 @@ use netlink_proto::{
     Connection,
     sys::{AsyncSocket, SocketAddr},
 };
+use netlink_sys::{Socket, protocols::NETLINK_GENERIC};
+use tokio::io::unix::AsyncFd;
 
 use crate::{
-    Events, L2tpIfName, L2tpIfNameExt, L2tpVersion, NetNs, PseudowireType,
-    SessionConfig, SessionHandle, SessionId, SessionInfo, SessionModify,
-    SessionStats, TunnelConfig, TunnelHandle, TunnelId, TunnelInfo,
-    TunnelSocket, TunnelStats,
+    BoundedEvents, Events, L2tpIfName, L2tpIfNameExt, L2tpVersion, NetNs,
+    PseudowireType, SessionConfig, SessionHandle, SessionId, SessionInfo,
+    SessionModify, SessionStats, TunnelConfig, TunnelHandle, TunnelId,
+    TunnelInfo, TunnelSocket, TunnelStats,
     link::LinkMonitor,
     netlink::{self, SessionRef},
     netns::Owner,
@@ -772,12 +774,7 @@ impl L2tpHandle {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             io::Error::other("tokio runtime is required for events")
         })?;
-        let family = self.resolve_family().await?;
-        let group = family.events_group.ok_or_else(|| {
-            crate::Error::FamilyResolution(format!(
-                "the l2tp family has no `{EVENTS_GROUP}` multicast group"
-            ))
-        })?;
+        let (family_id, group) = self.events_family().await?;
         let (mut connection, genl, receiver) =
             open_connection(&self.inner.netns)?;
         // The kernel sends these notifications without a sender port and
@@ -790,7 +787,60 @@ impl L2tpHandle {
         // Requests are never sent on this connection; it only listens.
         drop(genl);
         let task = runtime.spawn(connection);
-        Ok(Events::new(receiver, task, family.id))
+        Ok(Events::new(receiver, task, family_id))
+    }
+
+    /// Like [`events`](Self::events), but with no queue between the kernel
+    /// socket and the stream: notifications wait in the socket's bounded
+    /// receive buffer, and an overflow is reported as `ENOBUFS`; see
+    /// [`BoundedEvents`].
+    ///
+    /// No task is spawned; the stream must be polled inside a Tokio runtime
+    /// with I/O enabled, and creating it outside one fails with
+    /// [`Error::Io`](crate::Error::Io).
+    pub async fn events_bounded(&self) -> crate::Result<BoundedEvents> {
+        tokio::runtime::Handle::try_current().map_err(|_| {
+            io::Error::other("tokio runtime is required for events")
+        })?;
+        let (socket, family_id) = self.event_socket().await?;
+        socket.set_non_blocking(true)?;
+        // `AsyncFd` panics instead of failing without an I/O driver. `new`
+        // is deprecated for wrappers that do not own their descriptor, but
+        // `Socket` does, and `register` would require tokio 1.53.
+        #[allow(deprecated)]
+        let socket = std::panic::catch_unwind(move || AsyncFd::new(socket))
+            .map_err(|_| {
+            io::Error::other(
+                "tokio runtime with I/O enabled is required for events",
+            )
+        })??;
+        Ok(BoundedEvents::new(socket, family_id))
+    }
+
+    /// A blocking socket in the handle's original namespace, subscribed to
+    /// the L2TP notifications, and the family identifier to decode them.
+    pub(crate) async fn event_socket(&self) -> crate::Result<(Socket, u16)> {
+        let (family_id, group) = self.events_family().await?;
+        let socket =
+            self.inner.netns.run_in(move || -> io::Result<Socket> {
+                let mut socket = Socket::new(NETLINK_GENERIC)?;
+                // Bound for the same reason as in `events`.
+                socket.bind_auto()?;
+                socket.add_membership(group)?;
+                Ok(socket)
+            })??;
+        Ok((socket, family_id))
+    }
+
+    /// The family identifier and its notification group.
+    async fn events_family(&self) -> crate::Result<(u16, u32)> {
+        let family = self.resolve_family().await?;
+        let group = family.events_group.ok_or_else(|| {
+            crate::Error::FamilyResolution(format!(
+                "the l2tp family has no `{EVENTS_GROUP}` multicast group"
+            ))
+        })?;
+        Ok((family.id, group))
     }
 
     async fn resolve_family(&self) -> crate::Result<FamilyInfo> {
@@ -1324,6 +1374,16 @@ mod tests {
         match handle.events().await {
             Ok(events) => drop(events),
             // Without the l2tp module the family cannot be resolved.
+            Err(crate::Error::FamilyResolution(_)) => {}
+            Err(err) => panic!("unexpected error: {err:?}"),
+        }
+        match handle.events_bounded().await {
+            // Polling neither blocks nor fails; another namespace's events
+            // may be queued.
+            Ok(mut events) => assert!(!matches!(
+                futures::poll!(events.next()),
+                std::task::Poll::Ready(None | Some(Err(_)))
+            )),
             Err(crate::Error::FamilyResolution(_)) => {}
             Err(err) => panic!("unexpected error: {err:?}"),
         }

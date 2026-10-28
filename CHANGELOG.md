@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.4.3 (2026-10-28)
+
+### Added
+
+- `L2tpHandle::events_bounded` and `blocking::L2tpHandle::events_bounded`
+  return `BoundedEvents` and `blocking::BoundedEventIter`, which read
+  notifications straight from the socket with no queue in between. Memory
+  is bounded by the socket's receive buffer, which `AsFd` lets callers size;
+  an overflow is reported as `ENOBUFS` ahead of the notifications still
+  queued, and the subscription continues. `events` is unchanged.
 
 ### Fixed
 

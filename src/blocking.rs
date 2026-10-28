@@ -18,6 +18,8 @@
 
 use std::{
     future::Future,
+    io,
+    os::fd::{AsFd, BorrowedFd},
     pin::Pin,
     sync::{Arc, Mutex, mpsc},
     thread::{JoinHandle, ThreadId},
@@ -27,11 +29,12 @@ use futures::{
     StreamExt,
     future::{self, Either},
 };
+use netlink_sys::Socket;
 
 use crate::{
     IpEndpoint, L2tpEvent, L2tpIfName, NetNs, SessionConfig, SessionId,
     SessionInfo, SessionModify, SessionStats, TunnelConfig, TunnelId,
-    TunnelInfo, TunnelSocket, TunnelStats, UdpEndpoint,
+    TunnelInfo, TunnelSocket, TunnelStats, UdpEndpoint, event::Pending,
 };
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -444,6 +447,54 @@ impl L2tpHandle {
             _worker: self.clone(),
         })
     }
+
+    /// Subscribes to kernel notifications with no queue between the socket
+    /// and the iterator; see [`crate::L2tpHandle::events_bounded`] and
+    /// [`BoundedEventIter`].
+    pub fn events_bounded(&self) -> crate::Result<BoundedEventIter> {
+        let (socket, family_id) =
+            self.call(|handle| async move { handle.event_socket().await })?;
+        Ok(BoundedEventIter {
+            socket,
+            pending: Pending::new(family_id),
+        })
+    }
+}
+
+/// Blocking iterator over kernel notifications read straight from the
+/// socket; see [`crate::BoundedEvents`] for the bound and how loss is
+/// reported.
+///
+/// `next` blocks in `recvmsg` until a notification or an error arrives and
+/// never returns `None`. The iterator needs neither the worker nor a Tokio
+/// context, and works on after the handle is dropped. Dropping it leaves
+/// the multicast group.
+#[derive(Debug)]
+pub struct BoundedEventIter {
+    socket: Socket,
+    pending: Pending,
+}
+
+impl Iterator for BoundedEventIter {
+    type Item = crate::Result<L2tpEvent>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(item) = self.pending.next() {
+                return Some(item);
+            }
+            match self.socket.recv_from_full() {
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                received => self.pending.receive(received),
+            }
+        }
+    }
+}
+
+impl AsFd for BoundedEventIter {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.socket.as_fd()
+    }
 }
 
 /// Blocking iterator over kernel notifications; see [`L2tpHandle::events`].
@@ -766,6 +817,15 @@ mod tests {
         match handle.events() {
             Ok(events) => drop(events),
             // Without the l2tp family (module not loaded) resolution fails.
+            Err(crate::Error::FamilyResolution(_)) => {}
+            Err(err) => panic!("unexpected error: {err:?}"),
+        }
+        match handle.events_bounded() {
+            // The iterator outlives the handle and its worker.
+            Ok(events) => {
+                drop(handle);
+                drop(events);
+            }
             Err(crate::Error::FamilyResolution(_)) => {}
             Err(err) => panic!("unexpected error: {err:?}"),
         }

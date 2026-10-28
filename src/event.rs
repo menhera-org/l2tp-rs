@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
+    collections::VecDeque,
+    io,
+    os::fd::{AsFd, BorrowedFd},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -9,7 +12,8 @@ use futures::{Stream, channel::mpsc::UnboundedReceiver};
 use genetlink::message::RawGenlMessage;
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
 use netlink_packet_l2tp::{L2tpCmd, L2tpMessage};
-use netlink_proto::sys::SocketAddr;
+use netlink_sys::{Socket, SocketAddr};
+use tokio::io::unix::AsyncFd;
 
 use crate::{SessionInfo, TunnelInfo, netlink};
 
@@ -117,6 +121,126 @@ impl Drop for Events {
     }
 }
 
+/// Stream of [`L2tpEvent`]s read straight from the kernel socket, created by
+/// [`L2tpHandle::events_bounded`](crate::L2tpHandle::events_bounded).
+///
+/// Unlike [`Events`], no task drains the socket into a queue: notifications
+/// wait in the socket's receive buffer until the stream is polled, so the
+/// memory they take is bounded by that buffer. Size it with `SO_RCVBUF` or
+/// `SO_RCVBUFFORCE` on [`as_fd`](AsFd::as_fd). Once it is full, the kernel
+/// drops notifications, and the next item is an
+/// [`Error::Io`](crate::Error::Io) with OS error `ENOBUFS`. The socket holds
+/// that report ahead of the notifications it still queues, so it cannot be
+/// lost behind them. Query current tunnel and session state to
+/// resynchronize; the stream continues afterward and never ends.
+///
+/// Otherwise it behaves like [`Events`]: notifications are advisory and may
+/// describe another network namespace, messages that are not L2TP
+/// notifications from the kernel are skipped, and a notification that fails
+/// to decode is reported as an error. Dropping the stream leaves the
+/// multicast group.
+#[derive(Debug)]
+pub struct BoundedEvents {
+    socket: AsyncFd<Socket>,
+    pending: Pending,
+}
+
+impl BoundedEvents {
+    pub(crate) fn new(socket: AsyncFd<Socket>, family_id: u16) -> Self {
+        Self {
+            socket,
+            pending: Pending::new(family_id),
+        }
+    }
+}
+
+impl Stream for BoundedEvents {
+    type Item = crate::Result<L2tpEvent>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(item) = this.pending.next() {
+                return Poll::Ready(Some(item));
+            }
+            let mut guard = match this.socket.poll_read_ready(cx) {
+                Poll::Ready(Ok(guard)) => guard,
+                Poll::Ready(Err(err)) => {
+                    return Poll::Ready(Some(Err(err.into())));
+                }
+                Poll::Pending => return Poll::Pending,
+            };
+            if let Ok(received) =
+                guard.try_io(|socket| socket.get_ref().recv_from_full())
+            {
+                this.pending.receive(received);
+            }
+        }
+    }
+}
+
+impl AsFd for BoundedEvents {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.socket.get_ref().as_fd()
+    }
+}
+
+/// The items decoded from one received datagram, not yet returned.
+#[derive(Debug)]
+pub(crate) struct Pending {
+    family_id: u16,
+    items: VecDeque<crate::Result<L2tpEvent>>,
+}
+
+impl Pending {
+    pub(crate) fn new(family_id: u16) -> Self {
+        Self {
+            family_id,
+            items: VecDeque::new(),
+        }
+    }
+
+    pub(crate) fn next(&mut self) -> Option<crate::Result<L2tpEvent>> {
+        self.items.pop_front()
+    }
+
+    /// Queues what one receive returned: the socket's error, such as
+    /// `ENOBUFS`, or the notifications a datagram holds.
+    pub(crate) fn receive(
+        &mut self,
+        received: io::Result<(Vec<u8>, SocketAddr)>,
+    ) {
+        let (datagram, source) = match received {
+            Ok(received) => received,
+            Err(err) => return self.items.push_back(Err(err.into())),
+        };
+        // As in `Events`, only recvmsg's sender address identifies the
+        // kernel.
+        if source.port_number() != 0 {
+            return;
+        }
+        let mut rest = datagram.as_slice();
+        while !rest.is_empty() {
+            let message = match NetlinkMessage::deserialize(rest) {
+                Ok(message) => message,
+                // The framing is lost; nothing after it can be found.
+                Err(err) => return self.items.push_back(Err(err.into())),
+            };
+            // Messages are padded to four bytes.
+            let len = (message.header.length as usize).next_multiple_of(4);
+            match decode(message, self.family_id) {
+                Ok(Some(event)) => self.items.push_back(Ok(event)),
+                Ok(None) => {}
+                Err(err) => self.items.push_back(Err(err)),
+            }
+            rest = rest.get(len..).unwrap_or_default();
+        }
+    }
+}
+
 pub(crate) fn decode(
     message: NetlinkMessage<RawGenlMessage>,
     family_id: u16,
@@ -177,7 +301,9 @@ mod tests {
         cmd: L2tpCmd,
         attributes: Vec<L2tpAttribute>,
     ) -> NetlinkMessage<RawGenlMessage> {
-        let genl = GenlMessage::from_payload(L2tpMessage { cmd, attributes });
+        let mut genl =
+            GenlMessage::from_payload(L2tpMessage { cmd, attributes });
+        genl.set_resolved_family_id(family_id);
         let mut header = NetlinkHeader::default();
         header.message_type = family_id;
         NetlinkMessage::new(
@@ -251,6 +377,68 @@ mod tests {
         let foreign =
             notification(FAMILY_ID + 1, L2tpCmd::TunnelCreate, vec![]);
         assert_eq!(decode(foreign, FAMILY_ID).unwrap(), None);
+    }
+
+    /// Serializes messages into one datagram, as the kernel may batch them.
+    fn datagram(messages: Vec<NetlinkMessage<RawGenlMessage>>) -> Vec<u8> {
+        let mut datagram = Vec::new();
+        for mut message in messages {
+            message.finalize();
+            let start = datagram.len();
+            datagram.resize(start + message.buffer_len(), 0);
+            message.serialize(&mut datagram[start..]);
+        }
+        datagram
+    }
+
+    #[test]
+    fn datagrams_are_decoded_from_the_kernel_only() {
+        let created = || {
+            notification(
+                FAMILY_ID,
+                L2tpCmd::TunnelCreate,
+                vec![
+                    L2tpAttribute::ConnId(1),
+                    L2tpAttribute::PeerConnId(2),
+                    L2tpAttribute::ProtoVersion(3),
+                    L2tpAttribute::EncapType(L2tpEncapType::Ip),
+                    L2tpAttribute::IpSaddr(Ipv4Addr::LOCALHOST),
+                    L2tpAttribute::IpDaddr(Ipv4Addr::LOCALHOST),
+                ],
+            )
+        };
+        let kernel = SocketAddr::new(0, 0);
+        let mut pending = Pending::new(FAMILY_ID);
+        // Every message of a datagram counts; other families are skipped.
+        let foreign =
+            notification(FAMILY_ID + 1, L2tpCmd::TunnelCreate, vec![]);
+        pending.receive(Ok((
+            datagram(vec![created(), foreign, created()]),
+            kernel,
+        )));
+        for _ in 0..2 {
+            assert!(matches!(
+                pending.next(),
+                Some(Ok(L2tpEvent::TunnelCreated(info))) if info.tunnel_id == TunnelId(1)
+            ));
+        }
+        assert!(pending.next().is_none());
+        // A forged header port of zero does not disguise a user-space sender.
+        pending.receive(Ok((
+            datagram(vec![created()]),
+            SocketAddr::new(31337, 0),
+        )));
+        assert!(pending.next().is_none());
+        // Broken framing and socket errors are reported.
+        pending.receive(Ok((vec![0; 7], kernel)));
+        assert!(matches!(
+            pending.next(),
+            Some(Err(crate::Error::Netlink(_)))
+        ));
+        pending.receive(Err(io::Error::from_raw_os_error(libc::ENOBUFS)));
+        let error = pending.next().unwrap().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS));
+        assert!(pending.next().is_none());
     }
 
     #[tokio::test]
