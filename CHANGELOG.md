@@ -9,6 +9,8 @@
   A handle keeps a namespace descriptor only when `/proc` is readable; without
   one, opening further sockets from a thread in another namespace fails with
   an `Unsupported` I/O error instead of entering the handle's namespace.
+  Without `/proc`, `L2tpHandle::new_in` cannot recognize the calling thread's
+  own namespace and always enters `netns`, which needs `CAP_SYS_ADMIN`.
 - `NetNs::current` falls back to `PIDFD_GET_NET_NAMESPACE` (Linux 6.11+) when
   `/proc` is unavailable.
 

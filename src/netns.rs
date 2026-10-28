@@ -113,22 +113,13 @@ impl Owner {
         })
     }
 
-    /// The namespace `ns`; its identity is learned from the first socket
-    /// created inside it, through [`identify`](Self::identify).
-    pub(crate) fn of(ns: NetNs) -> Self {
-        Self {
-            id: None,
+    /// The namespace `ns`, identified by `socket`, the first socket created
+    /// inside it.
+    pub(crate) fn of(ns: NetNs, socket: BorrowedFd<'_>) -> io::Result<Self> {
+        Ok(Self {
+            id: NsId::of_socket(socket)?,
             fd: Some(ns),
-        }
-    }
-
-    /// Records the identity of the namespace `socket` was created in.
-    pub(crate) fn identify(
-        &mut self,
-        socket: BorrowedFd<'_>,
-    ) -> io::Result<()> {
-        self.id = NsId::of_socket(socket)?;
-        Ok(())
+        })
     }
 
     /// Runs `f` where the owner's sockets live: inline when that is the
@@ -140,7 +131,9 @@ impl Owner {
         T: Send + 'static,
     {
         match (self.id, NsId::of_thread()?) {
+            // Same namespace, or no way to tell: the kernel decides.
             (Some(a), Some(b)) if a == b => Ok(f()),
+            (None, _) | (_, None) => Ok(f()),
             (Some(_), Some(_)) => match &self.fd {
                 Some(ns) => ns.run(f),
                 None => Err(io::Error::new(
@@ -149,12 +142,6 @@ impl Owner {
                      thread's and no descriptor for it is held; create the \
                      handle with `new_in` or call from its namespace",
                 )),
-            },
-            // Identity unknown: a held descriptor still decides; without
-            // one the kernel does, in the calling thread's namespace.
-            _ => match &self.fd {
-                Some(ns) if !ns.is_current() => ns.run(f),
-                _ => Ok(f()),
             },
         }
     }
@@ -204,19 +191,22 @@ impl NetNs {
             .or_else(|err| Self::from_pidfd().ok_or(err))
     }
 
-    /// `ioctl(pidfd_open(gettid(), PIDFD_THREAD), PIDFD_GET_NET_NAMESPACE)`
+    /// `ioctl(pidfd_open(getpid()), PIDFD_GET_NET_NAMESPACE)`
     /// (`include/uapi/linux/pidfd.h`, Linux 6.11+).
     fn from_pidfd() -> Option<Self> {
-        // `PIDFD_THREAD` is `O_EXCL` (Linux 6.9+): the thread, not the
-        // thread-group leader whose namespace may differ.
-        // SAFETY: plain syscalls; the descriptors are owned exactly once.
-        let pidfd = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_open,
-                libc::gettid(),
-                libc::O_EXCL as libc::c_uint,
-            )
+        // A process pidfd names the thread-group leader, whose namespace
+        // another thread may not share; there, `PIDFD_THREAD` (`O_EXCL`,
+        // Linux 6.9+) names the calling thread instead.
+        // SAFETY: plain syscalls.
+        let (pid, tid) = unsafe { (libc::getpid(), libc::gettid()) };
+        let (target, flags) = if tid == pid {
+            (pid, 0)
+        } else {
+            (tid, libc::O_EXCL as libc::c_uint)
         };
+        // SAFETY: plain syscall; the descriptor is owned exactly once.
+        let pidfd =
+            unsafe { libc::syscall(libc::SYS_pidfd_open, target, flags) };
         if pidfd < 0 {
             return None;
         }
@@ -231,7 +221,7 @@ impl NetNs {
 
     /// Whether this is the calling thread's namespace, by inode; `false`
     /// when that cannot be told.
-    fn is_current(&self) -> bool {
+    pub(crate) fn is_current(&self) -> bool {
         let (Ok(current), Ok(this)) = (Self::current(), self.0.try_clone())
         else {
             return false;
@@ -354,9 +344,11 @@ mod tests {
         let caller = std::thread::current().id();
         let actual = owner.run_in(|| std::thread::current().id()).unwrap();
         assert_eq!(actual, caller);
-        // A descriptor of the current namespace, before its identity is
-        // known, is recognized as well.
-        let owner = Owner::of(NetNs::current().unwrap());
+        // A held descriptor is not entered when the cookies match; this one
+        // is no namespace and would fail `setns` with EINVAL.
+        let socket = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        let bogus = NetNs::from(File::open("/dev/null").unwrap());
+        let owner = Owner::of(bogus, socket.as_fd()).unwrap();
         let actual = owner.run_in(|| std::thread::current().id()).unwrap();
         assert_eq!(actual, caller);
     }

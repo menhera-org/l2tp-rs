@@ -77,13 +77,14 @@ impl fmt::Debug for L2tpHandle {
     }
 }
 
-/// Opens a generic-netlink connection in its owning namespace.
-fn open_connection(
-    netns: &Owner,
-) -> crate::Result<(Connection<RawGenlMessage>, GenetlinkHandle, Unsolicited)> {
-    fn open()
-    -> io::Result<(Connection<RawGenlMessage>, GenetlinkHandle, Unsolicited)>
-    {
+type Opened = (Connection<RawGenlMessage>, GenetlinkHandle, Unsolicited);
+
+/// Opens a generic-netlink connection on whichever thread runs it, and
+/// registers it with this runtime's I/O driver.
+fn opener() -> impl FnOnce() -> io::Result<Opened> + Send + 'static {
+    let runtime = tokio::runtime::Handle::current();
+    move || {
+        let _guard = runtime.enter();
         // netlink-sys registers its socket with Tokio's I/O driver through
         // `AsyncFd`, which panics instead of failing when the runtime has no
         // I/O driver. Tokio offers no way to check for the driver first.
@@ -93,15 +94,13 @@ fn open_connection(
             )
         })?
     }
+}
 
-    // Avoid setns when already in the owning namespace, including inside
-    // a container. Otherwise create the socket on a temporary namespace
-    // thread and register it with this runtime's I/O driver.
-    let runtime = tokio::runtime::Handle::current();
-    Ok(netns.run_in(move || {
-        let _guard = runtime.enter();
-        open()
-    })??)
+/// Opens a generic-netlink connection in its owning namespace. Avoids
+/// setns when already there, including inside a container; otherwise the
+/// socket is created on a temporary namespace thread.
+fn open_connection(netns: &Owner) -> crate::Result<Opened> {
+    Ok(netns.run_in(opener())??)
 }
 
 impl L2tpHandle {
@@ -136,7 +135,8 @@ impl L2tpHandle {
     /// network namespace `netns`.
     ///
     /// Entering a different namespace needs `CAP_SYS_ADMIN`; see [`NetNs`].
-    /// Tunnel sockets for managed tunnels must be created in the same
+    /// When `/proc` is unavailable, `netns` cannot be told apart from the
+    /// calling thread's own and is always entered. Tunnel sockets for managed tunnels must be created in the same
     /// namespace, for example inside [`NetNs::run`].
     pub async fn new_in(netns: &NetNs) -> crate::Result<Self> {
         Self::connect(Some(netns.try_clone()?)).await
@@ -146,13 +146,25 @@ impl L2tpHandle {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             io::Error::other("tokio runtime is required for L2tpHandle")
         })?;
-        let mut netns = match netns {
-            Some(netns) => Owner::of(netns),
-            None => Owner::here(None)?,
+        let open = opener();
+        let (netns, (mut connection, genl, _unsolicited)) = match netns {
+            None => (None, open()?),
+            // Telling the current namespace apart needs `/proc`; without it
+            // `new_in` always enters the namespace.
+            Some(ns) if ns.is_current() => (Some(ns), open()?),
+            Some(ns) => {
+                let opened = ns.run(open)??;
+                (Some(ns), opened)
+            }
         };
-        let (mut connection, genl, _unsolicited) = open_connection(&netns)?;
         // The identity is that of the socket actually created.
-        netns.identify(connection.socket_mut().socket_mut().as_fd())?;
+        let async_socket = connection.socket_mut();
+        let socket = async_socket.socket_mut();
+        let socket = socket.as_fd();
+        let netns = match netns {
+            None => Owner::here(Some(socket))?,
+            Some(ns) => Owner::of(ns, socket)?,
+        };
         connection.set_forward_ack(true);
         connection.set_forward_done(true);
         runtime.spawn(connection);
