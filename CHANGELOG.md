@@ -11,6 +11,9 @@
   an `Unsupported` I/O error instead of entering the handle's namespace.
   Without `/proc`, `L2tpHandle::new_in` cannot recognize the calling thread's
   own namespace and always enters `netns`, which needs `CAP_SYS_ADMIN`.
+  Before Linux 5.14 namespace identity is unknown, and sockets a handle opens
+  after its first connection, such as event connections, are created in the
+  calling thread's namespace.
 - `NetNs::current` falls back to `PIDFD_GET_NET_NAMESPACE` (Linux 6.11+) when
   `/proc` is unavailable.
 
