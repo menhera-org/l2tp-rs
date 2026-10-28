@@ -136,8 +136,9 @@ impl L2tpHandle {
     ///
     /// Entering a different namespace needs `CAP_SYS_ADMIN`; see [`NetNs`].
     /// When `/proc` is unavailable, `netns` cannot be told apart from the
-    /// calling thread's own and is always entered. Tunnel sockets for managed tunnels must be created in the same
-    /// namespace, for example inside [`NetNs::run`].
+    /// calling thread's own and is always entered. Tunnel sockets for managed
+    /// tunnels must be created in the same namespace, for example inside
+    /// [`NetNs::run`].
     pub async fn new_in(netns: &NetNs) -> crate::Result<Self> {
         Self::connect(Some(netns.try_clone()?)).await
     }
