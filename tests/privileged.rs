@@ -5,6 +5,7 @@
 use std::{
     io::{BufRead, BufReader},
     net::{Ipv4Addr, SocketAddrV4},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     process::{Command, Stdio},
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -511,14 +512,16 @@ fn privileged_managed_ip_sockets_report_their_peer() {
             .unwrap_or_else(|e| panic!("disconnect: {e}"));
         let err = socket.peer_addr_ip().expect_err("no peer after disconnect");
         assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN), "{err}");
-        assert!(
-            TunnelConfig::for_socket(
-                TunnelId(id),
-                TunnelId(id.wrapping_add(1)),
-                &socket
-            )
-            .is_err()
-        );
+        let config = TunnelConfig::for_socket(
+            TunnelId(id),
+            TunnelId(id.wrapping_add(1)),
+            &socket,
+        )
+        .unwrap_or_else(|e| panic!("describe the disconnected socket: {e}"));
+        let Encapsulation::Ip { remote, .. } = config.encapsulation() else {
+            panic!("expected IP encapsulation");
+        };
+        assert!(remote.ip().is_unspecified(), "{remote}");
         socket
             .reconnect_ip(&local)
             .unwrap_or_else(|e| panic!("reconnect: {e}"));
@@ -528,6 +531,198 @@ fn privileged_managed_ip_sockets_report_their_peer() {
         );
         drop(socket);
     }
+}
+
+/// Brings an interface up with `SIOCSIFFLAGS`.
+fn set_up(ifindex: u32) {
+    let name =
+        L2tpIfName::from_index(ifindex).unwrap_or_else(|e| panic!("{e}"));
+    // SAFETY: plain socket call; the descriptor is owned right below.
+    let fd = unsafe {
+        libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0)
+    };
+    assert_ne!(fd, -1, "{}", std::io::Error::last_os_error());
+    // SAFETY: `fd` is a new descriptor nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: an all-zero `ifreq` is a valid value.
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (dst, src) in request.ifr_name.iter_mut().zip(name.as_array()) {
+        *dst = *src as libc::c_char;
+    }
+    // The request type differs between C libraries.
+    #[allow(clippy::unnecessary_cast)]
+    let (get, set) = (
+        libc::SIOCGIFFLAGS as libc::Ioctl,
+        libc::SIOCSIFFLAGS as libc::Ioctl,
+    );
+    // SAFETY: `request` names the interface; the kernel writes its flags.
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), get, &mut request) };
+    assert_ne!(rc, -1, "{}", std::io::Error::last_os_error());
+    // SAFETY: SIOCGIFFLAGS stored the flags in this union member.
+    unsafe { request.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short };
+    // SAFETY: `request` names the interface and carries the new flags.
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), set, &mut request) };
+    assert_ne!(rc, -1, "{}", std::io::Error::last_os_error());
+}
+
+/// Sends one broadcast Ethernet frame out of the interface.
+fn send_frame(ifindex: u32) {
+    // IEEE local experimental EtherType.
+    const ETHERTYPE: u16 = 0x88b5;
+    // SAFETY: plain socket call; the descriptor is owned right below.
+    let fd = unsafe {
+        libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0)
+    };
+    assert_ne!(fd, -1, "{}", std::io::Error::last_os_error());
+    // SAFETY: `fd` is a new descriptor nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: an all-zero `sockaddr_ll` is a valid value.
+    let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    addr.sll_family = libc::AF_PACKET as libc::c_ushort;
+    addr.sll_protocol = ETHERTYPE.to_be();
+    addr.sll_ifindex = ifindex as libc::c_int;
+    let mut frame = [0u8; 60];
+    frame[..6].fill(0xff);
+    // A locally administered source address.
+    frame[6] = 0x02;
+    frame[12..14].copy_from_slice(&ETHERTYPE.to_be_bytes());
+    // SAFETY: `frame` and `addr` are valid for the lengths passed.
+    let sent = unsafe {
+        libc::sendto(
+            fd.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            0,
+            (&addr as *const libc::sockaddr_ll).cast(),
+            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        sent,
+        frame.len() as isize,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Reads one counter of `/sys/class/net/<interface>/statistics`.
+fn link_stat(ifindex: u32, stat: &str) -> u64 {
+    let name =
+        L2tpIfName::from_index(ifindex).unwrap_or_else(|e| panic!("{e}"));
+    let path = std::path::Path::new("/sys/class/net")
+        .join(name.as_os_str())
+        .join("statistics")
+        .join(stat);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+}
+
+/// Whether the counter exceeds `floor` within two seconds.
+fn stat_rises(ifindex: u32, stat: &str, floor: u64) -> bool {
+    (0..200).any(|_| {
+        let risen = link_stat(ifindex, stat) > floor;
+        if !risen {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        risen
+    })
+}
+
+#[test]
+#[ignore = "requires CAP_NET_ADMIN and CAP_NET_RAW/root and kernel l2tp_ip and \
+            l2tp_eth support"]
+fn privileged_unconnected_ip_socket_drops_until_connected() {
+    runtime().block_on(async {
+        let handle = L2tpHandle::new()
+            .await
+            .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
+        let id = next_id_base();
+        let (ours, theirs) = (TunnelId(id), TunnelId(id.wrapping_add(1)));
+        let (our_session, their_session) =
+            (SessionId(id.wrapping_add(2)), SessionId(id.wrapping_add(3)));
+        let local = IpEndpoint::V4(Ipv4Addr::LOCALHOST);
+
+        let socket = TunnelSocket::ip_unconnected(&local, None, ours, theirs)
+            .unwrap_or_else(|e| panic!("create an unconnected socket: {e}"));
+        let config = TunnelConfig::for_socket(ours, theirs, &socket)
+            .unwrap_or_else(|e| panic!("describe the socket: {e}"));
+        let tunnel = handle
+            .create_tunnel(config, socket)
+            .await
+            .unwrap_or_else(|e| panic!("create_tunnel failed: {e}"));
+        let session = handle
+            .create_session(SessionConfig::eth(
+                ours,
+                our_session,
+                their_session,
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("create_session failed: {e}"));
+
+        // The peer is a kernel-socket tunnel on the same host with the
+        // identifiers crossed.
+        let peer_tunnel = handle
+            .create_unmanaged_tunnel(
+                TunnelConfig::new(
+                    theirs,
+                    ours,
+                    Encapsulation::Ip {
+                        local: local.clone(),
+                        remote: local.clone(),
+                    },
+                )
+                .unwrap_or_else(|e| panic!("TunnelConfig::new failed: {e}")),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create the peer tunnel: {e}"));
+        let peer_session = handle
+            .create_session(SessionConfig::eth(
+                theirs,
+                their_session,
+                our_session,
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("create the peer session: {e}"));
+
+        let ifindex =
+            session.ifindex().expect("ethernet sessions have an index");
+        let peer_ifindex = peer_session
+            .ifindex()
+            .expect("ethernet sessions have an index");
+        set_up(ifindex);
+        set_up(peer_ifindex);
+
+        let dropped = link_stat(ifindex, "tx_dropped");
+        send_frame(ifindex);
+        assert!(
+            stat_rises(ifindex, "tx_dropped", dropped),
+            "an unconnected tunnel drops what its session sends"
+        );
+
+        tunnel
+            .socket()
+            .expect("a managed tunnel keeps its socket")
+            .reconnect_ip(&local)
+            .unwrap_or_else(|e| panic!("reconnect: {e}"));
+        let received = link_stat(peer_ifindex, "rx_packets");
+        send_frame(ifindex);
+        assert!(
+            stat_rises(peer_ifindex, "rx_packets", received),
+            "the frame reaches the peer after the connect"
+        );
+
+        peer_tunnel
+            .delete()
+            .await
+            .unwrap_or_else(|e| panic!("delete the peer tunnel: {e}"));
+        tunnel
+            .delete()
+            .await
+            .unwrap_or_else(|e| panic!("delete the tunnel: {e}"));
+    });
 }
 
 /// Set in the re-executed test binary that runs without procfs.

@@ -56,6 +56,13 @@ impl TunnelConfig {
     /// [`TunnelSocket::from_fd`], needs no repeated description. The version
     /// is [`L2tpVersion::V3`]; change it with
     /// [`with_version`](Self::with_version).
+    ///
+    /// A socket without a peer, from
+    /// [`TunnelSocket::ip_unconnected`], [`TunnelSocket::udp_unconnected`]
+    /// or after [`TunnelSocket::disconnect`], reports the unspecified address
+    /// of its family (port 0 for UDP) as the remote. That is enough for
+    /// [`L2tpHandle::create_tunnel`](crate::L2tpHandle::create_tunnel): the
+    /// kernel ignores the addresses of a tunnel created on a descriptor.
     pub fn for_socket(
         tunnel_id: TunnelId,
         peer_tunnel_id: TunnelId,

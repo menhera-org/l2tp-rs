@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.2 (2026-10-28)
+
+### Added
+
+- `TunnelSocket::ip_unconnected` and `TunnelSocket::udp_unconnected` bind a
+  tunnel socket without connecting a peer. The tunnel can be registered on
+  it right away; the kernel drops what its sessions send until the first
+  `reconnect_ip` or `reconnect_udp`.
+- `TunnelSocket::bind_to_device_index` applies `SO_BINDTOIFINDEX`, binding
+  by interface index instead of by name.
+
+### Changed
+
+- `TunnelConfig::for_socket` describes a socket without a peer, unconnected
+  or disconnected, with the unspecified address of its family as the remote
+  instead of failing with `ENOTCONN`. `create_tunnel` ignores the addresses of
+  a tunnel created on a descriptor.
+
 ## 0.4.1 (2026-10-28)
 
 ### Fixed

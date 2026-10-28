@@ -374,7 +374,11 @@ device for its whole life; see [Kernel Semantics Notes](#kernel-semantics-notes)
 
 - `TunnelSocket::for_config` creates the socket a `TunnelConfig` describes;
   `TunnelSocket::udp` and `TunnelSocket::ip` are the lower-level
-  constructors.
+  constructors. `udp_unconnected` and `ip_unconnected` only bind: the
+  tunnel can be registered before a peer is known, and the kernel drops
+  what its sessions send until `reconnect_udp` or `reconnect_ip`.
+  `TunnelConfig::for_socket` reports the remote of a socket without a peer
+  as the unspecified address, which `create_tunnel` ignores.
 - `TunnelSocket::from_fd` adopts a bound and connected datagram socket
   prepared elsewhere, for example with `socket2` or through socket
   activation, and `TunnelConfig::for_socket` describes such a socket. The
@@ -383,7 +387,8 @@ device for its whole life; see [Kernel Semantics Notes](#kernel-semantics-notes)
   closed together with the error.
 - `set_tos`, `set_hop_limit`, `set_mark`, `set_pmtu_discovery` and
   `set_ipv6_dontfrag` cover the common options of tunnel traffic;
-  `bind_to_device` applies `SO_BINDTODEVICE`, which needs `CAP_NET_RAW`.
+  `bind_to_device` applies `SO_BINDTODEVICE` and `bind_to_device_index`
+  `SO_BINDTOIFINDEX`; replacing an existing binding needs `CAP_NET_RAW`.
 - A `device` is not a scope. The kernel routes through the bound device by
   itself, so the socket never resolves it to an index; a device that
   disappears only matters to the kernel. A link-local scope, by contrast,

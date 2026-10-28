@@ -246,6 +246,42 @@ impl TunnelSocket {
         })
     }
 
+    /// Like [`udp`](Self::udp), but only binds: no peer is connected until
+    /// [`reconnect_udp`](Self::reconnect_udp). The tunnel may be registered
+    /// on it meanwhile; the kernel drops what its sessions send until the
+    /// first connect. A link-local `local` needs a scope ID or a `device`, as
+    /// for `udp`.
+    pub fn udp_unconnected(
+        local: &UdpEndpoint,
+        device: Option<&L2tpIfName>,
+    ) -> crate::Result<Self> {
+        require_udp_scope(local, device.is_some())?;
+
+        let family = SocketFamily::from_udp(local);
+        let fd = socket(family.domain(), libc::SOCK_DGRAM, libc::IPPROTO_UDP)?;
+
+        if let Some(device) = device {
+            set_bind_to_device(fd.as_raw_fd(), device)?;
+        }
+
+        bind(fd.as_raw_fd(), &udp_sockaddr(local))?;
+
+        Ok(Self {
+            fd,
+            encap: SocketEncap::Udp,
+            family,
+            scope: None,
+            conn_id: None,
+            peer_conn_id: None,
+            link: Mutex::new(Link {
+                pinned: device.is_some() || local.is_link_local(),
+                peer_v4: 0,
+                connected: false,
+                device: device.copied(),
+            }),
+        })
+    }
+
     /// Creates and connects an IP-encapsulated L2TP socket.
     ///
     /// The local bind uses `tunnel_id` as `l2tp_conn_id`, so it must match the
@@ -317,6 +353,51 @@ impl TunnelSocket {
                 pinned,
                 peer_v4: v4_bits(remote),
                 connected: true,
+                device: device.copied(),
+            }),
+        })
+    }
+
+    /// Like [`ip`](Self::ip), but only binds: no peer is connected until
+    /// [`reconnect_ip`](Self::reconnect_ip). The tunnel may be registered
+    /// on it meanwhile; the kernel drops what its sessions send until the
+    /// first connect. `peer_tunnel_id` is remembered for the reconnect.
+    /// A link-local `local` needs a scope or a `device`, as for `ip`.
+    pub fn ip_unconnected(
+        local: &IpEndpoint,
+        device: Option<&L2tpIfName>,
+        tunnel_id: TunnelId,
+        peer_tunnel_id: TunnelId,
+    ) -> crate::Result<Self> {
+        let pinning = unified_scope([local.scope(), device])?;
+        require_scope(local, pinning, false)?;
+        let scope = local.scope().copied();
+
+        let family = SocketFamily::from_ip(local);
+        let fd = socket(family.domain(), libc::SOCK_DGRAM, IPPROTO_L2TP)?;
+        let scope_id = if local.is_link_local() {
+            resolve_scope(fd.as_raw_fd(), scope.as_ref())?
+        } else {
+            0
+        };
+
+        if let Some(device) = device {
+            set_bind_to_device(fd.as_raw_fd(), device)?;
+        }
+
+        bind(fd.as_raw_fd(), &l2tp_sockaddr(local, tunnel_id.0, scope_id))?;
+
+        Ok(Self {
+            fd,
+            encap: SocketEncap::Ip,
+            family,
+            scope,
+            conn_id: Some(tunnel_id.0),
+            peer_conn_id: Some(peer_tunnel_id.0),
+            link: Mutex::new(Link {
+                pinned: device.is_some() || local.is_link_local(),
+                peer_v4: 0,
+                connected: false,
                 device: device.copied(),
             }),
         })
@@ -533,7 +614,8 @@ impl TunnelSocket {
     }
 
     /// Describes the socket's current addresses and UDP checksum options as
-    /// an [`Encapsulation`].
+    /// an [`Encapsulation`]. A socket without a peer reports the unspecified
+    /// address of its family as the remote.
     pub(crate) fn encapsulation(&self) -> crate::Result<Encapsulation> {
         let raw = self.fd.as_raw_fd();
         match self.encap {
@@ -556,22 +638,53 @@ impl TunnelSocket {
                         )? != 0,
                     ),
                 };
+                let remote = if self.link().connected {
+                    self.peer_addr_udp()?
+                } else {
+                    match self.family {
+                        SocketFamily::V4 => UdpEndpoint::V4(SocketAddrV4::new(
+                            Ipv4Addr::UNSPECIFIED,
+                            0,
+                        )),
+                        SocketFamily::V6 => UdpEndpoint::V6(SocketAddrV6::new(
+                            Ipv6Addr::UNSPECIFIED,
+                            0,
+                            0,
+                            0,
+                        )),
+                    }
+                };
                 Ok(Encapsulation::Udp {
                     local: self.local_addr_udp()?,
-                    remote: self.peer_addr_udp()?,
+                    remote,
                     udp_csum,
                     udp_zero_csum6_tx,
                     udp_zero_csum6_rx,
                 })
             }
-            SocketEncap::Ip => Ok(Encapsulation::Ip {
-                local: self.local_addr_ip()?,
-                remote: self.peer_addr_ip()?,
-            }),
+            SocketEncap::Ip => {
+                let remote = if self.link().connected {
+                    self.peer_addr_ip()?
+                } else {
+                    match self.family {
+                        SocketFamily::V4 => {
+                            IpEndpoint::V4(Ipv4Addr::UNSPECIFIED)
+                        }
+                        SocketFamily::V6 => {
+                            IpEndpoint::v6(Ipv6Addr::UNSPECIFIED)
+                        }
+                    }
+                };
+                Ok(Encapsulation::Ip {
+                    local: self.local_addr_ip()?,
+                    remote,
+                })
+            }
         }
     }
 
-    /// Applies `SO_BINDTODEVICE` on this socket; this requires `CAP_NET_RAW`.
+    /// Applies `SO_BINDTODEVICE` on this socket. Replacing an existing
+    /// binding requires `CAP_NET_RAW`, as does any binding on older kernels.
     ///
     /// Afterwards a link-local remote may omit its scope on reconnect.
     pub fn bind_to_device(&self, device: &L2tpIfName) -> crate::Result<()> {
@@ -579,6 +692,27 @@ impl TunnelSocket {
         set_bind_to_device(self.fd.as_raw_fd(), device)?;
         link.pinned = true;
         link.device = Some(*device);
+        Ok(())
+    }
+
+    /// Applies `SO_BINDTOIFINDEX` on this socket. It binds by index, so a
+    /// device that takes the name between a lookup and the bind cannot be
+    /// bound to. Same privilege rule as
+    /// [`bind_to_device`](Self::bind_to_device): none on a socket without a
+    /// binding, `CAP_NET_RAW` to replace one.
+    pub fn bind_to_device_index(&self, index: u32) -> crate::Result<()> {
+        let index =
+            libc::c_int::try_from(index).map_err(|_| errno(libc::ENODEV))?;
+        let mut link = self.link();
+        set_socket_int(
+            self.fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTOIFINDEX,
+            index,
+        )?;
+        link.pinned = true;
+        // The cache keeps names only; `from_fd` reads the name back.
+        link.device = None;
         Ok(())
     }
 
@@ -1890,6 +2024,123 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn unconnected_ip_sockets_connect_later() {
+        for (index, (local, unspecified)) in [
+            (
+                IpEndpoint::V4(Ipv4Addr::LOCALHOST),
+                IpEndpoint::V4(Ipv4Addr::UNSPECIFIED),
+            ),
+            (
+                IpEndpoint::v6(Ipv6Addr::LOCALHOST),
+                IpEndpoint::v6(Ipv6Addr::UNSPECIFIED),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tunnel_id =
+                TunnelId(0x4c32_5500 ^ std::process::id() ^ index as u32);
+            let peer_tunnel_id = TunnelId(tunnel_id.0 ^ 0x100);
+            let sock = match TunnelSocket::ip_unconnected(
+                &local,
+                None,
+                tunnel_id,
+                peer_tunnel_id,
+            ) {
+                Ok(sock) => sock,
+                Err(crate::Error::Io(e)) if skippable(&e) => continue,
+                Err(e) => panic!("unexpected IP socket error: {e:?}"),
+            };
+            assert_eq!(sock.local_addr_ip().unwrap(), local);
+            let err = sock.peer_addr_ip().unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN), "{err:?}");
+            let config =
+                TunnelConfig::for_socket(tunnel_id, peer_tunnel_id, &sock)
+                    .unwrap();
+            assert_eq!(
+                config.encapsulation(),
+                &Encapsulation::Ip {
+                    local: local.clone(),
+                    remote: unspecified,
+                }
+            );
+
+            sock.reconnect_ip(&local).unwrap();
+            assert_eq!(sock.peer_addr_ip().unwrap(), local);
+            sock.disconnect().unwrap();
+            let err = sock.peer_addr_ip().unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn unconnected_udp_socket_connects_later() {
+        let Some(receiver) = bind_v4_local() else {
+            return;
+        };
+        let remote = UdpEndpoint::V4(as_v4(receiver.local_addr().unwrap()));
+        let sock = match TunnelSocket::udp_unconnected(
+            &UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            None,
+        ) {
+            Ok(sock) => sock,
+            Err(crate::Error::Io(e)) if skippable(&e) => return,
+            Err(e) => panic!("unexpected UDP socket error: {e:?}"),
+        };
+        let local = sock.local_addr_udp().unwrap();
+        assert!(matches!(
+            local,
+            UdpEndpoint::V4(v4) if *v4.ip() == Ipv4Addr::LOCALHOST && v4.port() != 0
+        ));
+        let err = sock.peer_addr_udp().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN), "{err:?}");
+        let config =
+            TunnelConfig::for_socket(TunnelId(1), TunnelId(2), &sock).unwrap();
+        let Encapsulation::Udp {
+            local: described,
+            remote: unspecified,
+            ..
+        } = config.encapsulation()
+        else {
+            panic!("expected UDP encapsulation");
+        };
+        assert_eq!(*described, local);
+        assert_eq!(
+            *unspecified,
+            UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        );
+
+        sock.reconnect_udp(&remote).unwrap();
+        assert_eq!(sock.peer_addr_udp().unwrap(), remote);
+        sock.disconnect().unwrap();
+        let err = sock.peer_addr_udp().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN), "{err:?}");
+    }
+
+    #[test]
+    fn device_index_bindings_read_back_by_name() {
+        let Some(fd) = udp_fd(libc::AF_INET) else {
+            return;
+        };
+        let sock = raw_socket(fd, SocketEncap::Udp, SocketFamily::V4, None);
+        let lo = L2tpIfName::new("lo").unwrap();
+        match sock.bind_to_device_index(lo.index().unwrap()) {
+            Ok(()) => {}
+            // Older kernels require CAP_NET_RAW for any binding.
+            Err(e) if e.kind() == Some(io::ErrorKind::PermissionDenied) => {
+                return;
+            }
+            Err(e) => panic!("unexpected SO_BINDTOIFINDEX error: {e:?}"),
+        }
+        assert!(sock.link().pinned);
+        assert_eq!(sock.link().device, None);
+        let adopted =
+            TunnelSocket::from_fd(sock.try_clone_fd().unwrap()).unwrap();
+        assert_eq!(adopted.link().device, Some(lo));
+        assert!(adopted.link().pinned);
     }
 
     #[test]
