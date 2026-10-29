@@ -1,54 +1,74 @@
-# l2tp 0.4.4, addendum: the lenient decoder must be public
+# l2tp 0.5.0: public kernel decoding with distinct cookie types
 
-Checked on 2026-10-29 against commit `6f5b400` (0.4.4, unreleased) and the
-rs-l2tpd phase 2 code (`../rs-l2tpd/src/kernel/linux/`). Items 1 and 3 of
-the original instruction are complete and usable as shipped. Item 2 is
-complete for this crate's own handles but does not reach rs-l2tpd, for one
-reason:
+Reviewed on 2026-10-29 against this crate at `1296ed6` and the released
+`v0.4.3` API. This is a general-purpose Linux L2TP API; no changes to
+downstream projects are part of this task.
 
-rs-l2tpd sends its generic-netlink requests on its own socket (it needs a
-five-second deadline, which the handles do not offer, and it must not need
-a runtime), and decodes the replies with `netlink-packet-l2tp` 0.4.0's
-`L2tpMessage::parse_with_param`. That parser refuses a cookie whose length
-is not 0, 4 or 8 (`attribute.rs:760-770`, `validate_cookie_len`), so one
-foreign session with a 2-byte cookie still fails rs-l2tpd's whole session
-dump. 0.4.4 fixed exactly this in `netlink.rs:87-109` (`KernelMessage`,
-which takes any cookie up to 8 bytes before falling back to the upstream
-parser) and `types.rs:135` (`Cookie::from_kernel`), but both are
-`pub(crate)`.
+## Rationale and corrections
 
-## Add, in 0.4.4
+Callers using their own generic-netlink sockets need the same decoding as
+the crate's handles. `netlink-packet-l2tp` 0.4.0 rejects cookies other than
+0, 4 or 8 bytes, while Linux accepts and reports lengths from 0 through 8.
+See the cookie checks and session reporting in
+[Linux l2tp_netlink.c](https://github.com/torvalds/linux/blob/master/net/l2tp/l2tp_netlink.c).
 
-```rust
-/// A message as the kernel sends it: like `L2tpMessage`, but a cookie of
-/// any length up to 8 bytes is accepted (`l2tp_netlink.c` refuses only
-/// longer ones), so a reply or notification describing a session created
-/// elsewhere decodes. Emitting is unchanged.
-pub struct KernelMessage(pub L2tpMessage);
-// with its existing GenlFamily, Emitable and
-// ParseableParametrized<[u8], GenlHeader> impls, re-exported from the crate
-// root
+The existing internal `KernelMessage` parser already accommodates these
+reports. Making it public does not relax emission: the upstream emitter
+still validates RFC lengths and panics for a nonstandard cookie. Document
+this explicitly instead of claiming decoded messages cannot be emitted.
 
-impl Cookie {
-    /// A cookie as the kernel reported it: 0 to 8 bytes, any length.
-    /// Fails above 8. The only way to build a non-RFC-3931 length; see
-    /// `is_rfc3931`.
-    pub fn from_kernel(bytes: &[u8]) -> crate::Result<Self>;
-}
-```
+Keep `Cookie` strictly RFC-conforming. Introduce a distinct `KernelCookie`
+for reported values rather than exposing `Cookie::from_kernel`. Changing
+the public `SessionInfo.cookie` and `peer_cookie` field types breaks
+compatibility with v0.4.3, so release this work as 0.5.0, replacing the
+unreleased 0.4.4 version.
 
-Nothing else changes: `SessionInfo` keeps decoding through the same path,
-creation keeps refusing a non-conforming cookie, every other constructor
-keeps 0, 4 or 8.
+## Implementation
 
-Tests: the existing `KernelMessage` and `from_kernel` unit tests, plus one
-that parses a `GenlMessage<KernelMessage>` from the bytes of a reply
-carrying a 3-byte cookie and reads it back through `from_kernel`.
+- Export `pub struct KernelMessage(pub L2tpMessage)` at the crate root,
+  retaining its existing `GenlFamily`, `Emitable` and
+  `ParseableParametrized<[u8], GenlHeader>` implementations.
+- Add and export `KernelCookie`, with private storage, checked construction
+  from bytes accepting 0 through 8, byte/length accessors, hexadecimal
+  display, and `is_rfc3931`. It is not an unrestricted byte container.
+- Keep all `Cookie` construction and deserialization limited to 0, 4 or 8.
+  Provide infallible conversion from `Cookie` to `KernelCookie` and checked
+  conversion back, returning `Error::InvalidCookieLength` otherwise.
+- Use `KernelCookie` for both reported cookie fields in `SessionInfo`,
+  including queries, dumps and notifications. Session configuration stays
+  typed as `Cookie`; remove the now-redundant creation-time length check.
+- Preserve reported values in CLI output. With `serde`, both types use
+  hexadecimal strings in human-readable formats and byte strings otherwise;
+  `KernelCookie` must round-trip all allowed lengths.
+- Update API docs, README, changelog and package/lockfile versions together.
+  Explain the field-type migration and emission limitation. Avoid the old
+  claim that every public cookie constructor accepts only RFC lengths.
 
-CHANGELOG, under `### Added` of 0.4.4: "`KernelMessage` and
-`Cookie::from_kernel` are public, for callers that decode kernel replies
-themselves."
+## Additional 0.5.0 work
 
-rs-l2tpd then replaces `L2tpMessage::parse_with_param` with
-`KernelMessage` in `src/kernel/linux/l2tp.rs` and stores the reported
-cookie as `l2tp::Cookie` in its kernel `SessionInfo`.
+- Require Tokio 1.54.1 and replace deprecated `AsyncFd::new` with
+  `AsyncFd::register`, documenting ownership safety and preserving error handling.
+- Add explicit `HandleConfig { request_timeout: Option<Duration> }` arguments
+  to both async and blocking handle constructors. `Default` selects 30 seconds;
+  `None` disables timeouts. Apply the setting to family discovery and requests,
+  including dumps and family refresh, and document timer-driver requirements.
+- Timeouts report `Error::Io` with `TimedOut`. A mutation may have reached the
+  kernel: do not claim rollback or retry it automatically. Creation retains
+  its existing detached ACK/cleanup path so a timeout cannot close a managed
+  descriptor before the kernel consumes it or delete someone else's object.
+- Update all callers, docs and tests for the explicit configuration. Cover
+  stalled replies, disabled timeouts and late creation acknowledgements.
+- Review deprecated APIs and recorded compatibility deferrals. No other
+  marked deferrals or open repository issues were found.
+
+## Validation and completion
+
+Keep coverage for strict cookie construction and kernel-length limits.
+Test checked conversion in both directions, text/binary serde round trips,
+and parsing a `GenlMessage<KernelMessage>` with a three-byte cookie from an
+external integration test. Check both cookie attributes and rejection of
+oversized or malformed data. Retain session/event decoding coverage.
+Run formatting, tests, Clippy and documentation checks using musl on Linux.
+
+Commit this corrected instruction before implementation, then delete it
+when implementation is complete. Commit and push the completed work.
