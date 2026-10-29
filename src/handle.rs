@@ -40,11 +40,17 @@ type Unsolicited =
 /// Configuration for async and blocking L2TP handles.
 ///
 /// Pass this explicitly to handle constructors. The default limits each
-/// request to 30 seconds; set `request_timeout` to `None` to wait indefinitely.
+/// request to 30 seconds. Use
+/// [`with_request_timeout`](Self::with_request_timeout) to choose a limit or
+/// disable it with `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandleConfig {
-    /// Maximum wait for a request, including family discovery, a family-ID
-    /// retry, and all replies in a dump. `None` disables the limit.
+    pub(crate) request_timeout: Option<Duration>,
+}
+
+impl HandleConfig {
+    /// Sets the maximum wait for a request, including family discovery, a
+    /// family-ID retry, and all replies in a dump. `None` disables the limit.
     ///
     /// A finite timeout requires a Tokio time driver as well as I/O.
     /// Expiration returns [`Error::Io`](crate::Error::Io) with
@@ -56,7 +62,11 @@ pub struct HandleConfig {
     /// unclaimed objects. Keep the runtime running for that cleanup.
     /// Other multi-request operations apply the limit to each request.
     /// Event streams and blocking event iterators have no idle timeout.
-    pub request_timeout: Option<Duration>,
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
 }
 
 impl Default for HandleConfig {
@@ -1231,9 +1241,7 @@ mod tests {
 
     pub(super) fn test_handle(genl: GenetlinkHandle) -> L2tpHandle {
         L2tpHandle {
-            config: HandleConfig {
-                request_timeout: None,
-            },
+            config: HandleConfig::default().with_request_timeout(None),
             inner: Arc::new(L2tpInner {
                 genl,
                 family: std::sync::Mutex::new(Some(FamilyInfo {

@@ -7,8 +7,9 @@
 ### Breaking changes
 
 - Async and blocking `L2tpHandle::new` and `new_in` now require a
-  `HandleConfig`. Its `request_timeout: Option<Duration>` defaults to
-  30 seconds; `None` restores unlimited waits. Finite timeouts require the
+  `HandleConfig`. Its fields are crate-private; configure the timeout with
+  `.with_request_timeout(Option<Duration>)`. The default is 30 seconds;
+  `None` restores unlimited waits. Finite timeouts require the
   Tokio time driver. Expiration reports `Error::Io` with `TimedOut`;
   a mutation may already have reached the kernel.
 - `SessionInfo.cookie` and `peer_cookie` are `KernelCookie`, preserving

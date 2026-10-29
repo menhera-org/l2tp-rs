@@ -74,8 +74,9 @@ is required when using an IPv4 remote with `--no-udp-csum`.
 ## Request timeouts
 
 Both async and blocking constructors take an explicit `HandleConfig`.
-`HandleConfig::default()` sets a 30-second request timeout. Choose a limit
-or disable it with `None`:
+`HandleConfig::default()` sets a 30-second request timeout. Use the
+`with_request_timeout` builder method to choose a limit or disable it with
+`None`:
 
 ```rust,no_run
 use l2tp::{HandleConfig, L2tpHandle};
@@ -83,12 +84,12 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> l2tp::Result<()> {
-    let handle = L2tpHandle::new(HandleConfig {
-        request_timeout: Some(Duration::from_secs(5)),
-    }).await?;
-    let unlimited = L2tpHandle::new(HandleConfig {
-        request_timeout: None,
-    }).await?;
+    let handle = L2tpHandle::new(
+        HandleConfig::default().with_request_timeout(Some(Duration::from_secs(5))),
+    ).await?;
+    let unlimited = L2tpHandle::new(
+        HandleConfig::default().with_request_timeout(None),
+    ).await?;
     Ok(())
 }
 ```
@@ -606,9 +607,9 @@ The crate logs netlink requests and failures through the `log` crate at
 
 - Pass `HandleConfig` to `L2tpHandle::new(config)` and
   `L2tpHandle::new_in(&netns, config)`, including their blocking counterparts.
-  Use `HandleConfig::default()` for 30 seconds, or explicitly set
-  `request_timeout: None` for the old unlimited wait. Finite timeouts require
-  the Tokio time driver (`enable_time()` or `enable_all()`).
+  Use `HandleConfig::default()` for 30 seconds, or chain
+  `.with_request_timeout(None)` for the old unlimited wait. Finite timeouts
+  require the Tokio time driver (`enable_time()` or `enable_all()`).
 - `SessionInfo.cookie` and `peer_cookie` are now `KernelCookie`.
   Reusing one in a `SessionConfig` requires
   `config.cookie = info.cookie.try_into()?`.

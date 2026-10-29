@@ -791,10 +791,10 @@ pub(crate) async fn main() -> ExitCode {
     let cli = Cli::parse();
     let out = Output::new(cli.output);
 
-    let config = HandleConfig {
-        request_timeout: (cli.request_timeout != 0)
+    let config = HandleConfig::default().with_request_timeout(
+        (cli.request_timeout != 0)
             .then(|| Duration::from_secs(cli.request_timeout)),
-    };
+    );
     let handle = match L2tpHandle::new(config).await {
         Ok(v) => v,
         Err(e) => {
