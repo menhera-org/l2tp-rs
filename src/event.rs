@@ -160,13 +160,11 @@ impl BoundedEvents {
         tokio::runtime::Handle::try_current().map_err(|_| {
             io::Error::other("tokio runtime is required for events")
         })?;
-        // `AsyncFd` panics instead of failing without an I/O driver. `new`
-        // is deprecated for wrappers that do not own their descriptor, but
-        // `EventSocket` does, and `register` would require tokio 1.53. The
-        // socket is dropped by the panic, so no broken state is observed.
-        #[allow(deprecated)]
+        // Missing I/O drivers panic; the owned socket is dropped on unwind.
         let socket = std::panic::catch_unwind(AssertUnwindSafe(move || {
-            AsyncFd::new(socket)
+            // SAFETY: EventSocket owns its descriptor, never replaces it,
+            // and keeps it open for the lifetime of AsyncFd.
+            unsafe { AsyncFd::register(socket) }.map_err(io::Error::from)
         }))
         .map_err(|_| {
             io::Error::other(

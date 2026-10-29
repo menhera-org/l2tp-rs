@@ -13,9 +13,10 @@ use netlink_packet_l2tp::{
 };
 
 use crate::{
-    Cookie, Encapsulation, IpEndpoint, L2SpecType, L2tpIfName, L2tpVersion,
-    PseudowireType, SessionConfig, SessionId, SessionInfo, SessionModify,
-    SessionStats, TunnelConfig, TunnelId, TunnelInfo, TunnelStats, UdpEndpoint,
+    Encapsulation, IpEndpoint, KernelCookie, L2SpecType, L2tpIfName,
+    L2tpVersion, PseudowireType, SessionConfig, SessionId, SessionInfo,
+    SessionModify, SessionStats, TunnelConfig, TunnelId, TunnelInfo,
+    TunnelStats, UdpEndpoint,
 };
 
 /// How a session is addressed in `SESSION_GET`, `SESSION_DELETE` and
@@ -49,16 +50,23 @@ fn message(cmd: L2tpCmd, attributes: Vec<L2tpAttribute>) -> L2tpMessage {
 const L2TP_ATTR_COOKIE: u16 = 15;
 const L2TP_ATTR_PEER_COOKIE: u16 = 16;
 
-/// An [`L2tpMessage`] parsed as the kernel may send it.
+/// An L2TP generic-netlink message decoded with the kernel's cookie limits.
 ///
-/// `netlink-packet-l2tp` parses cookies of 0, 4 or 8 bytes only, which would
-/// fail a whole reply or dump on a session created elsewhere with another
-/// length; the kernel stores and reports any length up to 8
-/// (`l2tp_netlink.c`). This parser keeps such a cookie as reported. Replies
-/// are never emitted again, so the unchecked attribute goes nowhere but
-/// [`decode_session_info`].
+/// Use with [`netlink_packet_generic::GenlMessage`] when receiving replies or
+/// notifications on your own socket, without a handle or runtime. Both cookie
+/// attributes accept any length from 0 through 8; other attributes retain
+/// the validation of [`L2tpMessage`]. Convert reported bytes to
+/// [`KernelCookie`].
+///
+/// Emission delegates to `netlink-packet-l2tp` unchanged. Its emitter
+/// **panics** for non-RFC cookie lengths; decoding a message does not make it
+/// suitable for emission. Use [`Cookie`](crate::Cookie) to validate cookies for
+/// creation.
 #[derive(Debug, Clone)]
-pub(crate) struct KernelMessage(pub(crate) L2tpMessage);
+pub struct KernelMessage(
+    /// The decoded message, including the original cookie bytes.
+    pub L2tpMessage,
+);
 
 impl GenlFamily for KernelMessage {
     fn family_name() -> &'static str {
@@ -230,13 +238,6 @@ pub(crate) fn encode_tunnel_get_dump() -> L2tpMessage {
 pub(crate) fn encode_session_create(
     config: &SessionConfig,
 ) -> crate::Result<L2tpMessage> {
-    // Only a cookie copied from a kernel report can break RFC 3931; never
-    // send one back.
-    for cookie in [config.cookie, config.peer_cookie] {
-        if !cookie.is_rfc3931() {
-            return Err(crate::Error::InvalidCookieLength(cookie.len()));
-        }
-    }
     let mut attrs = vec![
         L2tpAttribute::ConnId(config.tunnel_id.0),
         L2tpAttribute::SessionId(config.session_id.0),
@@ -435,8 +436,8 @@ pub(crate) fn decode_session_info(
     let mut peer_session_id = None;
     let mut pseudowire_type = None;
     let mut l2spec_type = None;
-    let mut cookie = Cookie::none();
-    let mut peer_cookie = Cookie::none();
+    let mut cookie = KernelCookie::none();
+    let mut peer_cookie = KernelCookie::none();
     let mut recv_seq = false;
     let mut send_seq = false;
     let mut lns_mode = false;
@@ -459,9 +460,11 @@ pub(crate) fn decode_session_info(
                 l2spec_type = Some(from_l2tp_l2spec(*v))
             }
             // A session created elsewhere may carry any length up to 8.
-            L2tpAttribute::Cookie(v) => cookie = Cookie::from_kernel(v)?,
+            L2tpAttribute::Cookie(v) => {
+                cookie = KernelCookie::try_from(v.as_slice())?
+            }
             L2tpAttribute::PeerCookie(v) => {
-                peer_cookie = Cookie::from_kernel(v)?
+                peer_cookie = KernelCookie::try_from(v.as_slice())?
             }
             L2tpAttribute::RecvSeq(v) => recv_seq = *v != 0,
             L2tpAttribute::SendSeq(v) => send_seq = *v != 0,
@@ -607,6 +610,7 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
     use super::*;
+    use crate::Cookie;
 
     fn has_attr(
         attrs: &[L2tpAttribute],
@@ -1217,8 +1221,11 @@ mod tests {
         assert_eq!(info.peer_session_id, SessionId(9));
         assert_eq!(info.pseudowire_type, PseudowireType::Ppp);
         assert_eq!(info.l2spec_type, Some(L2SpecType::None));
-        assert_eq!(info.cookie, Cookie::from([1, 2, 3, 4]));
-        assert_eq!(info.peer_cookie, Cookie::from([5, 6, 7, 8, 9, 10, 11, 12]));
+        assert_eq!(info.cookie, KernelCookie::from([1, 2, 3, 4]));
+        assert_eq!(
+            info.peer_cookie,
+            KernelCookie::from([5, 6, 7, 8, 9, 10, 11, 12])
+        );
         assert!(info.recv_seq);
         assert!(!info.send_seq);
         assert!(info.lns_mode);
@@ -1245,21 +1252,13 @@ mod tests {
             assert_eq!(info.peer_cookie.as_bytes(), bytes.as_slice());
             assert!(!info.cookie.is_rfc3931());
 
-            // Re-creating the session from the report is refused before
-            // anything is encoded.
-            let mut cfg =
-                SessionConfig::eth(TunnelId(7), SessionId(8), SessionId(9));
-            cfg.cookie = info.cookie;
-            assert!(matches!(
-                encode_session_create(&cfg),
-                Err(crate::Error::InvalidCookieLength(n)) if n == bytes.len()
-            ));
-            cfg.cookie = Cookie::none();
-            cfg.peer_cookie = info.peer_cookie;
-            assert!(matches!(
-                encode_session_create(&cfg),
-                Err(crate::Error::InvalidCookieLength(_))
-            ));
+            // Reported cookies must be validated before session creation.
+            for cookie in [info.cookie, info.peer_cookie] {
+                assert!(matches!(
+                    Cookie::try_from(cookie),
+                    Err(crate::Error::InvalidCookieLength(n)) if n == bytes.len()
+                ));
+            }
         }
     }
 

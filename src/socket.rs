@@ -1812,7 +1812,7 @@ mod tests {
     async fn create_tunnel_rejects_a_mismatched_bound_connection_id() {
         use futures::FutureExt;
 
-        let handle = match crate::L2tpHandle::new().await {
+        let handle = match crate::L2tpHandle::new(Default::default()).await {
             Ok(handle) => handle,
             Err(crate::Error::Io(e)) if skippable(&e) => return,
             Err(e) => panic!("unexpected netlink socket error: {e:?}"),

@@ -30,9 +30,9 @@ use futures::{
 };
 
 use crate::{
-    EventSocket, IpEndpoint, L2tpEvent, L2tpIfName, NetNs, SessionConfig,
-    SessionId, SessionInfo, SessionModify, SessionStats, TunnelConfig,
-    TunnelId, TunnelInfo, TunnelSocket, TunnelStats, UdpEndpoint,
+    EventSocket, HandleConfig, IpEndpoint, L2tpEvent, L2tpIfName, NetNs,
+    SessionConfig, SessionId, SessionInfo, SessionModify, SessionStats,
+    TunnelConfig, TunnelId, TunnelInfo, TunnelSocket, TunnelStats, UdpEndpoint,
 };
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -85,18 +85,22 @@ impl std::fmt::Debug for L2tpHandle {
 
 impl L2tpHandle {
     /// Starts the worker thread and opens the netlink connection in the
-    /// calling thread's network namespace.
-    pub fn new() -> crate::Result<Self> {
-        Self::start(None)
+    /// calling thread's network namespace. Request timeouts follow
+    /// [`HandleConfig`]; the worker enables both I/O and time drivers.
+    pub fn new(config: HandleConfig) -> crate::Result<Self> {
+        Self::start(None, config)
     }
 
     /// Starts the worker thread with its netlink connection in `netns`,
     /// which needs `CAP_SYS_ADMIN`; see [`NetNs`].
-    pub fn new_in(netns: &NetNs) -> crate::Result<Self> {
-        Self::start(Some(netns.try_clone()?))
+    pub fn new_in(netns: &NetNs, config: HandleConfig) -> crate::Result<Self> {
+        Self::start(Some(netns.try_clone()?), config)
     }
 
-    fn start(netns: Option<NetNs>) -> crate::Result<Self> {
+    fn start(
+        netns: Option<NetNs>,
+        config: HandleConfig,
+    ) -> crate::Result<Self> {
         let (task_tx, mut task_rx) =
             tokio::sync::mpsc::unbounded_channel::<Task>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<crate::Result<()>>(1);
@@ -106,6 +110,7 @@ impl L2tpHandle {
                 let runtime =
                     match tokio::runtime::Builder::new_current_thread()
                         .enable_io()
+                        .enable_time()
                         .build()
                     {
                         Ok(runtime) => runtime,
@@ -116,8 +121,10 @@ impl L2tpHandle {
                     };
                 runtime.block_on(async move {
                     let handle = match &netns {
-                        None => crate::L2tpHandle::new().await,
-                        Some(netns) => crate::L2tpHandle::new_in(netns).await,
+                        None => crate::L2tpHandle::new(config).await,
+                        Some(netns) => {
+                            crate::L2tpHandle::new_in(netns, config).await
+                        }
                     };
                     let handle = match handle {
                         Ok(handle) => handle,
@@ -719,7 +726,7 @@ mod tests {
 
     #[test]
     fn requests_complete_from_a_plain_thread() {
-        let handle = L2tpHandle::new().unwrap();
+        let handle = L2tpHandle::new(Default::default()).unwrap();
         let err = handle.get_tunnel(TunnelId(u32::MAX)).unwrap_err();
         permission_or_missing(&err);
         let clone = handle.clone();
@@ -742,7 +749,7 @@ mod tests {
             // A nested `block_on` would panic here; the worker thread does
             // not need the caller's runtime at all.
             tokio::task::spawn_blocking(|| {
-                let handle = L2tpHandle::new().unwrap();
+                let handle = L2tpHandle::new(Default::default()).unwrap();
                 // Fails as root (no such tunnel) and unprivileged (EPERM).
                 handle
                     .open_tunnel(TunnelId(u32::MAX))
@@ -760,7 +767,7 @@ mod tests {
             .unwrap();
         let err = runtime.block_on(async {
             tokio::task::spawn_blocking(|| {
-                L2tpHandle::new()
+                L2tpHandle::new(Default::default())
                     .unwrap()
                     .get_session(TunnelId(u32::MAX), SessionId(1))
                     .unwrap_err()
@@ -773,7 +780,7 @@ mod tests {
 
     #[test]
     fn worker_stops_when_the_last_handle_drops() {
-        let handle = L2tpHandle::new().unwrap();
+        let handle = L2tpHandle::new(Default::default()).unwrap();
         let worker = Arc::downgrade(&handle.worker);
         drop(handle);
         assert!(worker.upgrade().is_none());
@@ -781,7 +788,7 @@ mod tests {
 
     #[test]
     fn event_iterator_blocks_without_a_tokio_context() {
-        let handle = L2tpHandle::new().unwrap();
+        let handle = L2tpHandle::new(Default::default()).unwrap();
         let (tx, rx) = mpsc::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         tx.send(Err(crate::Error::other("probe"))).unwrap();
@@ -806,7 +813,7 @@ mod tests {
 
     #[test]
     fn event_subscription_can_be_opened_and_dropped() {
-        let handle = L2tpHandle::new().unwrap();
+        let handle = L2tpHandle::new(Default::default()).unwrap();
         match handle.events() {
             Ok(events) => drop(events),
             // Without the l2tp family (module not loaded) resolution fails.
@@ -826,7 +833,7 @@ mod tests {
 
     #[test]
     fn event_socket_outlives_the_handle_without_blocking() {
-        let handle = L2tpHandle::new().unwrap();
+        let handle = L2tpHandle::new(Default::default()).unwrap();
         match handle.event_socket() {
             Ok(mut socket) => {
                 drop(handle);

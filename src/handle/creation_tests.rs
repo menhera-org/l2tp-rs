@@ -743,3 +743,119 @@ fn deletion_wait_handles_present_tunnels_without_runtime_drivers() {
         }
     });
 }
+
+#[tokio::test(start_paused = true)]
+async fn timed_out_creates_keep_ownership_until_late_ack() {
+    for resource in [Resource::Managed, Resource::Unmanaged, Resource::Session]
+    {
+        for before_send in [true, false] {
+            for code in [0, libc::EEXIST] {
+                let mut harness = Harness::new();
+                harness.handle.config.request_timeout =
+                    Some(Duration::from_secs(1));
+                let (mut creation, socket) = harness.create(resource);
+                assert!(futures::poll!(creation.as_mut()).is_pending());
+                tokio::task::yield_now().await;
+                let request = if before_send {
+                    None
+                } else {
+                    Some(harness.next_request(resource.create_cmd()).await)
+                };
+                tokio::time::advance(Duration::from_secs(2)).await;
+                assert_eq!(
+                    creation.await.unwrap_err().kind(),
+                    Some(io::ErrorKind::TimedOut)
+                );
+                if let Some(socket) = &socket {
+                    assert!(
+                        socket.is_open(),
+                        "timeout closed a queued or unacknowledged FD"
+                    );
+                }
+                let request = match request {
+                    Some(request) => request,
+                    None => harness.next_request(resource.create_cmd()).await,
+                };
+                harness.ack(&request, code);
+                if code == 0 {
+                    if matches!(resource, Resource::Session) {
+                        harness.session_lookup(false).await;
+                    }
+                    harness.finish_cleanup(resource).await;
+                } else {
+                    harness.assert_idle().await;
+                }
+                if let Some(socket) = &socket {
+                    assert!(!socket.is_open());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_covers_family_discovery_and_refresh_without_reset() {
+    for cached in [false, true] {
+        let mut harness = Harness::new();
+        harness.handle.config = HandleConfig::default();
+        if !cached {
+            *harness.handle.inner.family.lock().unwrap() = None;
+        }
+        let handle = harness.handle.clone();
+        let request =
+            tokio::spawn(async move { handle.get_tunnel(TunnelId(101)).await });
+        if cached {
+            let get = harness.next_request(L2tpCmd::TunnelGet).await;
+            tokio::time::advance(Duration::from_secs(20)).await;
+            harness.ack(&get, libc::ENOENT);
+        }
+        harness.next_family_query().await;
+        tokio::time::advance(Duration::from_secs(if cached { 11 } else { 31 }))
+            .await;
+        assert_eq!(
+            request.await.unwrap().unwrap_err().kind(),
+            Some(io::ErrorKind::TimedOut)
+        );
+        harness.assert_idle().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn disabled_timeout_accepts_a_late_reply() {
+    let mut harness = Harness::new();
+    let handle = harness.handle.clone();
+    let request =
+        tokio::spawn(async move { handle.get_tunnel(TunnelId(101)).await });
+    let get = harness.next_request(L2tpCmd::TunnelGet).await;
+    tokio::time::advance(Duration::from_secs(300)).await;
+    assert!(!request.is_finished());
+    harness.tunnel_reply(&get, L2tpVersion::V3);
+    assert_eq!(
+        harness.settle(request).await.unwrap().tunnel_id,
+        TunnelId(101)
+    );
+    harness.assert_idle().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn partial_dump_does_not_reset_timeout() {
+    let mut harness = Harness::new();
+    harness.handle.config = HandleConfig::default();
+    let handle = harness.handle.clone();
+    let request = tokio::spawn(async move { handle.list_tunnels().await });
+    let raw = harness.next_raw_request("tunnel dump").await;
+    let get = Message::deserialize(&raw).unwrap();
+    tokio::time::advance(Duration::from_secs(20)).await;
+    let mut partial = Message::from(GenlMessage::from_payload(
+        L2tpMessage::new(L2tpCmd::TunnelGet),
+    ));
+    partial.header.flags = NLM_F_MULTIPART;
+    harness.reply(&get, partial);
+    harness.step().await;
+    tokio::time::advance(Duration::from_secs(11)).await;
+    assert_eq!(
+        request.await.unwrap().unwrap_err().kind(),
+        Some(io::ErrorKind::TimedOut)
+    );
+    harness.assert_idle().await;
+}

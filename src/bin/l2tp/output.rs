@@ -387,7 +387,7 @@ fn session_to_json(info: &SessionInfo) -> SessionInfoJson {
     }
 }
 
-fn fmt_cookie(cookie: &l2tp::Cookie) -> String {
+fn fmt_cookie(cookie: &l2tp::KernelCookie) -> String {
     if cookie.is_empty() {
         "none".to_string()
     } else {

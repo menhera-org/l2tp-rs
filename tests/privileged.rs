@@ -150,7 +150,7 @@ fn privileged_bind_to_device_on_loopback() {
 #[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp generic-netlink support"]
 fn privileged_unmanaged_tunnel_lifecycle_over_genl() {
     runtime().block_on(async {
-        let handle = L2tpHandle::new()
+        let handle = L2tpHandle::new(Default::default())
             .await
             .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
         for version in [L2tpVersion::V3, L2tpVersion::V2] {
@@ -185,7 +185,7 @@ fn privileged_unmanaged_tunnel_lifecycle_over_genl() {
 #[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp_eth support"]
 fn privileged_session_lifecycle_over_genl() {
     runtime().block_on(async {
-        let handle = L2tpHandle::new()
+        let handle = L2tpHandle::new(Default::default())
             .await
             .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
         let (config, mut tunnel) = create_unmanaged(&handle, ip_loopback).await;
@@ -236,7 +236,10 @@ fn privileged_session_lifecycle_over_genl() {
         assert_eq!(info.session_id, session_id);
         assert_eq!(info.peer_session_id, peer_session_id);
         assert_eq!(info.pseudowire_type, PseudowireType::Eth);
-        assert_eq!(info.cookie, Cookie::from([1, 2, 3, 4]));
+        assert_eq!(
+            info.cookie,
+            l2tp::KernelCookie::from(Cookie::from([1, 2, 3, 4]))
+        );
         let ifname = info.ifname.expect("ethernet sessions have an interface");
 
         // The same session is reachable by its interface name.
@@ -281,7 +284,7 @@ fn privileged_session_lifecycle_over_genl() {
 #[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp generic-netlink support"]
 fn privileged_events_report_tunnel_lifecycle() {
     runtime().block_on(async {
-        let handle = L2tpHandle::new()
+        let handle = L2tpHandle::new(Default::default())
             .await
             .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
         let mut events = handle
@@ -335,7 +338,7 @@ fn privileged_events_report_tunnel_lifecycle() {
 #[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp generic-netlink support"]
 fn privileged_bounded_events_report_overflow_and_continue() {
     runtime().block_on(async {
-        let handle = L2tpHandle::new()
+        let handle = L2tpHandle::new(Default::default())
             .await
             .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
         let mut events = handle
@@ -467,7 +470,7 @@ fn create_foreign_session(
 #[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp_eth support"]
 fn privileged_foreign_odd_length_cookies_are_reported_never_sent() {
     runtime().block_on(async {
-        let handle = L2tpHandle::new()
+        let handle = L2tpHandle::new(Default::default())
             .await
             .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
         let (config, _tunnel) = create_unmanaged(&handle, ip_loopback).await;
@@ -506,15 +509,9 @@ fn privileged_foreign_odd_length_cookies_are_reported_never_sent() {
             .await
             .unwrap_or_else(|e| panic!("list_all_sessions failed: {e}"));
 
-        // Re-creating it from the report is refused before any request.
-        let mut again = SessionConfig::eth(
-            tunnel_id,
-            SessionId(tunnel_id.0.wrapping_add(4)),
-            peer_session_id,
-        );
-        again.cookie = info.cookie;
+        // Non-RFC reports cannot be converted into a creation cookie.
         assert!(matches!(
-            handle.create_session(again).await,
+            Cookie::try_from(info.cookie),
             Err(l2tp::Error::InvalidCookieLength(2))
         ));
         handle
@@ -537,7 +534,7 @@ fn privileged_event_socket_reads_without_a_runtime() {
     }
 
     let session_id = rt.block_on(async {
-        let handle = L2tpHandle::new()
+        let handle = L2tpHandle::new(Default::default())
             .await
             .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
         let (config, _tunnel) = create_unmanaged(&handle, ip_loopback).await;
@@ -621,7 +618,7 @@ async fn attached_ppp_session(
 #[ignore = "requires CAP_NET_ADMIN/root and the kernel l2tp_ppp module"]
 fn privileged_ppp_session_attaches_a_pppol2tp_socket() {
     runtime().block_on(async {
-        let handle = L2tpHandle::new()
+        let handle = L2tpHandle::new(Default::default())
             .await
             .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
         let (config, tunnel, session_id, session, socket) =
@@ -659,7 +656,7 @@ fn privileged_ppp_session_attaches_a_pppol2tp_socket() {
             /dev/ppp"]
 fn privileged_ppp_unit_connects_and_disconnects_a_channel() {
     runtime().block_on(async {
-        let handle = L2tpHandle::new()
+        let handle = L2tpHandle::new(Default::default())
             .await
             .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
         let (_config, tunnel, _session_id, _session, socket) =
@@ -696,7 +693,7 @@ fn privileged_ppp_unit_connects_and_disconnects_a_channel() {
 #[test]
 #[ignore = "requires CAP_NET_ADMIN/root and kernel l2tp generic-netlink support"]
 fn privileged_blocking_api_manages_a_tunnel() {
-    let handle = blocking::L2tpHandle::new()
+    let handle = blocking::L2tpHandle::new(Default::default())
         .unwrap_or_else(|e| panic!("blocking::L2tpHandle::new failed: {e}"));
     let mut events = handle
         .events_bounded()
@@ -903,7 +900,7 @@ fn stat_rises(ifindex: u32, stat: &str, floor: u64) -> bool {
             l2tp_eth support"]
 fn privileged_unconnected_ip_socket_drops_until_connected() {
     runtime().block_on(async {
-        let handle = L2tpHandle::new()
+        let handle = L2tpHandle::new(Default::default())
             .await
             .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
         let id = next_id_base();
@@ -1028,7 +1025,7 @@ fn without_procfs() {
         "procfs is still visible"
     );
     runtime().block_on(async {
-        let handle = L2tpHandle::new()
+        let handle = L2tpHandle::new(Default::default())
             .await
             .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
         handle
@@ -1096,10 +1093,10 @@ fn privileged_new_in_controls_another_namespace() {
         let netns = NetNs::open(format!("/proc/{}/ns/net", child.id()))
             .unwrap_or_else(|e| panic!("open the namespace: {e}"));
         runtime().block_on(async {
-            let outer = L2tpHandle::new()
+            let outer = L2tpHandle::new(Default::default())
                 .await
                 .unwrap_or_else(|e| panic!("L2tpHandle::new failed: {e}"));
-            let inner = L2tpHandle::new_in(&netns)
+            let inner = L2tpHandle::new_in(&netns, Default::default())
                 .await
                 .unwrap_or_else(|e| panic!("L2tpHandle::new_in failed: {e}"));
             // Opened from this thread, in another namespace: setns.
@@ -1156,7 +1153,7 @@ fn privileged_cli_tunnel_survives_process_exit() {
         String::from_utf8_lossy(&output.stderr)
     );
     runtime().block_on(async {
-        let handle = L2tpHandle::new().await.unwrap();
+        let handle = L2tpHandle::new(Default::default()).await.unwrap();
         let info = handle.get_tunnel(TunnelId(id)).await;
         // Clean up our tunnel before asserting that the lookup succeeded.
         let cleanup = handle.delete_tunnel(TunnelId(id)).await;

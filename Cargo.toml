@@ -1,6 +1,6 @@
 [package]
 name = "l2tp"
-version = "0.4.4"
+version = "0.5.0"
 authors = ["metastable-void <mori@menhera.ad.jp>"]
 edition = "2024"
 rust-version = "1.89"
@@ -36,7 +36,7 @@ netlink-packet-generic = "0.5"
 netlink-proto          = "0.13"
 netlink-sys            = "0.9"
 genetlink              = "0.3"
-tokio                  = { version = "1", features = ["rt", "sync", "net"] }
+tokio                  = { version = "1.54.1", features = ["rt", "sync", "net", "time"] }
 libc                   = "0.2"
 log                    = "0.4"
 thiserror              = "2"
@@ -50,7 +50,7 @@ ciborium               = "0.2"
 postcard               = { version = "1", default-features = false, features = ["alloc"] }
 serde_json             = "1"
 # README examples are compiled as doctests.
-tokio                  = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio                  = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [dependencies]
 clap                   = { version = "4", features = ["derive"], optional = true }

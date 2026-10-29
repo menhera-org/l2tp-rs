@@ -4,6 +4,7 @@ use std::{
     fmt, io,
     os::fd::{AsFd, AsRawFd},
     sync::{Arc, PoisonError},
+    time::Duration,
 };
 
 use futures::{Stream, StreamExt, channel::mpsc::UnboundedReceiver};
@@ -36,10 +37,41 @@ const EVENTS_GROUP: &str = "l2tp";
 type Unsolicited =
     UnboundedReceiver<(NetlinkMessage<RawGenlMessage>, SocketAddr)>;
 
+/// Configuration for async and blocking L2TP handles.
+///
+/// Pass this explicitly to handle constructors. The default limits each
+/// request to 30 seconds; set `request_timeout` to `None` to wait indefinitely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandleConfig {
+    /// Maximum wait for a request, including family discovery, a family-ID
+    /// retry, and all replies in a dump. `None` disables the limit.
+    ///
+    /// A finite timeout requires a Tokio time driver as well as I/O.
+    /// Expiration returns [`Error::Io`](crate::Error::Io) with
+    /// [`io::ErrorKind::TimedOut`]. A mutation may already have reached the
+    /// kernel; a timeout does not mean rollback. Query state before retrying.
+    ///
+    /// Creation waits are bounded across the entire operation, but their
+    /// background tasks retain ownership until acknowledgement and clean up
+    /// unclaimed objects. Keep the runtime running for that cleanup.
+    /// Other multi-request operations apply the limit to each request.
+    /// Event streams and blocking event iterators have no idle timeout.
+    pub request_timeout: Option<Duration>,
+}
+
+impl Default for HandleConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout: Some(Duration::from_secs(30)),
+        }
+    }
+}
+
 /// Shared async handle for L2TP generic-netlink operations.
 #[derive(Clone)]
 pub struct L2tpHandle {
     inner: Arc<L2tpInner>,
+    config: HandleConfig,
 }
 
 struct L2tpInner {
@@ -73,6 +105,7 @@ impl fmt::Debug for L2tpHandle {
         f.debug_struct("L2tpHandle")
             .field("family", &self.inner.cached_family())
             .field("netns", &self.inner.netns)
+            .field("config", &self.config)
             .finish_non_exhaustive()
     }
 }
@@ -115,20 +148,22 @@ impl L2tpHandle {
     /// use [`new_in`](Self::new_in) instead. `/proc` is not needed otherwise.
     ///
     /// This must be awaited while running inside a Tokio runtime with I/O
-    /// enabled, because the internal Generic Netlink connection task is
+    /// enabled, and a time driver when request timeouts are configured.
+    /// The internal Generic Netlink connection task is
     /// spawned onto the current Tokio executor. Without a runtime, or with a
     /// runtime built without `enable_io`, this returns
     /// [`Error::Io`](crate::Error::Io). Tokio reports a missing I/O driver by
     /// panicking inside the netlink socket registration; that panic is caught
     /// and turned into the error, so the panic hook still runs. The handle is
-    /// cheap to clone; clones share one netlink connection.
+    /// cheap to clone; clones share one netlink connection and copy the
+    /// configuration. See [`HandleConfig`] for timeout semantics.
     ///
     /// Requests that refer to a tunnel or session the kernel does not know
     /// fail with [`Error::KernelError`](crate::Error::KernelError) carrying
     /// `ENODEV`. Every L2TP command needs `CAP_NET_ADMIN`; without it the
     /// kernel replies `EPERM`.
-    pub async fn new() -> crate::Result<Self> {
-        Self::connect(None).await
+    pub async fn new(config: HandleConfig) -> crate::Result<Self> {
+        Self::connect(None, config).await
     }
 
     /// Like [`new`](Self::new), but controls the L2TP subsystem of the
@@ -139,11 +174,17 @@ impl L2tpHandle {
     /// calling thread's own and is always entered. Tunnel sockets for managed
     /// tunnels must be created in the same namespace, for example inside
     /// [`NetNs::run`].
-    pub async fn new_in(netns: &NetNs) -> crate::Result<Self> {
-        Self::connect(Some(netns.try_clone()?)).await
+    pub async fn new_in(
+        netns: &NetNs,
+        config: HandleConfig,
+    ) -> crate::Result<Self> {
+        Self::connect(Some(netns.try_clone()?), config).await
     }
 
-    async fn connect(netns: Option<NetNs>) -> crate::Result<Self> {
+    async fn connect(
+        netns: Option<NetNs>,
+        config: HandleConfig,
+    ) -> crate::Result<Self> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             io::Error::other("tokio runtime is required for L2tpHandle")
         })?;
@@ -171,6 +212,7 @@ impl L2tpHandle {
         runtime.spawn(connection);
 
         Ok(Self {
+            config,
             inner: Arc::new(L2tpInner {
                 genl,
                 family: std::sync::Mutex::new(None),
@@ -214,8 +256,8 @@ impl L2tpHandle {
         let message =
             netlink::encode_tunnel_create(&config, Some(socket.as_raw_fd()))?;
         let handle = self.clone();
-        run_creation(async move {
-            handle.send_ack(message).await?;
+        run_creation(self.config.request_timeout, async move {
+            handle.send_creation(message).await?;
             Ok(TunnelHandle {
                 tunnel_id: config.tunnel_id,
                 socket: Some(socket),
@@ -248,8 +290,8 @@ impl L2tpHandle {
     ) -> crate::Result<TunnelHandle> {
         let message = netlink::encode_tunnel_create(&config, None)?;
         let handle = self.clone();
-        run_creation(async move {
-            handle.send_ack(message).await?;
+        run_creation(self.config.request_timeout, async move {
+            handle.send_creation(message).await?;
             Ok(TunnelHandle {
                 tunnel_id: config.tunnel_id,
                 socket: None,
@@ -319,7 +361,7 @@ impl L2tpHandle {
             }
             _ => None,
         };
-        run_creation(async move {
+        run_creation(self.config.request_timeout, async move {
             // The kernel stores 32-bit session IDs even for V2, whose wire
             // format truncates them to 16 bits. Only query the parent when an
             // ID is outside the range shared by both protocol versions.
@@ -331,7 +373,7 @@ impl L2tpHandle {
             {
                 return Err(crate::Error::V2IdTooLarge(id.0));
             }
-            handle.send_ack(message).await?;
+            handle.send_creation(message).await?;
             handle.get_created_session(config, monitor).await
         })
         .await
@@ -821,7 +863,9 @@ impl L2tpHandle {
 
     /// The family identifier and its notification group.
     async fn events_family(&self) -> crate::Result<(u16, u32)> {
-        let family = self.resolve_family().await?;
+        let family =
+            with_timeout(self.config.request_timeout, self.resolve_family())
+                .await?;
         let group = family.events_group.ok_or_else(|| {
             crate::Error::FamilyResolution(format!(
                 "the l2tp family has no `{EVENTS_GROUP}` multicast group"
@@ -856,6 +900,14 @@ impl L2tpHandle {
         Ok(info)
     }
 
+    // Keep creation requests alive through ACK even if the caller times out:
+    // the queued request may still contain an owned socket's raw descriptor.
+    async fn send_creation(&self, payload: L2tpMessage) -> crate::Result<()> {
+        let mut handle = self.clone();
+        handle.config.request_timeout = None;
+        handle.send_ack(payload).await
+    }
+
     async fn send_ack(&self, payload: L2tpMessage) -> crate::Result<()> {
         let _ = self
             .send_and_collect(payload, NLM_F_REQUEST | NLM_F_ACK)
@@ -864,6 +916,18 @@ impl L2tpHandle {
     }
 
     async fn send_and_collect(
+        &self,
+        payload: L2tpMessage,
+        flags: u16,
+    ) -> crate::Result<Vec<GenlMessage<L2tpMessage>>> {
+        with_timeout(
+            self.config.request_timeout,
+            self.send_and_collect_unlimited(payload, flags),
+        )
+        .await
+    }
+
+    async fn send_and_collect_unlimited(
         &self,
         payload: L2tpMessage,
         flags: u16,
@@ -927,6 +991,43 @@ impl L2tpHandle {
                 Err(err)
             }
         }
+    }
+}
+
+async fn with_timeout<F, T>(
+    timeout: Option<Duration>,
+    future: F,
+) -> crate::Result<T>
+where
+    F: std::future::Future<Output = crate::Result<T>>,
+{
+    let Some(timeout) = timeout else {
+        return future.await;
+    };
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request timeout is too large",
+            )
+        })?;
+    // Tokio has no fallible way to construct a timer without a time driver.
+    let timer = std::panic::catch_unwind(|| tokio::time::sleep_until(deadline))
+        .map_err(|_| {
+            io::Error::other(
+                "tokio runtime with time enabled is required for request \
+                 timeouts",
+            )
+        })?;
+    futures::pin_mut!(future, timer);
+    match futures::future::select(future, timer).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "L2TP request timed out; a mutation may have reached the kernel",
+        )
+        .into()),
     }
 }
 
@@ -1025,7 +1126,10 @@ impl<T> Drop for CreationResult<T> {
 // result is dropped with auto-delete enabled. Do not construct that handle
 // before a successful ACK: deleting after EEXIST could remove someone else's
 // tunnel or session.
-async fn run_creation<F, T>(creation: F) -> crate::Result<T>
+async fn run_creation<F, T>(
+    timeout: Option<Duration>,
+    creation: F,
+) -> crate::Result<T>
 where
     F: std::future::Future<Output = crate::Result<T>> + Send + 'static,
     T: Send + 'static,
@@ -1034,15 +1138,19 @@ where
         io::Error::other("tokio runtime is required for creation")
     })?;
     let cleanup_runtime = runtime.clone();
-    let mut result = runtime
-        .spawn(async move {
-            CreationResult {
-                value: Some(creation.await),
-                runtime: cleanup_runtime,
-            }
-        })
-        .await
-        .map_err(|err| io::Error::other(err.to_string()))?;
+    // Spawn only after the timeout has been initialized successfully.
+    let mut result = with_timeout(timeout, async move {
+        runtime
+            .spawn(async move {
+                CreationResult {
+                    value: Some(creation.await),
+                    runtime: cleanup_runtime,
+                }
+            })
+            .await
+            .map_err(|err| io::Error::other(err.to_string()).into())
+    })
+    .await?;
     result.value.take().unwrap_or_else(|| {
         Err(crate::Error::other("creation task lost its result"))
     })
@@ -1123,6 +1231,9 @@ mod tests {
 
     pub(super) fn test_handle(genl: GenetlinkHandle) -> L2tpHandle {
         L2tpHandle {
+            config: HandleConfig {
+                request_timeout: None,
+            },
             inner: Arc::new(L2tpInner {
                 genl,
                 family: std::sync::Mutex::new(Some(FamilyInfo {
@@ -1132,6 +1243,35 @@ mod tests {
                 netns: Owner::here(None).unwrap(),
             }),
         }
+    }
+
+    #[test]
+    fn disabled_timeout_needs_no_runtime_and_missing_timer_is_an_error() {
+        assert_eq!(
+            futures::executor::block_on(with_timeout(None, async { Ok(7) }))
+                .unwrap(),
+            7
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut polled = false;
+            let result = with_timeout(Some(Duration::from_secs(1)), async {
+                polled = true;
+                Ok(())
+            })
+            .await;
+            assert!(result.unwrap_err().to_string().contains("time enabled"));
+            assert!(!polled, "a request must not be started without its timer");
+            assert_eq!(
+                with_timeout(Some(Duration::MAX), async { Ok(()) })
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                Some(io::ErrorKind::InvalidInput)
+            );
+        });
     }
 
     #[test]
@@ -1336,7 +1476,8 @@ mod tests {
 
     #[test]
     fn new_fails_without_tokio_runtime() {
-        let result = futures::executor::block_on(L2tpHandle::new());
+        let result =
+            futures::executor::block_on(L2tpHandle::new(Default::default()));
         match result {
             Ok(_) => panic!("expected failure without tokio runtime"),
             Err(crate::Error::Io(e)) => {
@@ -1355,7 +1496,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        match runtime.block_on(L2tpHandle::new()) {
+        match runtime.block_on(L2tpHandle::new(Default::default())) {
             Ok(_) => panic!("expected failure without an I/O driver"),
             Err(crate::Error::Io(e)) => {
                 assert!(
@@ -1369,7 +1510,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_subscription_joins_the_multicast_group() {
-        let handle = L2tpHandle::new().await.unwrap();
+        let handle = L2tpHandle::new(Default::default()).await.unwrap();
         match handle.events().await {
             Ok(events) => drop(events),
             // Without the l2tp module the family cannot be resolved.
@@ -1404,7 +1545,7 @@ mod tests {
             err.kind().is_some()
                 || matches!(err, crate::Error::FamilyResolution(_))
         }
-        let handle = L2tpHandle::new().await.unwrap();
+        let handle = L2tpHandle::new(Default::default()).await.unwrap();
         let err = handle.open_tunnel(TunnelId(u32::MAX)).await.unwrap_err();
         assert!(refused(&err), "{err:?}");
         let name = L2tpIfName::new("l2tp-no-such0").unwrap();
@@ -1420,7 +1561,9 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let netns = NetNs::current().unwrap();
-            let handle = L2tpHandle::new_in(&netns).await.unwrap();
+            let handle = L2tpHandle::new_in(&netns, Default::default())
+                .await
+                .unwrap();
             let here = Owner::here(None).unwrap();
             assert_eq!(handle.inner.netns.same_as(&here), Some(true));
         });

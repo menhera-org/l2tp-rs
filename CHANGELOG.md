@@ -1,6 +1,21 @@
 # Changelog
 
-## 0.4.4 (2026-10-29)
+## 0.5.0 (2026-10-29)
+
+0.4.4 was never released; its changes are included here.
+
+### Breaking changes
+
+- Async and blocking `L2tpHandle::new` and `new_in` now require a
+  `HandleConfig`. Its `request_timeout: Option<Duration>` defaults to
+  30 seconds; `None` restores unlimited waits. Finite timeouts require the
+  Tokio time driver. Expiration reports `Error::Io` with `TimedOut`;
+  a mutation may already have reached the kernel.
+- `SessionInfo.cookie` and `peer_cookie` are `KernelCookie`, preserving
+  all kernel-reported lengths from 0 through 8. `Cookie` remains strictly
+  0, 4 or 8 bytes for creation. Use `Cookie::try_from(info.cookie)` before
+  copying a report into a `SessionConfig`; non-RFC lengths fail with
+  `Error::InvalidCookieLength`.
 
 ### Added
 
@@ -19,7 +34,15 @@
 - `BoundedEvents::from_socket` registers an `EventSocket` with the current
   Tokio runtime. `events_bounded` and `blocking::BoundedEventIter` are built
   on `EventSocket`, unchanged in behaviour.
-- `Cookie::is_rfc3931` tells whether a cookie is 0, 4 or 8 bytes long.
+- Public `KernelMessage` for callers decoding generic-netlink replies and
+  notifications on their own sockets, without a handle or runtime. It
+  accepts both cookie attributes up to 8 bytes. Emission retains upstream
+  validation and panics for non-RFC lengths.
+- `KernelCookie`, including `is_rfc3931`, checked conversion to `Cookie`,
+  and hexadecimal/binary serde round trips for all reported lengths.
+  Construction rejects lengths above 8 with `Error::InvalidKernelCookieLength`.
+- CLI `--request-timeout SECONDS` (default 30; 0 disables the timeout).
+  Event monitoring has no idle timeout.
 
 ### Changed
 
@@ -28,11 +51,13 @@
   kernel accepts any length up to 8, and such a cookie is now reported as
   it is in `SessionInfo`. Replies are parsed with lengths
   `netlink-packet-l2tp` 0.4.0 refuses.
-- Session creation refuses a cookie that is not 0, 4 or 8 bytes with
-  `Error::InvalidCookieLength` before any request is sent. Before this, no
-  constructor could produce one; the check guards cookies copied from a
-  `SessionInfo`. Every public way of building a `Cookie`, including
-  deserialization, still accepts 0, 4 or 8 bytes only.
+- Tokio now requires 1.54.1. Event socket registration uses
+  `AsyncFd::register`, removing the deprecated `AsyncFd::new` call and its
+  lint suppression. The Rust minimum remains 1.89.
+- Request timeouts cover discovery, family refresh and complete dumps.
+  Creation continues through acknowledgement and cleanup after a caller
+  times out, retaining managed descriptors until the kernel consumes them.
+  Other multi-request operations apply the timeout to each request.
 
 ## 0.4.3 (2026-10-28)
 

@@ -6,6 +6,7 @@ use std::{
     net::{IpAddr, SocketAddr, SocketAddrV6},
     os::unix::ffi::OsStrExt,
     process::ExitCode,
+    time::Duration,
 };
 
 use clap::{
@@ -14,9 +15,9 @@ use clap::{
 };
 use futures::StreamExt;
 use l2tp::{
-    Cookie, Encapsulation, IpEndpoint, L2SpecType, L2tpHandle, L2tpIfName,
-    L2tpIfNameExt, L2tpVersion, PseudowireType, SessionConfig, SessionId,
-    SessionInfo, SessionModify, TunnelConfig, TunnelId, UdpEndpoint,
+    Cookie, Encapsulation, HandleConfig, IpEndpoint, L2SpecType, L2tpHandle,
+    L2tpIfName, L2tpIfNameExt, L2tpVersion, PseudowireType, SessionConfig,
+    SessionId, SessionInfo, SessionModify, TunnelConfig, TunnelId, UdpEndpoint,
 };
 
 use crate::output::Output;
@@ -105,6 +106,11 @@ fn ifname_parser() -> IfNameParser {
 struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = OutputFmt::Text)]
     output: OutputFmt,
+
+    /// Request timeout in seconds; 0 disables it. Does not limit monitor idle
+    /// time.
+    #[arg(long, global = true, default_value_t = 30)]
+    request_timeout: u64,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -785,7 +791,11 @@ pub(crate) async fn main() -> ExitCode {
     let cli = Cli::parse();
     let out = Output::new(cli.output);
 
-    let handle = match L2tpHandle::new().await {
+    let config = HandleConfig {
+        request_timeout: (cli.request_timeout != 0)
+            .then(|| Duration::from_secs(cli.request_timeout)),
+    };
+    let handle = match L2tpHandle::new(config).await {
         Ok(v) => v,
         Err(e) => {
             out.error(&e.to_string());
@@ -842,6 +852,30 @@ mod tests {
             panic!("expected session create");
         };
         args
+    }
+
+    #[test]
+    fn request_timeout_is_explicitly_configurable_and_disablable() {
+        assert_eq!(
+            Cli::try_parse_from(["l2tp", "tunnel", "list"])
+                .unwrap()
+                .request_timeout,
+            30
+        );
+        for value in ["0", "5"] {
+            assert_eq!(
+                Cli::try_parse_from([
+                    "l2tp",
+                    "tunnel",
+                    "list",
+                    "--request-timeout",
+                    value
+                ])
+                .unwrap()
+                .request_timeout,
+                value.parse::<u64>().unwrap()
+            );
+        }
     }
 
     #[test]
@@ -909,7 +943,7 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_mapped_tunnel_rejects_disabled_udp_checksum() {
-        let handle = L2tpHandle::new().await.unwrap();
+        let handle = L2tpHandle::new(Default::default()).await.unwrap();
         let out = Output::new(OutputFmt::Text);
         for (local, remote) in [
             (Some("[::]:1701"), "127.0.0.1:1702"),
@@ -942,7 +976,7 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_tunnels_reject_link_local_addresses() {
-        let handle = L2tpHandle::new().await.unwrap();
+        let handle = L2tpHandle::new(Default::default()).await.unwrap();
         let out = Output::new(OutputFmt::Text);
         for (encap, local, remote, expected) in [
             // Zone suffixes are rejected while parsing.

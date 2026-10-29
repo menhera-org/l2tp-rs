@@ -26,7 +26,8 @@ mod types;
 
 pub use error::{Error, Result};
 pub use event::{BoundedEvents, EventSocket, Events, L2tpEvent};
-pub use handle::L2tpHandle;
+pub use handle::{HandleConfig, L2tpHandle};
+pub use netlink::KernelMessage;
 /// The error of [`L2tpIfName`]'s own constructors (`new`, `parse` and the
 /// `TryFrom` conversions), re-exported so it can be named without
 /// depending on `netlink-packet-core`; it converts into
@@ -40,7 +41,7 @@ pub use socket::{PmtuDiscovery, TunnelSocket};
 pub use stats::{SessionStats, TunnelStats};
 pub use tunnel::{TunnelConfig, TunnelHandle, TunnelInfo};
 pub use types::{
-    Cookie, Encapsulation, IFNAMSIZ, IpEndpoint, L2SpecType, L2tpIfName,
-    L2tpIfNameExt, L2tpVersion, PseudowireType, SessionId, TunnelId,
-    UdpEndpoint,
+    Cookie, Encapsulation, IFNAMSIZ, IpEndpoint, KernelCookie, L2SpecType,
+    L2tpIfName, L2tpIfNameExt, L2tpVersion, PseudowireType, SessionId,
+    TunnelId, UdpEndpoint,
 };

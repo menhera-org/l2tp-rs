@@ -17,8 +17,9 @@ separate crate.
 - Linux kernel with L2TP Generic Netlink support (`l2tp` family). Ethernet
   pseudowires need `l2tp_eth`, PPP pseudowires `l2tp_ppp`, and IP
   encapsulation `l2tp_ip` or `l2tp_ip6`.
-- Tokio runtime with its I/O driver enabled, or the `blocking` module, which
-  brings its own.
+- Tokio 1.54.1 or newer, with its I/O driver enabled and its time driver
+  enabled when request timeouts are configured, or the `blocking` module,
+  which brings its own runtime.
 - `CAP_NET_ADMIN` (or root) for every L2TP netlink command, including `get`
   and `list`; the kernel marks them all `GENL_UNS_ADMIN_PERM`. Subscribing to
   notifications needs no privilege.
@@ -29,8 +30,8 @@ separate crate.
 
 ```toml
 [dependencies]
-l2tp = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+l2tp = "0.5"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
 ```
 
 ### Cargo features
@@ -61,12 +62,51 @@ cargo install --features cli l2tp
 From a checkout, use `cargo run --features cli -- <args>`. Besides tunnel and
 session management, `l2tp monitor` prints kernel notifications as they
 happen, and sessions can be selected by `--ifname` instead of their
-identifiers.
+identifiers. Requests time out after 30 seconds by default; use
+`--request-timeout SECONDS` to change this or `--request-timeout 0` to
+disable it. Monitoring notifications has no idle timeout.
 
 For UDP tunnels, omitting `--local` binds the IPv6 wildcard `::`; an IPv4
 remote is then mapped to IPv6. Pass `--local 0.0.0.0` (or an IPv4 address,
 optionally with a port) to create an IPv4 socket. An explicit IPv4 `--local`
 is required when using an IPv4 remote with `--no-udp-csum`.
+
+## Request timeouts
+
+Both async and blocking constructors take an explicit `HandleConfig`.
+`HandleConfig::default()` sets a 30-second request timeout. Choose a limit
+or disable it with `None`:
+
+```rust,no_run
+use l2tp::{HandleConfig, L2tpHandle};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> l2tp::Result<()> {
+    let handle = L2tpHandle::new(HandleConfig {
+        request_timeout: Some(Duration::from_secs(5)),
+    }).await?;
+    let unlimited = L2tpHandle::new(HandleConfig {
+        request_timeout: None,
+    }).await?;
+    Ok(())
+}
+```
+
+The limit covers family discovery, a family-ID retry, and every reply in a
+dump without resetting on progress. Creation's caller wait is bounded across
+the whole operation; other operations involving several requests apply the
+limit to each request. It does not bound synchronous socket/namespace setup
+or time when the runtime is not scheduled. Event streams have no idle timeout.
+
+A timeout is `Error::Io` with `ErrorKind::TimedOut`. The kernel may have
+applied a mutation even when its reply did not arrive; query state before
+retrying. Creation continues in the background until acknowledgement,
+retaining managed socket descriptors and deleting successfully created
+objects that the caller did not receive. It never deletes an object after
+an `EEXIST` reply. Keep the runtime (or blocking handle's worker) alive for
+cleanup. If no acknowledgement ever arrives, that task and its resources
+remain until runtime shutdown.
 
 ## Quick Start
 
@@ -81,7 +121,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 #[tokio::main]
 async fn main() -> l2tp::Result<()> {
-    let handle = L2tpHandle::new().await?;
+    let handle = L2tpHandle::new(Default::default()).await?;
 
     let local = UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1701));
     let remote = UdpEndpoint::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 1701));
@@ -125,7 +165,7 @@ use std::net::Ipv4Addr;
 
 #[tokio::main]
 async fn main() -> l2tp::Result<()> {
-    let handle = L2tpHandle::new().await?;
+    let handle = L2tpHandle::new(Default::default()).await?;
 
     let local = IpEndpoint::V4(Ipv4Addr::new(192, 0, 2, 1));
     let remote = IpEndpoint::V4(Ipv4Addr::new(192, 0, 2, 2));
@@ -161,7 +201,7 @@ use std::net::Ipv6Addr;
 
 #[tokio::main]
 async fn main() -> l2tp::Result<()> {
-    let handle = L2tpHandle::new().await?;
+    let handle = L2tpHandle::new(Default::default()).await?;
 
     let eth0: L2tpIfName = "eth0".parse()?;
     let local =
@@ -239,7 +279,7 @@ use l2tp::{L2tpHandle, L2tpVersion, PppSocket, SessionConfig, SessionId, TunnelI
 
 #[tokio::main]
 async fn main() -> l2tp::Result<()> {
-    let handle = L2tpHandle::new().await?;
+    let handle = L2tpHandle::new(Default::default()).await?;
     // The tunnel was created earlier, managed or unmanaged.
     let tunnel = handle.open_tunnel(TunnelId(1000)).await?;
     let session = handle
@@ -273,7 +313,7 @@ The crate cannot reliably distinguish those events: tunnel and session IDs
 can be reused in different namespaces. Treat notifications as hints to
 reconcile through `list_tunnels`, `list_all_sessions`, or other queries on
 your handle. Do not apply a notification as a mutation of a local object.
-This limitation also applies to plain `L2tpHandle::new()` inside a container;
+This limitation also applies to `L2tpHandle::new` inside a container;
 no explicit namespace argument or netns ID is needed to encounter it.
 
 ```rust,no_run
@@ -282,7 +322,7 @@ use l2tp::L2tpHandle;
 
 #[tokio::main]
 async fn main() -> l2tp::Result<()> {
-    let handle = L2tpHandle::new().await?;
+    let handle = L2tpHandle::new(Default::default()).await?;
     let mut events = handle.events().await?;
     while let Some(event) = events.next().await {
         event?;
@@ -322,7 +362,7 @@ worker thread on drop, so auto-delete keeps working.
 use l2tp::{TunnelId, blocking::L2tpHandle};
 
 fn main() -> l2tp::Result<()> {
-    let handle = L2tpHandle::new()?;
+    let handle = L2tpHandle::new(Default::default())?;
     for tunnel in handle.list_tunnels()? {
         println!("{tunnel:?}");
     }
@@ -339,7 +379,7 @@ executes a closure on a thread inside it, and `L2tpHandle::new_in` controls
 the L2TP subsystem of that namespace. Entering a namespace needs
 `CAP_SYS_ADMIN`.
 
-`L2tpHandle::new()` retains the calling thread's actual namespace, including
+`L2tpHandle::new` retains the calling thread's actual namespace, including
 an inherited container namespace, for future event connections. Opening an
 event connection from a different namespace enters that original namespace;
 opening it from the same namespace needs no additional privileges.
@@ -356,7 +396,7 @@ use l2tp::{L2tpHandle, NetNs, TunnelConfig, TunnelSocket};
 
 async fn in_namespace(cfg: TunnelConfig) -> l2tp::Result<()> {
     let netns = NetNs::open("/run/netns/blue")?;
-    let handle = L2tpHandle::new_in(&netns).await?;
+    let handle = L2tpHandle::new_in(&netns, Default::default()).await?;
     let socket_cfg = cfg.clone();
     let socket = netns.run(move || TunnelSocket::for_config(&socket_cfg, None))??;
     let _tunnel = handle.create_tunnel(cfg, socket).await?;
@@ -469,12 +509,15 @@ device for its whole life; see [Kernel Semantics Notes](#kernel-semantics-notes)
   therefore reports the peer the socket connected to itself, which an IPv4
   L2TP/IP socket adopted with `from_fd` does not know: describe such a
   socket with `TunnelConfig::new` instead of `TunnelConfig::for_socket`.
-- RFC 3931 cookies are 4 or 8 bytes, but the kernel accepts and reports any
-  length up to 8. A `Cookie` built here is 0, 4 or 8 bytes. One reported for
-  a session created elsewhere keeps its length, so queries and dumps still
-  succeed, and `Cookie::is_rfc3931` tells it apart. Such a cookie is never
-  sent back: `create_session` refuses it with `Error::InvalidCookieLength`.
-  It serializes as it is but does not deserialize.
+- `Cookie` accepts only RFC lengths: 0 (absent), 4 or 8 bytes.
+  `SessionInfo` reports both cookies as `KernelCookie`, preserving every
+  length from 0 through 8, so foreign sessions do not fail queries or dumps.
+  `KernelCookie::is_rfc3931` identifies standard lengths;
+  `Cookie::try_from(reported)` rejects other lengths before session creation.
+  Both types round-trip through serde with their respective length limits.
+  Callers decoding their own generic-netlink replies can use the public
+  `KernelMessage` wrapper with `GenlMessage`. Its upstream emitter still
+  panics for nonstandard cookie lengths.
 - The kernel accepts the L2-specific sublayer type (`L2TP_ATTR_L2SPEC_TYPE`)
   when a session is created but never reports it, so `SessionInfo::l2spec_type`
   is `None` and the CLI shows `unknown`.
@@ -546,15 +589,32 @@ match handle.create_unmanaged_tunnel(cfg).await {
 }
 ```
 
-`Error::raw_os_error()` returns the raw errno when one is available. No
-public function panics on its input; conditions such as a missing Tokio I/O
-driver, an invalid interface name or an unsupported protocol version are
-reported as errors.
+`Error::raw_os_error()` returns the raw errno when one is available.
+High-level operations report missing Tokio I/O/time drivers, invalid
+interface names and unsupported protocol versions as errors. The low-level
+`KernelMessage` emitter retains upstream validation and can panic; a decoded
+reply containing nonstandard cookie lengths is not suitable for emission.
 
 ## Logging
 
 The crate logs netlink requests and failures through the `log` crate at
 `debug` and `trace` level.
+
+## Upgrading from 0.4.3
+
+0.4.4 was never released; its additions ship in 0.5.0.
+
+- Pass `HandleConfig` to `L2tpHandle::new(config)` and
+  `L2tpHandle::new_in(&netns, config)`, including their blocking counterparts.
+  Use `HandleConfig::default()` for 30 seconds, or explicitly set
+  `request_timeout: None` for the old unlimited wait. Finite timeouts require
+  the Tokio time driver (`enable_time()` or `enable_all()`).
+- `SessionInfo.cookie` and `peer_cookie` are now `KernelCookie`.
+  Reusing one in a `SessionConfig` requires
+  `config.cookie = info.cookie.try_into()?`.
+  Conversely, use `KernelCookie::from(cookie)` to compare with a `Cookie`.
+  Nonstandard reported cookies now round-trip through serde.
+- Tokio's minimum supported version is 1.54.1. Rust's minimum remains 1.89.
 
 ## Upgrading from 0.2
 

@@ -102,28 +102,23 @@ impl TryFrom<u8> for L2tpVersion {
     }
 }
 
-/// Session cookie (`L2TP_ATTR_COOKIE`): 0, 4 or 8 bytes when built here; a
-/// kernel report may carry any length up to 8 (`l2tp_netlink.c`), which this
-/// crate decodes but never sends.
+/// An RFC 3931 session cookie: 0 (absent), 4 or 8 bytes.
 ///
-/// Construct one with [`Cookie::none`], the `TryFrom` conversions from
-/// `&[u8]` and `Vec<u8>`, the `From` conversions from `[u8; 4]` and
-/// `[u8; 8]`, or by parsing a hexadecimal string; all of them keep to the
-/// lengths of RFC 3931. Only a cookie read from the kernel, in a
-/// [`SessionInfo`](crate::SessionInfo) or an [`L2tpEvent`](crate::L2tpEvent),
-/// can have another length, which [`is_rfc3931`](Self::is_rfc3931) tells;
-/// [`create_session`](crate::L2tpHandle::create_session) refuses it.
+/// Construct one from byte slices, vectors, arrays of 4 or 8 bytes, or a
+/// hexadecimal string. All constructors and deserialization enforce these
+/// lengths. Kernel reports use [`KernelCookie`]; convert them with
+/// `Cookie::try_from` before using them in
+/// [`SessionConfig`](crate::SessionConfig).
 ///
-/// `Display` prints the bytes as lowercase hexadecimal. With the `serde`
-/// feature a cookie is a hexadecimal string in human-readable formats and
-/// bytes otherwise. Serialization writes the actual length, so a reported
-/// non-conforming cookie can be shown, but deserializing it back fails, like
-/// every public constructor.
+/// With `serde`, cookies are hexadecimal strings in human-readable formats
+/// and byte strings otherwise.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Cookie {
-    bytes: [u8; 8],
-    len: u8,
-}
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(try_from = "KernelCookie", into = "KernelCookie")
+)]
+pub struct Cookie(KernelCookie);
 
 impl Cookie {
     /// Returns an empty cookie.
@@ -131,73 +126,68 @@ impl Cookie {
         Self::default()
     }
 
-    /// A cookie the kernel reported: any length up to 8, the kernel's limit.
-    pub(crate) fn from_kernel(b: &[u8]) -> crate::Result<Self> {
-        if b.len() > 8 {
-            return Err(crate::Error::InvalidCookieLength(b.len()));
-        }
-        let mut bytes = [0; 8];
-        bytes[..b.len()].copy_from_slice(b);
-        Ok(Self {
-            bytes,
-            len: b.len() as u8,
-        })
-    }
-
     /// Returns the raw cookie bytes.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.len)]
+        self.0.as_bytes()
     }
 
-    /// Returns the cookie length in bytes: 0, 4 or 8, or up to 8 for a
-    /// cookie the kernel reported.
+    /// Returns the cookie length in bytes: 0, 4 or 8.
     pub fn len(&self) -> usize {
-        usize::from(self.len)
+        self.0.len()
     }
 
     /// Returns whether the cookie is absent.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Returns whether the length is one RFC 3931 allows: 0 (no cookie), 4
-    /// or 8 bytes. Always true except for a cookie the kernel reported for a
-    /// session created elsewhere.
-    pub fn is_rfc3931(&self) -> bool {
-        matches!(self.len, 0 | 4 | 8)
+        self.0.is_empty()
     }
 }
 
 impl TryFrom<&[u8]> for Cookie {
     type Error = crate::Error;
 
-    fn try_from(b: &[u8]) -> crate::Result<Self> {
-        match b.len() {
-            0 | 4 | 8 => Self::from_kernel(b),
-            n => Err(crate::Error::InvalidCookieLength(n)),
+    fn try_from(bytes: &[u8]) -> crate::Result<Self> {
+        if !matches!(bytes.len(), 0 | 4 | 8) {
+            return Err(crate::Error::InvalidCookieLength(bytes.len()));
         }
+        Ok(Self(KernelCookie::try_from(bytes)?))
     }
 }
 
 impl TryFrom<Vec<u8>> for Cookie {
     type Error = crate::Error;
 
-    fn try_from(b: Vec<u8>) -> crate::Result<Self> {
-        Self::try_from(b.as_slice())
+    fn try_from(bytes: Vec<u8>) -> crate::Result<Self> {
+        Self::try_from(bytes.as_slice())
     }
 }
 
 impl From<[u8; 4]> for Cookie {
-    fn from(b: [u8; 4]) -> Self {
-        let mut bytes = [0; 8];
-        bytes[..4].copy_from_slice(&b);
-        Self { bytes, len: 4 }
+    fn from(bytes: [u8; 4]) -> Self {
+        Self(KernelCookie::from(bytes))
     }
 }
 
 impl From<[u8; 8]> for Cookie {
     fn from(bytes: [u8; 8]) -> Self {
-        Self { bytes, len: 8 }
+        Self(KernelCookie::from(bytes))
+    }
+}
+
+impl TryFrom<KernelCookie> for Cookie {
+    type Error = crate::Error;
+
+    fn try_from(cookie: KernelCookie) -> crate::Result<Self> {
+        if cookie.is_rfc3931() {
+            Ok(Self(cookie))
+        } else {
+            Err(crate::Error::InvalidCookieLength(cookie.len()))
+        }
+    }
+}
+
+impl From<Cookie> for KernelCookie {
+    fn from(cookie: Cookie) -> Self {
+        cookie.0
     }
 }
 
@@ -210,34 +200,14 @@ impl AsRef<[u8]> for Cookie {
 impl std::str::FromStr for Cookie {
     type Err = crate::Error;
 
-    /// Parses a hexadecimal string of 0, 8 or 16 digits.
     fn from_str(s: &str) -> crate::Result<Self> {
-        let digits = s.as_bytes();
-        // `from_str_radix` would also accept a sign, so check the digits.
-        if !digits.len().is_multiple_of(2)
-            || !digits.iter().all(u8::is_ascii_hexdigit)
-        {
-            return Err(crate::Error::InvalidCookieHex);
-        }
-        let mut bytes = Vec::with_capacity(digits.len() / 2);
-        for pair in digits.chunks(2) {
-            let hex = std::str::from_utf8(pair)
-                .map_err(|_| crate::Error::InvalidCookieHex)?;
-            bytes.push(
-                u8::from_str_radix(hex, 16)
-                    .map_err(|_| crate::Error::InvalidCookieHex)?,
-            );
-        }
-        Self::try_from(bytes.as_slice())
+        Self::try_from(parse_cookie_hex(s)?)
     }
 }
 
 impl fmt::Display for Cookie {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.as_bytes() {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        self.0.fmt(f)
     }
 }
 
@@ -247,8 +217,140 @@ impl fmt::Debug for Cookie {
     }
 }
 
+/// A kernel-reported session cookie of any length from 0 through 8.
+///
+/// Linux can report non-RFC lengths for sessions created by other software.
+/// Use [`is_rfc3931`](Self::is_rfc3931) to inspect a value and
+/// `Cookie::try_from` to validate it for session creation. Lengths above 8
+/// fail with [`Error::InvalidKernelCookieLength`](crate::Error::InvalidKernelCookieLength).
+///
+/// `Display` prints lowercase hexadecimal. With `serde`, this type
+/// round-trips as hexadecimal in human-readable formats and bytes otherwise,
+/// including non-RFC lengths.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct KernelCookie {
+    bytes: [u8; 8],
+    len: u8,
+}
+
+impl KernelCookie {
+    /// Returns an empty cookie.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Returns the raw cookie bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    /// Returns the cookie length in bytes, from 0 through 8.
+    pub fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    /// Returns whether the cookie is absent.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns whether the length is one RFC 3931 allows: 0 (no cookie), 4
+    /// or 8 bytes.
+    pub fn is_rfc3931(&self) -> bool {
+        matches!(self.len, 0 | 4 | 8)
+    }
+}
+
+impl TryFrom<&[u8]> for KernelCookie {
+    type Error = crate::Error;
+
+    fn try_from(b: &[u8]) -> crate::Result<Self> {
+        if b.len() > 8 {
+            return Err(crate::Error::InvalidKernelCookieLength(b.len()));
+        }
+        let mut bytes = [0; 8];
+        bytes[..b.len()].copy_from_slice(b);
+        Ok(Self {
+            bytes,
+            len: b.len() as u8,
+        })
+    }
+}
+
+impl TryFrom<Vec<u8>> for KernelCookie {
+    type Error = crate::Error;
+
+    fn try_from(b: Vec<u8>) -> crate::Result<Self> {
+        Self::try_from(b.as_slice())
+    }
+}
+
+impl From<[u8; 4]> for KernelCookie {
+    fn from(b: [u8; 4]) -> Self {
+        let mut bytes = [0; 8];
+        bytes[..4].copy_from_slice(&b);
+        Self { bytes, len: 4 }
+    }
+}
+
+impl From<[u8; 8]> for KernelCookie {
+    fn from(bytes: [u8; 8]) -> Self {
+        Self { bytes, len: 8 }
+    }
+}
+
+impl AsRef<[u8]> for KernelCookie {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl std::str::FromStr for KernelCookie {
+    type Err = crate::Error;
+
+    /// Parses a hexadecimal string of up to 16 digits, in byte pairs.
+    fn from_str(s: &str) -> crate::Result<Self> {
+        Self::try_from(parse_cookie_hex(s)?)
+    }
+}
+
+fn parse_cookie_hex(s: &str) -> crate::Result<Vec<u8>> {
+    let digits = s.as_bytes();
+    // `from_str_radix` would also accept a sign, so check the digits.
+    if !digits.len().is_multiple_of(2)
+        || !digits.iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err(crate::Error::InvalidCookieHex);
+    }
+    let mut bytes = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.chunks(2) {
+        let hex = std::str::from_utf8(pair)
+            .map_err(|_| crate::Error::InvalidCookieHex)?;
+        bytes.push(
+            u8::from_str_radix(hex, 16)
+                .map_err(|_| crate::Error::InvalidCookieHex)?,
+        );
+    }
+    Ok(bytes)
+}
+
+impl fmt::Display for KernelCookie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.as_bytes() {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for KernelCookie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "KernelCookie(\"{self}\")")
+    }
+}
+
 #[cfg(feature = "serde")]
-impl serde::Serialize for Cookie {
+impl serde::Serialize for KernelCookie {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
@@ -262,7 +364,7 @@ impl serde::Serialize for Cookie {
 }
 
 #[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for Cookie {
+impl<'de> serde::Deserialize<'de> for KernelCookie {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Self, D::Error> {
@@ -277,23 +379,23 @@ impl<'de> serde::Deserialize<'de> for Cookie {
         struct BytesVisitor;
 
         impl<'de> serde::de::Visitor<'de> for BytesVisitor {
-            type Value = Cookie;
+            type Value = KernelCookie;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a cookie of 0, 4 or 8 bytes")
+                f.write_str("a kernel cookie of up to 8 bytes")
             }
 
             fn visit_bytes<E: serde::de::Error>(
                 self,
                 v: &[u8],
-            ) -> Result<Cookie, E> {
-                Cookie::try_from(v).map_err(E::custom)
+            ) -> Result<KernelCookie, E> {
+                KernelCookie::try_from(v).map_err(E::custom)
             }
 
             fn visit_seq<A: serde::de::SeqAccess<'de>>(
                 self,
                 mut seq: A,
-            ) -> Result<Cookie, A::Error> {
+            ) -> Result<KernelCookie, A::Error> {
                 let mut bytes = [0u8; 8];
                 let mut len = 0;
                 while let Some(byte) = seq.next_element::<u8>()? {
@@ -306,7 +408,7 @@ impl<'de> serde::Deserialize<'de> for Cookie {
                     bytes[len] = byte;
                     len += 1;
                 }
-                Cookie::try_from(&bytes[..len])
+                KernelCookie::try_from(&bytes[..len])
                     .map_err(serde::de::Error::custom)
             }
         }
@@ -936,7 +1038,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_constructors_build_rfc_lengths_only() {
+    fn cookie_constructors_build_rfc_lengths_only() {
         let bytes: Vec<u8> = (1..=9).collect();
         for len in 0..=9 {
             let rfc = matches!(len, 0 | 4 | 8);
@@ -951,7 +1053,6 @@ mod tests {
                     Ok(cookie) => {
                         assert!(rfc, "{len} bytes were accepted");
                         assert_eq!(cookie.as_bytes(), &bytes[..len]);
-                        assert!(cookie.is_rfc3931());
                     }
                     Err(crate::Error::InvalidCookieLength(n)) => {
                         assert!(!rfc, "{len} bytes were refused");
@@ -967,15 +1068,28 @@ mod tests {
     fn kernel_cookies_take_any_length_up_to_eight() {
         let bytes: Vec<u8> = (1..=9).collect();
         for len in 0..=8 {
-            let cookie = Cookie::from_kernel(&bytes[..len]).unwrap();
+            let cookie = KernelCookie::try_from(&bytes[..len]).unwrap();
             assert_eq!(cookie.as_bytes(), &bytes[..len]);
             assert_eq!(cookie.len(), len);
             assert_eq!(cookie.is_rfc3931(), matches!(len, 0 | 4 | 8));
             assert_eq!(cookie.to_string().len(), 2 * len);
+            assert_eq!(
+                cookie.to_string().parse::<KernelCookie>().unwrap(),
+                cookie
+            );
+            let strict = Cookie::try_from(cookie);
+            assert_eq!(strict.is_ok(), cookie.is_rfc3931());
+            if let Ok(strict) = strict {
+                assert_eq!(KernelCookie::from(strict), cookie);
+            } else {
+                assert!(
+                    matches!(strict, Err(crate::Error::InvalidCookieLength(n)) if n == len)
+                );
+            }
         }
         assert!(matches!(
-            Cookie::from_kernel(&bytes),
-            Err(crate::Error::InvalidCookieLength(9))
+            KernelCookie::try_from(bytes.as_slice()),
+            Err(crate::Error::InvalidKernelCookieLength(9))
         ));
     }
 
@@ -1121,7 +1235,7 @@ mod tests {
         }
 
         // Serialization writes the actual length of a reported cookie, but
-        // only RFC 3931 lengths deserialize, as a byte string or a sequence.
+        // only RFC 3931 lengths deserialize as Cookie, as bytes or a sequence.
         let bytes: Vec<u8> = (1..=9).collect();
         for len in 0..=9 {
             let rfc = matches!(len, 0 | 4 | 8);
@@ -1130,6 +1244,10 @@ mod tests {
             assert_eq!(
                 postcard::from_bytes::<Cookie>(&postcard_wire).is_ok(),
                 rfc
+            );
+            assert_eq!(
+                postcard::from_bytes::<KernelCookie>(&postcard_wire).is_ok(),
+                len <= 8
             );
             for value in [
                 ciborium::Value::Bytes(wire.to_vec()),
@@ -1141,14 +1259,21 @@ mod tests {
                     ciborium::from_reader::<Cookie, _>(cbor.as_slice()).is_ok(),
                     rfc
                 );
+                assert_eq!(
+                    ciborium::from_reader::<KernelCookie, _>(cbor.as_slice())
+                        .is_ok(),
+                    len <= 8
+                );
             }
-            if let Ok(cookie) = Cookie::from_kernel(wire) {
+            if let Ok(cookie) = KernelCookie::try_from(wire) {
                 assert_eq!(
                     postcard::to_allocvec(&cookie).unwrap(),
                     postcard_wire
                 );
+                assert_eq!(round_trip(&cookie), cookie);
                 if rfc {
-                    assert_eq!(round_trip(&cookie), cookie);
+                    let strict = Cookie::try_from(cookie).unwrap();
+                    assert_eq!(round_trip(&strict), strict);
                 }
             }
         }
@@ -1273,8 +1398,10 @@ mod tests {
                 .collect();
             let parsed = serde_json::from_str::<Cookie>(&json);
             assert_eq!(parsed.is_ok(), matches!(len, 0 | 4 | 8), "{json}");
-            // A reported cookie of any length is shown as it is.
-            if let Ok(cookie) = Cookie::from_kernel(&bytes[..len]) {
+            let reported = serde_json::from_str::<KernelCookie>(&json);
+            assert_eq!(reported.is_ok(), len <= 8);
+            if let Ok(cookie) = reported {
+                assert_eq!(cookie.as_bytes(), &bytes[..len]);
                 assert_eq!(serde_json::to_string(&cookie).unwrap(), json);
             }
         }

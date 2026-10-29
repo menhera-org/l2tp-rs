@@ -44,8 +44,12 @@ pub enum Error {
     #[error("invalid cookie length {0}: must be 0, 4, or 8")]
     InvalidCookieLength(usize),
 
+    /// A reported cookie exceeds the kernel's eight-byte limit.
+    #[error("invalid kernel cookie length {0}: must be at most 8")]
+    InvalidKernelCookieLength(usize),
+
     /// A cookie string is not an even number of hexadecimal digits.
-    #[error("invalid cookie: expected 0, 8 or 16 hexadecimal digits")]
+    #[error("invalid cookie: expected an even number of hexadecimal digits")]
     InvalidCookieHex,
 
     /// An endpoint string could not be parsed.
