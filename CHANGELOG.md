@@ -217,7 +217,7 @@
   `block_on` from a saturated blocking pool cannot panic or deadlock in it.
   A lookup that
   fails for a reason other than `ENODEV` is returned, and a tunnel still
-  listed after the wait is reported as `Error::Io` of kind `TimedOut`.
+  listed after the wait is reported as `Error::DeletionPending`.
 - `TunnelSocket` resolves interface scopes with `SIOCGIFINDEX` on the socket
   itself, in the socket's own network namespace, so a socket created through
   `NetNs::run` reconnects correctly from any thread.
@@ -297,8 +297,8 @@
 - Unmanaged tunnels reject disabling UDP checksums for IPv4-mapped peers,
   instead of silently sending checksums. The CLI explains how to use IPv4
   endpoints or the managed tunnel API for this setting.
-- Tunnel sockets are created with `SOCK_CLOEXEC`, so child processes no
-  longer keep a tunnel alive.
+- Tunnel sockets are created with `SOCK_CLOEXEC`, so their descriptors
+  close on `exec`. A child still inherits them across `fork`.
 - Tunnel and session creation retains ownership through the kernel ACK when
   the caller is cancelled. Unclaimed successful creations are cleaned up while
   the Tokio runtime remains running; managed socket descriptors cannot be

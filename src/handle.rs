@@ -625,14 +625,16 @@ impl L2tpHandle {
     /// The kernel acknowledges the request and then tears the tunnel down
     /// on a work queue, during which lookups still find it and creating a
     /// tunnel with the same identifier fails with `EEXIST`. This therefore
-    /// also waits, for up to about two seconds, until a lookup reports
-    /// `ENODEV`. Once the deletion is acknowledged it is not undone: a
-    /// lookup that fails otherwise is returned as is, and a tunnel still
-    /// listed after the wait is reported as
+    /// polls up to 200 times, paced at 10 ms intervals, until a lookup
+    /// reports `ENODEV`. With prompt replies this takes up to about two
+    /// seconds; slow replies extend the wait, and each lookup uses the
+    /// configured request timeout. Once the deletion is acknowledged it is not
+    /// undone: a lookup that fails otherwise is returned as is, and a tunnel
+    /// still listed after the wait is reported as
     /// [`Error::DeletionPending`](crate::Error::DeletionPending), which
     /// callers should treat as deleted, because repeating the request then
-    /// fails with `ENODEV`. The wait needs neither a Tokio timer nor a free
-    /// blocking thread.
+    /// fails with `ENODEV`. Poll pacing needs neither a Tokio timer nor a
+    /// free blocking thread, but finite request timeouts need the time driver.
     pub async fn delete_tunnel(
         &self,
         tunnel_id: TunnelId,
@@ -654,7 +656,7 @@ impl L2tpHandle {
             return Ok(());
         }
         // A thread of its own paces the polls and exits once the receiver is
-        // gone, so the wait depends neither on the runtime's timer driver
+        // gone, so pacing depends neither on the runtime's timer driver
         // nor on a spare thread in its blocking pool.
         let (tick_tx, mut tick_rx) = tokio::sync::mpsc::unbounded_channel();
         std::thread::Builder::new()

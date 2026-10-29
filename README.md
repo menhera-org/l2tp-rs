@@ -36,10 +36,11 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
 
 ### Cargo features
 
-- `serde`: `Serialize`/`Deserialize` for the configuration, information,
-  event, identifier and statistics types. Endpoints are strings such as
-  `192.0.2.1:1701` or `fe80::1%eth0`, cookies are hexadecimal strings, and
-  interface names are strings, or byte arrays when they are not UTF-8.
+- `serde`: `Serialize`/`Deserialize` for tunnel/session configuration,
+  information, event, identifier and statistics types (not `HandleConfig`).
+  Endpoints are strings such as `192.0.2.1:1701` or `fe80::1%eth0`, cookies
+  are hexadecimal strings, and interface names are strings, or byte arrays
+  when they are not UTF-8.
 - `cli`: builds the supplementary, testing-only `l2tp` command-line tool
   (implies `serde`).
 
@@ -225,11 +226,14 @@ async fn main() -> l2tp::Result<()> {
 UDP endpoints carry the numeric scope ID of `SocketAddrV6`. Resolve the name
 with `L2tpIfNameExt::index` right before creating or reconnecting the socket:
 
-```rust,ignore
-use l2tp::L2tpIfNameExt;
+```rust,no_run
+use l2tp::{L2tpIfName, L2tpIfNameExt, UdpEndpoint};
+use std::net::{Ipv6Addr, SocketAddrV6};
 
-let scope_id = L2tpIfName::new("eth0")?.index()?;
-let local = UdpEndpoint::V6(SocketAddrV6::new(link_local, 1701, 0, scope_id));
+fn scoped_udp(link_local: Ipv6Addr) -> l2tp::Result<UdpEndpoint> {
+    let scope_id = L2tpIfName::new("eth0")?.index()?;
+    Ok(UdpEndpoint::V6(SocketAddrV6::new(link_local, 1701, 0, scope_id)))
+}
 ```
 
 A link-local remote may omit the scope ID once the local endpoint, the
@@ -283,7 +287,7 @@ async fn main() -> l2tp::Result<()> {
     let handle = L2tpHandle::new(Default::default()).await?;
     // The tunnel was created earlier, managed or unmanaged.
     let tunnel = handle.open_tunnel(TunnelId(1000)).await?;
-    let session = handle
+    let mut session = handle
         .create_session(SessionConfig::ppp(tunnel.tunnel_id(), SessionId(1), SessionId(2)))
         .await?;
     let ppp = PppSocket::connect(
@@ -293,6 +297,7 @@ async fn main() -> l2tp::Result<()> {
         session.session_id(),
         SessionId(2),
     )?;
+    session.set_auto_delete(false);
     let _channel = ppp.channel_index()?;
     Ok(())
 }
@@ -336,12 +341,12 @@ async fn main() -> l2tp::Result<()> {
 }
 ```
 
-`events` drains the socket into an unbounded queue, so a slow consumer
-costs memory instead of losing notifications. `events_bounded` reads the
-socket directly instead: notifications wait in its receive buffer, sized
-with `SO_RCVBUF` through `AsFd`, and an overflow is reported once as
-`ENOBUFS`, after which the stream continues. Resynchronize with the queries
-above when that happens. The blocking handle offers both as well.
+`events` drains the socket into an unbounded queue, so a slow consumer can
+grow memory use without bound. Its kernel receive buffer can still overflow.
+`events_bounded` reads the socket directly: notifications wait in its receive
+buffer, sized with `SO_RCVBUF` through `AsFd`. Both streams report receive
+buffer overflow as `ENOBUFS` and continue afterwards. Resynchronize with the
+queries above when that happens. The blocking handle offers both as well.
 
 `EventSocket` is the runtime-free form of that socket: non-blocking,
 usable from any thread, and registered with an event loop only when the
@@ -385,12 +390,14 @@ an inherited container namespace, for future event connections. Opening an
 event connection from a different namespace enters that original namespace;
 opening it from the same namespace needs no additional privileges.
 `/proc` is not required. A handle remembers which namespace its sockets live
-in by their kernel cookie (`SO_NETNS_COOKIE`, Linux 5.14+); when `/proc` is
-readable it also keeps a descriptor, so that later sockets can be opened from
-a thread in another namespace. Without it, open event connections from a
-thread in the handle's namespace, or create the handle with `new_in`.
-The kernel's cross-namespace multicast behavior described under
-[Events](#events) still applies.
+in by their kernel cookie (`SO_NETNS_COOKIE`, Linux 5.14+). It also tries to
+retain a namespace descriptor through `/proc`, falling back to
+`PIDFD_GET_NET_NAMESPACE` on Linux 6.11+, so later sockets can be opened
+from a thread in another namespace. Without a descriptor, open event
+connections from a thread in the handle's namespace, or use `new_in`.
+Before Linux 5.14, namespace identity is unknown and later sockets are opened
+in the calling thread's namespace. The kernel's cross-namespace multicast
+behavior described under [Events](#events) still applies.
 
 ```rust,no_run
 use l2tp::{L2tpHandle, NetNs, TunnelConfig, TunnelSocket};
@@ -496,10 +503,12 @@ device for its whole life; see [Kernel Semantics Notes](#kernel-semantics-notes)
   this one does.
 - Tunnel deletion is acknowledged before the kernel tears the tunnel down on
   a work queue. `delete_tunnel` and `TunnelHandle::delete` wait until the
-  tunnel is gone, so its identifier can be reused immediately afterwards. If
-  it is still listed after about two seconds they return
-  `Error::DeletionPending`; the deletion is not undone, so treat the tunnel
-  as deleted (a repeated deletion fails with `ENODEV`).
+  tunnel is gone, so its identifier can be reused immediately after success.
+  They poll up to 200 times, paced at 10 ms intervals: up to about two
+  seconds with prompt replies, longer with slow replies. Each lookup uses
+  the configured request timeout. A tunnel still listed after all polls is
+  `Error::DeletionPending`; the acknowledged deletion is not undone, so treat
+  the tunnel as deleted (a repeated deletion fails with `ENODEV`).
 - Generic netlink assigns the `l2tp` family identifier dynamically. A handle
   caches it and re-resolves once when the kernel answers `ENOENT` for a
   request, so it survives a reload of `l2tp_netlink`; an `Events` stream
@@ -532,9 +541,11 @@ device for its whole life; see [Kernel Semantics Notes](#kernel-semantics-notes)
   IPv6 tunnel, even when its IPv4-mapped peer receives checksums.
 - The kernel does not report IPv6 scope IDs or flow labels, so `TunnelInfo`
   UDP endpoints have them set to `0` and IP endpoints have no scope.
-- Managed tunnels are fd-backed. When the managed tunnel socket is closed, the kernel
-  tears down that tunnel and its sessions. Sockets are created with `SOCK_CLOEXEC`
-  so child processes do not keep tunnels alive.
+- Managed tunnels are fd-backed. Closing the last descriptor for the tunnel
+  socket tears down that tunnel and its sessions. Duplicates, including those
+  inherited through `fork`, can keep it alive. Sockets created by this crate use
+  `SOCK_CLOEXEC`, so their descriptors close on `exec`; adopted descriptors
+  retain their existing flags.
 - The kernel cannot change tunnel parameters after creation, so there is no tunnel
   modify operation. Session parameters can be changed with `SessionHandle::modify`.
 - The kernel's session dump ignores the tunnel filter; `list_sessions` filters the
@@ -542,25 +553,36 @@ device for its whole life; see [Kernel Semantics Notes](#kernel-semantics-notes)
 
 ## Unmanaged Tunnels
 
-For kernel-managed tunnels without `L2TP_ATTR_FD`:
+For kernel-managed tunnels without `L2TP_ATTR_FD`, disable auto-delete to
+keep the tunnel after its handle is dropped:
 
-```rust,ignore
-let cfg = TunnelConfig::new(/* ... */)?;
-let tunnel = handle.create_unmanaged_tunnel(cfg).await?;
+```rust,no_run
+use l2tp::{L2tpHandle, TunnelConfig};
+
+async fn create_persistent(handle: &L2tpHandle, cfg: TunnelConfig) -> l2tp::Result<()> {
+    let mut tunnel = handle.create_unmanaged_tunnel(cfg).await?;
+    tunnel.set_auto_delete(false);
+    Ok(())
+}
 ```
 
 ## Common Operations
 
-```rust,ignore
-let tunnels = handle.list_tunnels().await?;
-let sessions = handle.list_all_sessions().await?;
+```rust,no_run
+use l2tp::{L2tpHandle, SessionId, TunnelId};
 
-let tstats = handle.tunnel_stats(TunnelId(1000)).await?;
-let sstats = handle.session_stats(TunnelId(1000), SessionId(3000)).await?;
+async fn inspect(handle: &L2tpHandle) -> l2tp::Result<()> {
+    let tunnels = handle.list_tunnels().await?;
+    let sessions = handle.list_all_sessions().await?;
 
-// Existing objects, for example created by another process.
-let tunnel = handle.open_tunnel(TunnelId(1000)).await?;
-let session = handle.open_session_by_ifname(&"l2tpeth0".parse()?).await?;
+    let tstats = handle.tunnel_stats(TunnelId(1000)).await?;
+    let sstats = handle.session_stats(TunnelId(1000), SessionId(3000)).await?;
+
+    // Existing objects, for example created by another process.
+    let tunnel = handle.open_tunnel(TunnelId(1000)).await?;
+    let session = handle.open_session_by_ifname(&"l2tpeth0".parse()?).await?;
+    Ok(())
+}
 ```
 
 ## Handle Lifetime
@@ -576,17 +598,25 @@ let session = handle.open_session_by_ifname(&"l2tpeth0".parse()?).await?;
 - Prefer `tunnel.delete().await?` / `session.delete().await?`, which delete
   deterministically and report errors.
 - Use `set_auto_delete(false)` if you want to avoid those best-effort netlink delete calls.
-- For managed tunnels, dropping the handle still closes the owned tunnel socket fd,
-  which causes the kernel to remove the tunnel/session datapath.
+- For managed tunnels, dropping the handle still closes its socket descriptor.
+  If auto-delete is disabled, duplicates of that descriptor keep the tunnel
+  alive until the last one is closed.
 
 ## Error Handling
 
 Match kernel errors by kind without depending on `libc`:
 
-```rust,ignore
-match handle.create_unmanaged_tunnel(cfg).await {
-    Err(e) if e.kind() == Some(std::io::ErrorKind::AlreadyExists) => { /* ID in use */ }
-    other => { /* ... */ }
+```rust,no_run
+use l2tp::{L2tpHandle, TunnelConfig, TunnelHandle};
+
+async fn create_if_free(
+    handle: &L2tpHandle,
+    cfg: TunnelConfig,
+) -> l2tp::Result<Option<TunnelHandle>> {
+    match handle.create_unmanaged_tunnel(cfg).await {
+        Err(e) if e.kind() == Some(std::io::ErrorKind::AlreadyExists) => Ok(None),
+        other => other.map(Some),
+    }
 }
 ```
 
@@ -627,10 +657,10 @@ The crate logs netlink requests and failures through the `log` crate at
 - `TunnelModify`, `TunnelHandle::modify` and `L2tpHandle::modify_tunnel` were removed:
   the kernel accepted these requests but did not apply their UDP checksum setting.
 - `TunnelSocket::ip` takes `TunnelId`s for the tunnel and its peer instead of a `u32`.
-- `delete_tunnel` and `TunnelHandle::delete` wait, for up to about two
-  seconds, until the kernel has removed the tunnel. A tunnel still listed
-  after that is `Error::DeletionPending`, which callers must treat as
-  deleted: the acknowledged deletion completes on its own, and repeating it
+- `delete_tunnel` and `TunnelHandle::delete` poll until the kernel has
+  removed the tunnel, for up to about two seconds with prompt replies.
+  A tunnel still listed after all polls is `Error::DeletionPending`, which
+  callers must treat as deleted: the acknowledged deletion completes on its own, and repeating it
   fails with `ENODEV`. Code that kept its tunnel state on any error from
   `delete_tunnel` would otherwise never remove it.
 - `SessionInfo::ifname` and the `*_by_ifname` methods carry the
@@ -669,18 +699,33 @@ The crate logs netlink requests and failures through the `log` crate at
 
 ## Running Tests
 
-Standard tests:
+Test both the default library and optional serde/CLI features, including all
+README examples:
 
-```bash
-cargo test
+```sh
+cargo test --locked --target x86_64-unknown-linux-musl
+cargo test --locked --all-features --target x86_64-unknown-linux-musl
 ```
 
-Privileged tests (require root/CAP_NET_ADMIN and matching kernel modules; the
-namespace tests also need CAP_SYS_ADMIN and `unshare(1)`):
+The privileged suite stays ignored by default. Run it manually in isolated
+user, network and mount namespaces on a host that allows unprivileged user
+namespaces and has the matching kernel modules, `unshare`, `mount` and `ip`:
 
-```bash
-cargo test --test privileged -- --ignored
+```sh
+unshare --user --map-root-user --net --mount -- sh -c '
+    ip link set lo up &&
+    mount -t sysfs sysfs /sys &&
+    cargo test --locked --all-features --target x86_64-unknown-linux-musl \
+        --test privileged -- --ignored --test-threads=1 --nocapture
+'
 ```
+
+Bringing up loopback enables local traffic; mounting sysfs in the private
+mount namespace exposes the test network namespace's interface statistics.
+The tests exercise `CAP_NET_ADMIN`, `CAP_NET_RAW` and `CAP_SYS_ADMIN` inside
+these namespaces without granting host privileges. The PPP unit/channel test
+also needs `/dev/ppp`; it prints a skip message when that device is absent.
+Keep `--nocapture` to see skips even when the test harness reports success.
 
 ## CLI tunnel lifetime
 

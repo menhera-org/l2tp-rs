@@ -13,8 +13,12 @@
 //! The handles returned here own their async counterparts and hand them back
 //! to the worker thread when dropped, so the best-effort deletion on drop
 //! keeps working. The worker thread stops once the last [`L2tpHandle`] clone
-//! and every handle created from it are gone, after pending deletions have
-//! completed.
+//! and every handle created from it are gone, after pending deletion attempts
+//! have finished.
+//!
+//! After a creation timeout, keep a handle alive so the background task can
+//! receive the acknowledgement and clean up. Shutting down the worker also
+//! shuts down its runtime and can abandon that task.
 
 use std::{
     future::Future,

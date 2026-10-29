@@ -182,9 +182,9 @@ impl TunnelHandle {
     /// that reuses this ID; use [`TunnelHandle::delete`] to delete
     /// deterministically. Without a Tokio runtime, nothing is deleted.
     ///
-    /// Note: for managed tunnels, dropping the handle also drops the managed
-    /// socket fd, and the kernel closes the tunnel when that fd is closed even
-    /// if `auto_delete` is disabled.
+    /// For managed tunnels, dropping the handle also closes its socket
+    /// descriptor. Even with `auto_delete` disabled, the kernel tears down
+    /// the tunnel once the last descriptor for that socket is closed.
     pub fn set_auto_delete(&mut self, v: bool) {
         self.auto_delete = v;
     }

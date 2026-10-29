@@ -45,13 +45,13 @@ impl PmtuDiscovery {
 
 /// Owned tunnel socket used by managed tunnels (`L2TP_ATTR_FD`).
 ///
-/// Dropping this type closes the file descriptor.
-/// Per the kernel L2TP API, closing the tunnel socket tears down the
-/// associated tunnel and sessions.
+/// Dropping this type closes its file descriptor. Closing the last descriptor
+/// for the tunnel socket tears down the associated tunnel and sessions.
+/// Duplicates, including those inherited through `fork`, can keep it alive.
 ///
-/// The descriptor is created with `SOCK_CLOEXEC`, so child processes do not
-/// inherit it and keep the tunnel alive. A socket prepared elsewhere is
-/// adopted with [`TunnelSocket::from_fd`].
+/// Sockets created by this type use `SOCK_CLOEXEC`, so their descriptors close
+/// on `exec`. [`TunnelSocket::from_fd`] adopts a socket prepared elsewhere and
+/// preserves its descriptor flags.
 #[derive(Debug)]
 pub struct TunnelSocket {
     fd: OwnedFd,
@@ -1005,6 +1005,9 @@ impl TunnelSocket {
 
     /// Duplicates the descriptor, for example to receive the L2TP control
     /// messages that the kernel delivers on the tunnel socket.
+    ///
+    /// The duplicate shares the socket's state and keeps it open after this
+    /// value is dropped. Explicit netlink deletion can still remove its tunnel.
     pub fn try_clone_fd(&self) -> io::Result<OwnedFd> {
         self.fd.try_clone()
     }

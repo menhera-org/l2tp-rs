@@ -13,8 +13,8 @@ description = "High-level L2TP interface for Linux kernel"
 exclude = [".github/", ".licenserc.yaml"]
 
 [features]
-# Derive `serde` traits for the configuration, information, identifier and
-# statistics types.
+# Derive `serde` traits for tunnel/session configuration, information,
+# event, identifier and statistics types.
 serde = ["dep:serde"]
 # Build the supplementary, testing-only `l2tp` command-line tool.
 cli = ["serde", "dep:clap", "dep:serde_json", "tokio/rt-multi-thread", "tokio/macros"]
